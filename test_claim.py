@@ -576,9 +576,15 @@ def run_claims(claim_file, project_dir, only_claim=None, verbose=False):
         cue_path = os.path.join(project_dir, cue_path)
 
     med_config = config.get("mednafen", {})
-    ipc_dir = med_config.get("ipc_dir", "build/claim_test_ipc")
-    if not os.path.isabs(ipc_dir):
-        ipc_dir = os.path.join(project_dir, ipc_dir)
+
+    # Oracle uses its own IPC directory — separate from the MCP server's
+    # to avoid stale artifacts (traces, snapshots) causing crashes
+    ipc_dir = os.path.join(project_dir, "build", "oracle_ipc")
+
+    # Use project's home dir for config/firmware
+    home_dir = med_config.get("home_dir", "build/mednafen_home")
+    if not os.path.isabs(home_dir):
+        home_dir = os.path.join(project_dir, home_dir)
 
     ctx = {
         "save_states": _resolve_save_states(config, project_dir),
@@ -589,15 +595,7 @@ def run_claims(claim_file, project_dir, only_claim=None, verbose=False):
 
     os.makedirs(ipc_dir, exist_ok=True)
 
-    # Clear stale watchpoint hits
-    hits_path = os.path.join(ipc_dir, "watchpoint_hits.txt")
-    try:
-        if os.path.exists(hits_path):
-            os.remove(hits_path)
-    except PermissionError:
-        pass
-
-    bot = MednafenBot(ipc_dir, cue_path, verbose=verbose)
+    bot = MednafenBot(ipc_dir, cue_path, home_dir=home_dir, verbose=verbose)
     print("Starting Mednafen...")
     if not bot.start(timeout=30):
         print("FAIL: Mednafen did not start")
