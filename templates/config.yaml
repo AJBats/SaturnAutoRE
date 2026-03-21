@@ -1,0 +1,55 @@
+# auto_re project configuration
+#
+# Place this file at: workstreams/auto_re/config.yaml
+# The CLI reads it to parameterize all pipeline operations.
+
+game_name: "Game Name"
+
+# Assembly source location (relative to project root)
+# Set to "" or omit if no disassembly exists yet
+assembly_dir: src
+
+# Target data structures to investigate
+# Each entry is a memory region of interest. The pipeline doesn't assume
+# these are "car structs" — they could be polygon lists, scene graphs,
+# VDP1 command tables, or any structured data in memory.
+targets:
+  player_car:                  # arbitrary name — used as reference key
+    base: 0x06000000           # absolute address of first entry
+    stride: 0x100              # bytes per entry (0 if single instance)
+    count: 40                  # number of entries (1 if single instance)
+    addressing: direct         # "direct" (fixed base) or "GBR" (per-entry register)
+    notes: "Player car struct — 40 cars, index 0 is player"
+
+# Controller mapping (game-specific button roles)
+# Keys are role names, values are Saturn button names.
+# Common buttons: A B C X Y Z START L R UP DOWN LEFT RIGHT
+controls:
+  throttle: C
+  brake: B
+  steer_left: LEFT
+  steer_right: RIGHT
+
+# Save states and scenarios
+# Each scenario maps to a save state file + input sequence
+save_states:
+  example_scenario:
+    file: build/save_states/example.mc0
+    inputs: [C]
+    frames: 300
+    notes: "Description of what's happening in this scenario"
+
+# Path to knowledge base (relative to project root)
+# Where the Mapper maintains accumulated understanding.
+knowledge_base: workstreams/auto_re/struct_map.md
+
+# CUE file for disc image (relative to project root)
+cue_path: external_resources/Game Name/Game.cue
+
+# Mednafen configuration
+# The emulator binary and MCP server live in SaturnAutoRE/mednafen/ (shared).
+# Each project gets its own IPC and home directories for parallel operation.
+# These paths are relative to project root.
+mednafen:
+  ipc_dir: build/mcp_ipc
+  home_dir: build/mednafen_home
