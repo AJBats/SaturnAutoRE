@@ -291,9 +291,3 @@ YourGameProject/                       ← your project (uses the harness)
   .mcp.json                           ← MCP server config (points here)
 ```
 
-## Projects Using This Pipeline
-
-This pipeline has been used to reverse engineer driving model physics
-across two Saturn racing games, producing 40+ Tier 2 verified functions,
-10+ NOP-confirmed field identities, and a complete force→velocity→position
-pipeline map.
