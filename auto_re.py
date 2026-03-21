@@ -14,7 +14,9 @@ Usage:
 
 import os
 import sys
+import re
 import argparse
+import yaml
 
 # Add our lib to path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -353,6 +355,82 @@ def cmd_verify(config, func_name):
     print(f"  auto_re.py integrate")
 
 
+def _find_nop_candidates(auto_re_dir, results):
+    """Scan results and claims for NOP-test-ready functions.
+
+    A candidate has:
+    - Tier 2 (enough evidence to be confident)
+    - At least one passing writes_to claim (confirmed writer)
+    - No existing NOP test (not already documented)
+    """
+    candidates = []
+    claims_dir = os.path.join(auto_re_dir, "claims")
+
+    # Check for existing NOP experiments file
+    nop_file = os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md")
+    if not os.path.exists(nop_file):
+        nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
+    existing_nops = set()
+    if os.path.exists(nop_file):
+        try:
+            with open(nop_file, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            # Extract function names mentioned in NOP experiments
+            for m in re.findall(r"(FUN_[0-9A-Fa-f]+|sym_[0-9A-Fa-f]+)", content):
+                existing_nops.add(m)
+        except (IOError, OSError):
+            pass
+
+    for r in results:
+        func = r.get("function", "")
+        try:
+            tier = int(r.get("tier", 0))
+        except ValueError:
+            continue
+
+        if tier < 2:
+            continue
+        if func in existing_nops:
+            continue
+
+        # Check claim file for writes_to claims that passed
+        claim_path = os.path.join(claims_dir, f"{func}.yaml")
+        if not os.path.exists(claim_path):
+            continue
+
+        try:
+            with open(claim_path) as f:
+                claim_data = yaml.safe_load(f)
+        except (yaml.YAMLError, IOError):
+            continue
+
+        for claim in claim_data.get("claims", []):
+            if claim.get("type") != "writes_to":
+                continue
+
+            # Extract target address and writer PC from description
+            raw_target = claim.get("address", "unknown")
+            # Format target as hex if it's an integer
+            if isinstance(raw_target, int):
+                target = f"0x{raw_target:08X}"
+            else:
+                target = str(raw_target)
+            writer_pc = None
+            desc = claim.get("description", "")
+            pc_match = re.search(r"PC\s+0x([0-9A-Fa-f]+)", desc)
+            if pc_match:
+                writer_pc = f"0x{pc_match.group(1)}"
+
+            candidates.append({
+                "function": func,
+                "target": target,
+                "writer_pc": writer_pc,
+                "claim_id": claim.get("id", ""),
+            })
+
+    return candidates
+
+
 def cmd_integrate(config):
     """Check results and suggest next steps."""
     auto_re_dir = config["_auto_re_dir"]
@@ -401,8 +479,50 @@ def cmd_integrate(config):
         print(f"Update the knowledge base with any new confirmed writers:")
         print(f"  {kb_path}")
 
+    # NOP test candidate analysis
+    nop_candidates = _find_nop_candidates(auto_re_dir, results)
+    nop_file = os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md")
+    # Also check project-root-relative path
+    if not os.path.exists(os.path.dirname(nop_file)):
+        nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
+
+    if nop_candidates:
+        print()
+        print(f"=== NOP Test Candidates ({len(nop_candidates)}) ===")
+        print()
+        print(f"These functions have oracle-confirmed writes_to claims and may")
+        print(f"be ready for NOP testing. For each candidate:")
+        print(f"  1. Read the observation and claim to understand what the function writes")
+        print(f"  2. Read the assembly to find the exact store instruction PC")
+        print(f"  3. Predict what will break if the write is NOPed")
+        print(f"  4. Document the test in nop_experiments.md")
+        print()
+        for nc in nop_candidates:
+            print(f"  {nc['function']}: writes_to {nc['target']}")
+            if nc.get("writer_pc"):
+                print(f"    Writer PC: {nc['writer_pc']}")
+            print(f"    Claim: {nc['claim_id']}")
+            print(f"    Observation: workstreams/auto_re/observations/{nc['function']}_obs.md")
+            print()
+
+        print(f"Document NOP tests in: {nop_file}")
+        print(f"Format for each test:")
+        print(f"  - What to NOP (instruction PC, original bytes -> 00 09)")
+        print(f"  - Writer function and oracle confirmation")
+        print(f"  - Expected effect (what breaks when this write is removed)")
+        print(f"  - Best scenario (which save state reveals the effect)")
+        print(f"  - Confidence level (HIGH/MEDIUM/LOW)")
+        print()
+        print(f"The human (or another agent) executes the NOP test by patching")
+        print(f"the instruction with the debugger's poke command and observing the game.")
+    else:
+        if tier_2_count > 0:
+            print()
+            print(f"No new NOP test candidates found. Existing Tier 2 functions either")
+            print(f"already have NOP tests or lack writes_to claims with identifiable PCs.")
+
     print()
-    print(f"COMMIT if you made any knowledge base updates:")
+    print(f"COMMIT if you made any updates:")
     print(f"  git add -A workstreams/")
     print(f"  git commit -m \"Integrate results: update knowledge base\"")
 
