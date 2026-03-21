@@ -367,9 +367,7 @@ def _find_nop_candidates(auto_re_dir, results):
     claims_dir = os.path.join(auto_re_dir, "claims")
 
     # Check for existing NOP experiments file
-    nop_file = os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md")
-    if not os.path.exists(nop_file):
-        nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
+    nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
     existing_nops = set()
     if os.path.exists(nop_file):
         try:
@@ -481,10 +479,7 @@ def cmd_integrate(config):
 
     # NOP test candidate analysis
     nop_candidates = _find_nop_candidates(auto_re_dir, results)
-    nop_file = os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md")
-    # Also check project-root-relative path
-    if not os.path.exists(os.path.dirname(nop_file)):
-        nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
+    nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
 
     if nop_candidates:
         print()
