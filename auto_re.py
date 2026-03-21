@@ -155,19 +155,72 @@ def cmd_pick(config):
                 print(f"Next, run: auto_re.py explore-check <FUNCTION_NAME>")
                 return
 
-    # No priorities — suggest exploration approaches
-    print(f"No active priorities found. Explore by call-chain or CDL coverage.")
+    # No priorities — give context-aware guidance based on project state
+    observations = scan_observations(auto_re_dir)
     asm_dir = get_assembly_dir(config)
-    if asm_dir:
-        print(f"Assembly source: {asm_dir}")
-    print()
+    knowledge_base = config.get("_knowledge_base_path", "")
 
+    if len(observations) == 0:
+        # Greenfield — no observations yet
+        print(f"No priorities and no observations yet. This is a fresh project.")
+        print()
+        print(f"STEP 1: Do static analysis to identify investigation targets.")
+        print(f"  - Read mission.md for the RE objective and phases")
+        if asm_dir:
+            print(f"  - Read disassembly/source in {asm_dir}")
+        print(f"  - Identify 3-5 candidate functions to investigate")
+        print(f"  - Consider: what does the mission need? What functions are likely")
+        print(f"    to touch the data structures described in the mission?")
+        print()
+        print(f"STEP 2: Write your targets to explorer_priorities.md")
+        print(f"  For each target, document:")
+        print(f"  - WHY this function matters for the mission")
+        print(f"  - WHAT to do (which breakpoints, watchpoints, scenarios)")
+        print(f"  - WHAT it unblocks (what becomes possible after this)")
+        print()
+        print(f"STEP 3: Run auto_re.py pick again — it will find your priorities.")
+        print()
+        print(f"Alternatively, if you already know a function to investigate,")
+        print(f"go ahead and explore it with the debugger, then run:")
+        print(f"  auto_re.py explore-check <FUNCTION_NAME>")
+    elif len(observations) < 10:
+        # Early stage — some observations but still building up
+        print(f"No priorities set. {len(observations)} observations exist.")
+        print()
+        print(f"Review what's been explored and identify the next best targets:")
+        print(f"  1. Read existing observations in workstreams/auto_re/observations/")
+        print(f"  2. Follow call chains from observed functions — callees and callers")
+        print(f"     are the highest-ROI targets (you already have context)")
+        if asm_dir:
+            print(f"  3. Read assembly in {asm_dir} to trace data flow from known functions")
+        if knowledge_base and os.path.exists(knowledge_base):
+            print(f"  4. Check the knowledge base for gaps: {knowledge_base}")
+        print()
+        print(f"Write your targets to explorer_priorities.md, then run:")
+        print(f"  auto_re.py pick")
+        print()
+        print(f"Or investigate a function directly and run:")
+        print(f"  auto_re.py explore-check <FUNCTION_NAME>")
+    else:
+        # Mature project — many observations, need strategic direction
+        print(f"No priorities set. {len(observations)} observations exist.")
+        print()
+        print(f"Time for strategic analysis:")
+        print(f"  1. Re-read mission.md — are we still focused on the objective?")
+        if knowledge_base and os.path.exists(knowledge_base):
+            print(f"  2. Review the knowledge base for unmapped fields or pipeline gaps:")
+            print(f"     {knowledge_base}")
+        print(f"  3. Check results.tsv — any Tier 1 functions that could reach Tier 2?")
+        print(f"  4. Look for NOP test opportunities — any confirmed writers with")
+        print(f"     clear behavioral roles that haven't been NOP-tested?")
+        print()
+        print(f"Write updated priorities to explorer_priorities.md, then run:")
+        print(f"  auto_re.py pick")
+
+    print()
     controls = get_controls_display(config)
     if controls:
         print(f"Game controls: {controls}")
-    print()
-    print(f"After investigating a function, write the observation report and run:")
-    print(f"  auto_re.py explore-check <FUNCTION_NAME>")
 
 
 def cmd_explore_check(config, func_name):
