@@ -9,6 +9,9 @@ __pycache__/
 # Build artifacts
 build/
 
+# Watchdog temp files
+.watchdog/
+
 # Editor/IDE
 .vscode/
 *.swp
