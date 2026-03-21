@@ -20,7 +20,7 @@ import argparse
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-from lib.config import load_config, get_button, get_car_struct_base, get_assembly_dir
+from lib.config import load_config, get_assembly_dir, get_controls_display
 from lib.pipeline import (
     scan_observations, scan_claims, scan_questions, parse_results,
     pipeline_summary, get_function_status, observation_has_field_analysis,
@@ -34,7 +34,6 @@ def cmd_status(config):
     results_path = config["_results_path"]
 
     summary = pipeline_summary(auto_re_dir, results_path)
-    observations = scan_observations(auto_re_dir)
     questions = scan_questions(auto_re_dir)
 
     print(f"=== {config.get('game_name', 'Unknown Game')} — auto_re status ===")
@@ -54,6 +53,12 @@ def cmd_status(config):
         for func in summary["incomplete_observations"]:
             print(f"  - {func}")
 
+    if summary.get("claimed_not_tested"):
+        print()
+        print(f"Claims written but NOT YET TESTED (run oracle!):")
+        for func in summary["claimed_not_tested"]:
+            print(f"  - {func}")
+
     if summary["explored_not_verified"]:
         print()
         print(f"Explored but not verified:")
@@ -66,7 +71,7 @@ def cmd_status(config):
         for func in questions:
             print(f"  - {func}")
 
-    # What to do next
+    # What to do next — priority order
     print()
     print("--- NEXT ACTION ---")
     print()
@@ -78,10 +83,20 @@ def cmd_status(config):
         print(f"Then re-investigate with the debugger and append a ## Follow-Up section.")
         print()
         print(f"Next, run: auto_re.py explore-check {func}")
+    elif summary.get("claimed_not_tested"):
+        func = summary["claimed_not_tested"][0]
+        claim_path = os.path.join(auto_re_dir, "claims", f"{func}.yaml")
+        test_runner = os.path.join(config["_project_dir"], "tools", "test_claim.py")
+        print(f"Test the untested claims for {func}.")
+        print()
+        print(f"  python {test_runner} {claim_path} -v")
+        print()
+        print(f"Record results in results.tsv, then run: auto_re.py integrate")
     elif summary["incomplete_observations"]:
         func = summary["incomplete_observations"][0]
         print(f"Complete the observation for {func} — field analysis is missing.")
-        print(f"Read the sample CSVs in build/samples/ and classify field behavior.")
+        samples_dir = config["_samples_dir"]
+        print(f"Read the sample CSVs in {samples_dir}/ and classify field behavior.")
         print()
         print(f"Next, run: auto_re.py explore-check {func}")
     elif summary["explored_not_verified"]:
@@ -100,32 +115,27 @@ def cmd_pick(config):
     auto_re_dir = config["_auto_re_dir"]
     priorities_path = config["_priorities_path"]
     mission_path = config["_mission_path"]
-    asm_dir = get_assembly_dir(config)
 
     print(f"=== {config.get('game_name', 'Unknown Game')} — pick next target ===")
     print()
 
     # Check for mission context
     if os.path.exists(mission_path):
-        with open(mission_path) as f:
+        with open(mission_path, encoding="utf-8", errors="replace") as f:
             mission = f.read().strip()
         if mission:
             print(f"Current mission (from mission.md):")
-            # Show first 5 lines
             for line in mission.split("\n")[:5]:
                 print(f"  {line}")
             print()
 
     # Check for priorities file
     if os.path.exists(priorities_path):
-        with open(priorities_path) as f:
+        with open(priorities_path, encoding="utf-8", errors="replace") as f:
             priorities = f.read()
-        # Find first unresolved priority
         lines = priorities.split("\n")
         for i, line in enumerate(lines):
             if line.startswith("### ") and "RESOLVED" not in line:
-                # Found an active priority
-                # Gather the block until next ### or ##
                 block = [line]
                 for j in range(i + 1, min(i + 20, len(lines))):
                     if lines[j].startswith("### ") or lines[j].startswith("## "):
@@ -142,16 +152,16 @@ def cmd_pick(config):
                 print(f"Next, run: auto_re.py explore-check <FUNCTION_NAME>")
                 return
 
-    # No priorities — suggest assembly dir scan
+    # No priorities — suggest exploration approaches
     print(f"No active priorities found. Explore by call-chain or CDL coverage.")
-    print(f"Assembly source: {asm_dir}")
+    asm_dir = get_assembly_dir(config)
+    if asm_dir:
+        print(f"Assembly source: {asm_dir}")
     print()
 
-    # Show controls for reference
-    controls = config.get("controls", {})
+    controls = get_controls_display(config)
     if controls:
-        ctrl_str = ", ".join(f"{role}={btn}" for role, btn in controls.items())
-        print(f"Game controls: {ctrl_str}")
+        print(f"Game controls: {controls}")
     print()
     print(f"After investigating a function, write the observation report and run:")
     print(f"  auto_re.py explore-check <FUNCTION_NAME>")
@@ -172,8 +182,7 @@ def cmd_explore_check(config, func_name):
         print(f"Write the observation report first, then run this check again.")
         return
 
-    # Check required sections
-    with open(obs_path) as f:
+    with open(obs_path, encoding="utf-8", errors="replace") as f:
         content = f.read()
 
     checks = {
@@ -197,10 +206,11 @@ def cmd_explore_check(config, func_name):
     if not all_pass:
         print(f"Observation is INCOMPLETE. Fix the failing checks above.")
         print()
-        if not checks["Per-Frame Field Analysis"]:
+        samples_dir = config["_samples_dir"]
+        if not checks.get("Per-Frame Field Analysis"):
             print(f"The Per-Frame Field Analysis section is required. Read the sample")
-            print(f"CSVs in build/samples/ and classify each field this function touches.")
-        if not checks["Field analysis populated"]:
+            print(f"CSVs in {samples_dir}/ and classify each field this function touches.")
+        if not checks.get("Field analysis populated"):
             print(f"The Per-Frame Field Analysis section exists but appears empty or deferred.")
             print(f"Fill in the behavior classification table with data from the CSVs.")
         print()
@@ -212,11 +222,10 @@ def cmd_explore_check(config, func_name):
 
 
 def cmd_verify(config, func_name):
-    """Generate claims from observation and run oracle."""
+    """Generate claims from observation and prepare for oracle testing."""
     auto_re_dir = config["_auto_re_dir"]
     obs_path = os.path.join(auto_re_dir, "observations", f"{func_name}_obs.md")
     claim_path = os.path.join(auto_re_dir, "claims", f"{func_name}.yaml")
-    results_path = config["_results_path"]
 
     print(f"=== Verify: {func_name} ===")
     print()
@@ -226,7 +235,6 @@ def cmd_verify(config, func_name):
         print(f"Run: auto_re.py explore-check {func_name}")
         return
 
-    # Extract observation data
     obs_data = extract_observation_data(obs_path)
 
     if obs_data.get("field_analysis_deferred"):
@@ -234,7 +242,6 @@ def cmd_verify(config, func_name):
         print(f"Claims will be limited to call_count only (Tier 1 max).")
         print()
 
-    # Generate claims
     claims = generate_claims(obs_data, config)
 
     if not claims:
@@ -244,7 +251,16 @@ def cmd_verify(config, func_name):
         print(f"Re-investigate and run: auto_re.py explore-check {func_name}")
         return
 
+    # Show claim summary with types
+    type_counts = {}
+    for c in claims:
+        t = c["type"]
+        type_counts[t] = type_counts.get(t, 0) + 1
+
     print(f"Generated {len(claims)} claim(s):")
+    for t, count in type_counts.items():
+        print(f"  {t}: {count}")
+    print()
     for c in claims:
         print(f"  [{c['id']}] {c['type']}: {c.get('description', '')}")
     print()
@@ -261,7 +277,7 @@ def cmd_verify(config, func_name):
     print()
     print(f"  python {test_runner} {claim_path} -v")
     print()
-    print(f"After the oracle runs, record the results in results.tsv and run:")
+    print(f"After the oracle runs, record results in results.tsv and run:")
     print(f"  auto_re.py integrate")
 
 
@@ -279,8 +295,7 @@ def cmd_integrate(config):
         print(f"Run: auto_re.py status")
         return
 
-    # Show latest results
-    print(f"Latest results ({len(results)} functions tested):")
+    print(f"Results ({len(results)} functions tested):")
     print()
 
     tier_2_count = 0
@@ -302,18 +317,17 @@ def cmd_integrate(config):
     print()
     print(f"Summary: {tier_2_count} at Tier 2, {tier_1_count} at Tier 1")
 
-    # Check for Tier 1 functions that might reach Tier 2
     if tier_1_count > 0:
         print()
         print(f"{tier_1_count} function(s) at Tier 1 — may need deeper observation")
         print(f"for function-specific claims (writes_to, value_changes_with_input).")
 
-    # Suggest struct map update
-    struct_map = config.get("struct_map_path")
-    if struct_map:
+    # Suggest knowledge base update
+    kb_path = config.get("_knowledge_base_path", "")
+    if kb_path:
         print()
-        print(f"Update the struct map with any new confirmed writers:")
-        print(f"  {struct_map}")
+        print(f"Update the knowledge base with any new confirmed writers:")
+        print(f"  {kb_path}")
 
     print()
     print(f"--- NEXT ACTION ---")

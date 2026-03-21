@@ -9,16 +9,34 @@ import re
 import yaml
 
 
-def scan_observations(auto_re_dir):
-    """Return dict of function -> observation file path."""
+# Observation files must match these patterns to be treated as function
+# observations. This filters out non-function observations like
+# "brake_scenario_obs.md" or "collision_detection_obs.md".
+FUNCTION_OBS_PATTERN = re.compile(r"^(FUN_|sym_)[0-9A-Fa-f]+$")
+
+
+def _is_function_name(name):
+    """Check if a name looks like a function (FUN_XXXXXXXX or sym_XXXXXXXX)."""
+    return bool(FUNCTION_OBS_PATTERN.match(name))
+
+
+def scan_observations(auto_re_dir, functions_only=True):
+    """Return dict of function -> observation file path.
+
+    If functions_only is True (default), only return entries that look like
+    function names (FUN_* or sym_*). Non-function observations like
+    "brake_scenario_obs.md" are excluded from pipeline tracking.
+    """
     obs_dir = os.path.join(auto_re_dir, "observations")
     if not os.path.exists(obs_dir):
         return {}
     result = {}
     for f in os.listdir(obs_dir):
         if f.endswith("_obs.md"):
-            func = f.replace("_obs.md", "")
-            result[func] = os.path.join(obs_dir, f)
+            name = f.replace("_obs.md", "")
+            if functions_only and not _is_function_name(name):
+                continue
+            result[name] = os.path.join(obs_dir, f)
     return result
 
 
@@ -36,7 +54,11 @@ def scan_claims(auto_re_dir):
 
 
 def scan_questions(auto_re_dir):
-    """Return dict of function -> question file path."""
+    """Return dict of function -> question file path.
+
+    Filters out questions that have a corresponding _answers.md file,
+    since those have been addressed by the Explorer.
+    """
     obs_dir = os.path.join(auto_re_dir, "observations")
     if not os.path.exists(obs_dir):
         return {}
@@ -44,6 +66,19 @@ def scan_questions(auto_re_dir):
     for f in os.listdir(obs_dir):
         if f.endswith("_questions.md"):
             func = f.replace("_questions.md", "")
+            # Check if an answers file exists — if so, question is resolved
+            answers_file = os.path.join(obs_dir, f"{func}_answers.md")
+            if os.path.exists(answers_file):
+                continue
+            # Also check if the observation has a ## Follow-Up section
+            obs_file = os.path.join(obs_dir, f"{func}_obs.md")
+            if os.path.exists(obs_file):
+                try:
+                    with open(obs_file, encoding="utf-8", errors="replace") as fh:
+                        if "## Follow-Up" in fh.read():
+                            continue
+                except (IOError, OSError):
+                    pass
             result[func] = os.path.join(obs_dir, f)
     return result
 
@@ -71,18 +106,57 @@ def parse_results(results_path):
 
 
 def observation_has_field_analysis(obs_path):
-    """Check if an observation file has a Per-Frame Field Analysis table."""
-    with open(obs_path, encoding="utf-8", errors="replace") as f:
-        content = f.read()
+    """Check if an observation file has a populated Per-Frame Field Analysis."""
+    try:
+        with open(obs_path, encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except (IOError, OSError):
+        return False
+
     if "## Per-Frame Field Analysis" not in content:
         return False
-    # Check it's not just "deferred" or "N/A"
+
     idx = content.index("## Per-Frame Field Analysis")
-    section = content[idx:idx + 500]
-    if "deferred" in section.lower() or "n/a" in section.lower()[:100]:
-        return False
-    # Check for at least one table row (pipe-delimited)
-    return bool(re.search(r"\|.*\|.*\|.*\|", section))
+    # Find the next ## heading to bound the section
+    next_heading = content.find("\n## ", idx + 1)
+    if next_heading == -1:
+        section = content[idx:]
+    else:
+        section = content[idx:next_heading]
+
+    section_lower = section.lower()
+
+    # Check for explicit deferral or N/A markers
+    first_200 = section_lower[:200]
+    if "deferred" in first_200 or "n/a" in first_200:
+        # Make sure "n/a" isn't a false positive from hex values
+        # Look for "n/a" as a standalone word, not part of "0x0a"
+        if "deferred" in first_200:
+            return False
+        if re.search(r'\bn/a\b', first_200):
+            return False
+
+    # Check for actual data rows — need at least one pipe-delimited row
+    # that isn't a header or separator. A data row has content between pipes
+    # that isn't just dashes/spaces.
+    lines = section.split("\n")
+    data_rows = 0
+    for line in lines:
+        if "|" not in line:
+            continue
+        cells = [c.strip() for c in line.split("|") if c.strip()]
+        if not cells:
+            continue
+        # Skip header separator rows (all dashes)
+        if all(re.match(r"^[-:]+$", c) for c in cells):
+            continue
+        # Skip header rows (check if any cell looks like a field offset)
+        if any(re.match(r"^\+?0x[0-9A-Fa-f]+", c) for c in cells):
+            data_rows += 1
+        elif any(c[0].isdigit() or c.startswith("+") for c in cells if c):
+            data_rows += 1
+
+    return data_rows > 0
 
 
 def get_function_status(func, auto_re_dir, results_path):
@@ -90,10 +164,11 @@ def get_function_status(func, auto_re_dir, results_path):
 
     Returns one of:
     - "unexplored"  — no observation file
-    - "explored"    — observation exists, no claims
+    - "explored"    — observation exists with field analysis, no claims
     - "incomplete"  — observation missing field analysis
+    - "claimed"     — claims written but not yet tested
     - "verified"    — claims exist and have been tested
-    - "questioned"  — verifier filed a question
+    - "questioned"  — verifier filed a question (unanswered)
     """
     observations = scan_observations(auto_re_dir)
     claims = scan_claims(auto_re_dir)
@@ -108,7 +183,7 @@ def get_function_status(func, auto_re_dir, results_path):
         return "verified"
 
     if func in claims:
-        return "claimed"  # claims written but not yet tested
+        return "claimed"
 
     if func in observations:
         obs_path = observations[func]
@@ -142,9 +217,18 @@ def pipeline_summary(auto_re_dir, results_path):
         if not observation_has_field_analysis(path):
             incomplete.append(func)
 
-    # Functions explored but not verified
+    # Functions explored but not verified (and not claimed)
     result_funcs = {r.get("function", "") for r in results}
-    explored_not_verified = [f for f in observations if f not in result_funcs and f not in claims]
+    explored_not_verified = [
+        f for f in observations
+        if f not in result_funcs and f not in claims
+    ]
+
+    # Functions with claims but no results (claimed but untested)
+    claimed_not_tested = [
+        f for f in claims
+        if f not in result_funcs
+    ]
 
     return {
         "observations": len(observations),
@@ -154,4 +238,5 @@ def pipeline_summary(auto_re_dir, results_path):
         "tiers": tiers,
         "incomplete_observations": incomplete,
         "explored_not_verified": explored_not_verified,
+        "claimed_not_tested": claimed_not_tested,
     }

@@ -1,10 +1,11 @@
 {
+  "_comment": "Replace the mcp_server.py path below with your SaturnAutoRE location",
   "mcpServers": {
     "mednafen": {
       "type": "stdio",
       "command": "python",
       "args": [
-        "D:/Projects/SaturnAutoRE/mednafen/mcp_server.py",
+        "/path/to/SaturnAutoRE/mednafen/mcp_server.py",
         "--ipc-dir",
         "build/mcp_ipc",
         "--home-dir",

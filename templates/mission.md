@@ -34,7 +34,7 @@ What "done" looks like for this project.
 
 ## Game-Specific Context
 
-Anything the agents need to know about this game:
+Anything relevant to the RE investigation:
 - Control scheme
 - Game modes relevant to investigation
 - Known hardware usage (VDP1, VDP2, SCU, etc.)

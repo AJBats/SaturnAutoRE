@@ -52,23 +52,28 @@ def load_config(project_dir=None):
     else:
         config["_cue_path"] = cue
 
+    # Resolve knowledge base path (supports both "knowledge_base" and
+    # legacy "struct_map_path" keys)
+    kb = config.get("knowledge_base") or config.get("struct_map_path", "")
+    if kb and not os.path.isabs(kb):
+        config["_knowledge_base_path"] = os.path.join(project_dir, kb)
+    else:
+        config["_knowledge_base_path"] = kb
+
     return config
 
 
-def get_car_struct_base(config):
-    """Return car struct base address as int."""
-    val = config.get("car_struct", {}).get("base", 0)
-    if isinstance(val, str):
-        return int(val, 16)
-    return val
-
-
 def get_assembly_dir(config):
-    """Return absolute path to assembly source directory."""
-    rel = config.get("assembly_dir", "src")
+    """Return absolute path to assembly source directory, or None if not set."""
+    rel = config.get("assembly_dir", "")
+    if not rel:
+        return None
     return os.path.join(config["_project_dir"], rel)
 
 
-def get_button(config, role):
-    """Get the button name for a role (throttle, brake, steer_left, steer_right)."""
-    return config.get("controls", {}).get(role, "")
+def get_controls_display(config):
+    """Return a human-readable string of all controls."""
+    controls = config.get("controls", {})
+    if not controls:
+        return None
+    return ", ".join(f"{role}={btn}" for role, btn in controls.items())
