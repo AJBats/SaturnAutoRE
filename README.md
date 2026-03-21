@@ -291,9 +291,9 @@ YourGameProject/                       ← your project (uses the harness)
   .mcp.json                           ← MCP server config (points here)
 ```
 
-## Existing Projects Using This Pipeline
+## Projects Using This Pipeline
 
-- **Daytona USA '95** (`D:\Projects\SaturnReverseTest`) — driving model RE,
-  95 struct offsets mapped, 23 functions at Tier 2, 6 NOP tests confirmed
-- **Daytona USA CCE** (`D:\Projects\DaytonaCCEReverse`) — transplant boundary
-  mapping, 24 functions at Tier 2, 7 NOP tests confirmed
+This pipeline has been used to reverse engineer driving model physics
+across two Saturn racing games, producing 40+ Tier 2 verified functions,
+10+ NOP-confirmed field identities, and a complete force→velocity→position
+pipeline map.

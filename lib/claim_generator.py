@@ -199,13 +199,19 @@ def generate_claims(obs_data, config):
                 break  # One writes_to claim per target
 
     # 3. value_changes_with_input claims — from field analysis
-    controls = config.get("controls", {})
-    throttle_btn = controls.get("throttle", "")
+    # Determine which button to test with: use the first input from the
+    # default scenario, or fall back to the first control in the config
+    scenario_inputs = config.get("save_states", {}).get(default_scenario, {}).get("inputs", []) if default_scenario else []
+    if scenario_inputs:
+        test_button = scenario_inputs[0]  # first button held in the scenario
+    else:
+        controls = config.get("controls", {})
+        test_button = next(iter(controls.values()), "") if controls else ""
 
     for fc in obs_data.get("field_changes", []):
         offset_str = fc.get("offset", "")
         direction = fc.get("direction")
-        if not offset_str or not direction or not throttle_btn:
+        if not offset_str or not direction or not test_button:
             continue
         if not default_scenario:
             continue
@@ -235,10 +241,10 @@ def generate_claims(obs_data, config):
 
         claim = {
             "id": f"field_{offset_clean}_changes_{direction}",
-            "description": f"{offset_str} {direction} with {throttle_btn} held",
+            "description": f"{offset_str} {direction} with {test_button} held",
             "type": "value_changes_with_input",
             "address": abs_addr,
-            "input": throttle_btn,
+            "input": test_button,
             "direction": direction,
             "scenario": default_scenario,
             "frames": 60,

@@ -11,7 +11,7 @@ assembly_dir: src
 
 # Target data structures to investigate
 # Each entry is a memory region of interest. The pipeline doesn't assume
-# these are "car structs" — they could be polygon lists, scene graphs,
+# what these contain — they could be object arrays, polygon lists, scene graphs,
 # VDP1 command tables, or any structured data in memory.
 targets:
   player_car:                  # arbitrary name — used as reference key
@@ -19,7 +19,7 @@ targets:
     stride: 0x100              # bytes per entry (0 if single instance)
     count: 40                  # number of entries (1 if single instance)
     addressing: direct         # "direct" (fixed base) or "GBR" (per-entry register)
-    notes: "Player car struct — 40 cars, index 0 is player"
+    notes: "Example: game object array, 40 entries, index 0 is player"
 
 # Controller mapping (game-specific button roles)
 # Keys are role names, values are Saturn button names.
