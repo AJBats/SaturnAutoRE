@@ -150,16 +150,23 @@ Mednafen debugger:
 
 Replace `REPLACE_WITH_PATH` with the actual path to this SaturnAutoRE repo.
 
-### Step 5: Create save states
+### Step 5: Create save states and catalog
 
 This requires a human. Boot the game in Mednafen, navigate to the gameplay
-situation you want to investigate, and save state. Document each save state
-in `build/save_states/README.md` with:
+situation you want to investigate, and save state.
+
+Copy `templates/save_states.md` to `workstreams/auto_re/save_states.md`.
+Document each save state with:
 - What game mode/level/screen
 - What's happening (player position, speed, enemies, etc.)
-- What inputs to hold for deterministic replay
+- **Temporal constraints** — how many frames before the scene changes
+- **Best for / avoid for** — what this state is good for investigating
+- **Deterministic scenarios** — what inputs to hold for replay
 
 Add each save state to your `config.yaml` under `save_states:`.
+The catalog and config must stay in sync — the catalog has human context
+(why this state matters), the config has machine parameters (file path,
+inputs, frame count).
 
 ### Step 6: Run the pipeline
 
