@@ -603,10 +603,15 @@ def cmd_review(config):
     print()
     print(f"After the reviewer responds:")
     print(f"  - Address any HIGH action items immediately")
-    print(f"  - If the reviewer says CONTINUE, run: auto_re.py status")
-    print(f"  - If the reviewer says BLOCKED, report to the human what's needed")
+    print(f"  - If the reviewer says CONTINUE: run auto_re.py status NOW and")
+    print(f"    keep working. Do NOT summarize. Do NOT report to the human.")
+    print(f"    Do NOT pause. CONTINUE means CONTINUE.")
+    print(f"  - If the reviewer says BLOCKED: report to the human what's needed.")
+    print(f"    This is the ONLY case where you stop.")
     print()
-    print(f"Do NOT skip this review. Do NOT summarize and stop.")
+    print(f"The review is a checkpoint, not a stopping point. When the reviewer")
+    print(f"says CONTINUE, your next action is auto_re.py status — immediately,")
+    print(f"without summarizing what you just did.")
 
 
 def main():
