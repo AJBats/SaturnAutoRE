@@ -33,11 +33,27 @@ controls:
 # Save states and scenarios
 # Each scenario maps to a save state file + input sequence
 save_states:
-  example_scenario:
+  # Simple scenario — hold buttons for the entire run
+  example_simple:
     file: build/save_states/example.mc0
     inputs: [C]
     frames: 300
-    notes: "Description of what's happening in this scenario"
+    notes: "Description of what's happening"
+
+  # Timed scenario — press/release at specific frames
+  # example_timed:
+  #   file: build/save_states/example.mc0
+  #   inputs:
+  #     - [0, press, C]          # hold C from start
+  #     - [100, press, LEFT]     # steer at frame 100
+  #     - [120, release, LEFT]   # stop steering
+  #   frames: 300
+
+  # Playback scenario — recorded input file (frame-precise replay)
+  # example_playback:
+  #   file: build/save_states/example.mc0
+  #   playback: build/save_states/example.input.txt
+  #   frames: 300
 
 # Path to knowledge base (relative to project root)
 # Where the Mapper maintains accumulated understanding.

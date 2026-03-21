@@ -263,6 +263,7 @@ Prerequisites for building:
 ```
 SaturnAutoRE/                          ← this repo (the harness)
   auto_re.py                           ← CLI entry point
+  test_claim.py                        ← oracle test runner (game-agnostic)
   lib/
     config.py                          ← project config loader
     pipeline.py                        ← filesystem-based state tracking
@@ -286,8 +287,6 @@ YourGameProject/                       ← your project (uses the harness)
     samples/                           ← per-frame memory capture CSVs
     mcp_ipc/                           ← MCP server IPC (auto-created)
     mednafen_home/                     ← Mednafen config dir (auto-created)
-  tools/
-    test_claim.py                      ← oracle test runner
   .mcp.json                           ← MCP server config (points here)
 ```
 
