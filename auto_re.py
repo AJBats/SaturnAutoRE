@@ -178,7 +178,11 @@ def cmd_pick(config):
         print(f"  - WHAT to do (which breakpoints, watchpoints, scenarios)")
         print(f"  - WHAT it unblocks (what becomes possible after this)")
         print()
-        print(f"STEP 3: Run auto_re.py pick again — it will find your priorities.")
+        print(f"STEP 3: COMMIT your priorities:")
+        print(f"  git add workstreams/auto_re/explorer_priorities.md")
+        print(f"  git commit -m \"Set explorer priorities\"")
+        print()
+        print(f"STEP 4: Run auto_re.py pick again — it will find your priorities.")
         print()
         print(f"Alternatively, if you already know a function to investigate,")
         print(f"go ahead and explore it with the debugger, then run:")
@@ -274,6 +278,10 @@ def cmd_explore_check(config, func_name):
     else:
         print(f"Observation is COMPLETE. Ready for verification.")
         print()
+        print(f"COMMIT your observation now:")
+        print(f"  git add workstreams/auto_re/observations/{func_name}_obs.md")
+        print(f"  git commit -m \"Add observation for {func_name}\"")
+        print()
         print(f"Next, run: auto_re.py verify {func_name}")
 
 
@@ -337,7 +345,11 @@ def cmd_verify(config, func_name):
     print()
     print(f"  python {test_runner} {claim_path} -v")
     print()
-    print(f"After the oracle runs, record results in results.tsv and run:")
+    print(f"After the oracle runs, record results in results.tsv, then COMMIT:")
+    print(f"  git add workstreams/auto_re/claims/{func_name}.yaml workstreams/auto_re/results.tsv")
+    print(f"  git commit -m \"Verify {func_name}: N/M passed, Tier T\"")
+    print()
+    print(f"Then run:")
     print(f"  auto_re.py integrate")
 
 
@@ -388,6 +400,11 @@ def cmd_integrate(config):
         print()
         print(f"Update the knowledge base with any new confirmed writers:")
         print(f"  {kb_path}")
+
+    print()
+    print(f"COMMIT if you made any knowledge base updates:")
+    print(f"  git add -A workstreams/")
+    print(f"  git commit -m \"Integrate results: update knowledge base\"")
 
     print()
     print(f"--- NEXT ACTION ---")
