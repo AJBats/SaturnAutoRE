@@ -603,6 +603,8 @@ def run_claims(claim_file, project_dir, only_claim=None, verbose=False):
 
     print("Mednafen ready.\n")
 
+    hits_path = os.path.join(ipc_dir, "watchpoint_hits.txt")
+
     results = []
     for claim in claims:
         claim_id = claim.get("id", "unnamed")
