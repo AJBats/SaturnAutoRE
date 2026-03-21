@@ -524,8 +524,89 @@ def cmd_integrate(config):
     print()
     print(f"--- NEXT ACTION ---")
     print()
-    print(f"Run: auto_re.py status")
-    print(f"to see what needs doing next.")
+    print(f"Run: auto_re.py review")
+    print(f"to get a quality check before continuing.")
+
+
+def cmd_review(config):
+    """Output the review subagent prompt for quality and momentum check."""
+    auto_re_dir = config["_auto_re_dir"]
+    mission_path = config["_mission_path"]
+    results_path = config["_results_path"]
+    kb_path = config.get("_knowledge_base_path", "")
+
+    print(f"=== Review checkpoint ===")
+    print()
+    print(f"Spawn a reviewer subagent to check your work quality and mission focus.")
+    print(f"Use the Agent tool with the following prompt:")
+    print()
+
+    # Build the review prompt dynamically based on what exists
+    files_to_read = [f"workstreams/auto_re/results.tsv"]
+
+    if os.path.exists(mission_path):
+        files_to_read.insert(0, "workstreams/auto_re/mission.md")
+
+    if kb_path and os.path.exists(kb_path):
+        # Make path relative to project
+        try:
+            rel = os.path.relpath(kb_path, config["_project_dir"])
+            files_to_read.append(rel.replace("\\", "/"))
+        except ValueError:
+            pass
+
+    priorities_path = config["_priorities_path"]
+    if os.path.exists(priorities_path):
+        files_to_read.append("workstreams/auto_re/explorer_priorities.md")
+
+    obs_count = len(scan_observations(auto_re_dir))
+    claims_count = len(scan_claims(auto_re_dir))
+    results = parse_results(results_path)
+
+    print(f'  """')
+    print(f"  You are reviewing an autonomous RE session. Read these files:")
+    print(f"")
+    for f in files_to_read:
+        print(f"  - {f}")
+    print(f"  - Scan workstreams/auto_re/observations/ (all _obs.md files)")
+    print(f"  - Scan workstreams/auto_re/claims/ (all .yaml files)")
+    print(f"")
+    print(f"  Current state: {obs_count} observations, {claims_count} claims, {len(results)} results.")
+    print(f"")
+    print(f"  Check for these issues and return a SHORT list of action items:")
+    print(f"")
+    print(f"  QUALITY:")
+    print(f"  - Are observations missing Per-Frame Field Analysis? (must be populated)")
+    print(f"  - Are value_stable claims being used on globally static fields to pad Tier 2?")
+    print(f"  - Are there Tier 2 functions with confirmed writers but no NOP test documented?")
+    print(f"  - Are there observations with writes_to data that the claims don't cover?")
+    print(f"")
+    print(f"  MISSION FOCUS:")
+    print(f"  - Read mission.md. Is the recent work aligned with the mission objective?")
+    print(f"  - Are there mission-critical gaps being ignored in favor of easier targets?")
+    print(f"  - Is the knowledge base up to date with recent findings?")
+    print(f"")
+    print(f"  MOMENTUM:")
+    print(f"  - Are there unfinished priorities in explorer_priorities.md?")
+    print(f"  - Are there explored-but-unverified functions that should be verified?")
+    print(f"  - Is there work available that should be done before waiting for human input?")
+    print(f"")
+    print(f"  Return your response as:")
+    print(f"  ## Action Items")
+    print(f"  1. [HIGH/MED/LOW] Specific action to take")
+    print(f"  2. ...")
+    print(f"  ## Keep Going")
+    print(f"  State clearly: should the agent continue working, or is it genuinely blocked")
+    print(f"  on human input? If there is ANY available work, say CONTINUE and name it.")
+    print(f'  """')
+
+    print()
+    print(f"After the reviewer responds:")
+    print(f"  - Address any HIGH action items immediately")
+    print(f"  - If the reviewer says CONTINUE, run: auto_re.py status")
+    print(f"  - If the reviewer says BLOCKED, report to the human what's needed")
+    print()
+    print(f"Do NOT skip this review. Do NOT summarize and stop.")
 
 
 def main():
@@ -549,6 +630,7 @@ def main():
     verify.add_argument("function", help="Function name (e.g. FUN_0602D814)")
 
     sub.add_parser("integrate", help="Check results and suggest next steps")
+    sub.add_parser("review", help="Quality and momentum check via reviewer subagent")
 
     args = parser.parse_args()
 
@@ -574,6 +656,8 @@ def main():
         cmd_verify(config, args.function)
     elif args.command == "integrate":
         cmd_integrate(config)
+    elif args.command == "review":
+        cmd_review(config)
 
     return 0
 
