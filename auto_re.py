@@ -679,15 +679,19 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         ftable = FunctionTable.from_assembly_dir(asm_dir)
         print(f"Symbol table: {len(ftable.addrs)} functions from {asm_dir}")
     else:
-        # Check for linker map
-        map_candidates = [
-            os.path.join(project_dir, "build", "daytona.map"),
-            os.path.join(project_dir, "reimpl", "build", "daytona.map"),
+        # Check for linker map — search common locations
+        import glob
+        map_patterns = [
+            os.path.join(project_dir, "build", "*.map"),
+            os.path.join(project_dir, "reimpl", "build", "*.map"),
         ]
-        for mp in map_candidates:
-            if os.path.exists(mp):
+        for pattern in map_patterns:
+            for mp in glob.glob(pattern):
                 ftable = FunctionTable.from_map_file(mp)
-                print(f"Symbol table: {len(ftable.addrs)} functions from {mp}")
+                if len(ftable.addrs) > 0:
+                    print(f"Symbol table: {len(ftable.addrs)} functions from {mp}")
+                    break
+            if ftable and len(ftable.addrs) > 0:
                 break
 
     if not ftable or len(ftable.addrs) == 0:
@@ -785,6 +789,12 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
             print(f"    Written to: {out_path}")
 
         # Differential analysis
+        if not diff and len(all_analyses) >= 2:
+            print()
+            print(f"  TIP: Re-run with --diff to see idle-vs-input differences.")
+        if diff and len(all_analyses) < 2:
+            print()
+            print(f"  --diff requires at least 2 scenarios. Capture more traces first.")
         if diff and len(all_analyses) >= 2:
             print()
             print(f"=== Differential Analysis ===")
@@ -798,7 +808,11 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
                     idle_name = name
                     break
 
-            if idle_name:
+            if not idle_name:
+                print(f"  WARNING: No idle scenario found (no scenario without inputs).")
+                print(f"  Diff requires an idle baseline. Add a scenario with inputs: []")
+                print(f"  to config.yaml, capture its trace, and re-run with --diff.")
+            else:
                 baseline = all_analyses[idle_name]
                 for name, analysis in all_analyses.items():
                     if name == idle_name:

@@ -1,7 +1,7 @@
 """Call graph capture and analysis.
 
 Captures per-frame call traces from Mednafen, parses them into
-caller→callee edges, builds trees, and produces differential analysis
+caller->callee edges, builds trees, and produces differential analysis
 across scenarios.
 """
 
@@ -24,12 +24,23 @@ def parse_call_trace(path):
         for line in f:
             parts = line.strip().split()
             if len(parts) >= 4:
+                # Validate addresses are hex
+                try:
+                    int(parts[2], 16)
+                    int(parts[3], 16)
+                except ValueError:
+                    continue
                 calls.append((parts[0], parts[1], parts[2], parts[3]))
     return calls
 
 
 class FunctionTable:
     """Fast address-to-function lookup using sorted array + bisect."""
+
+    # Maximum offset from a function start to still attribute an address
+    # to that function. Prevents sparse tables from misattributing distant
+    # addresses to the nearest known function.
+    MAX_FUNCTION_SIZE = 0x4000  # 16KB
 
     def __init__(self, addr_to_name=None):
         if addr_to_name:
@@ -45,31 +56,28 @@ class FunctionTable:
         """Build a function table from assembly source filenames.
 
         Expects files named like FUN_06012345.s or sym_06012345.s.
-        Each filename maps to a function at that address.
+        Recurses into subdirectories.
         """
         addr_to_name = {}
         if not asm_dir or not os.path.exists(asm_dir):
             return cls()
-        for f in os.listdir(asm_dir):
-            if not f.endswith(".s"):
-                continue
-            name = f[:-2]  # strip .s
-            # Extract address from filename
-            m = re.match(r"(?:FUN_|sym_|)([0-9A-Fa-f]{6,8})", name)
-            if m:
-                try:
-                    addr = int(m.group(1), 16)
-                    addr_to_name[addr] = name
-                except ValueError:
-                    pass
+        for dirpath, _dirnames, filenames in os.walk(asm_dir):
+            for f in filenames:
+                if not f.endswith(".s"):
+                    continue
+                name = f[:-2]  # strip .s
+                m = re.match(r"^(?:FUN_|sym_)([0-9A-Fa-f]{6,8})$", name)
+                if m:
+                    try:
+                        addr = int(m.group(1), 16)
+                        addr_to_name[addr] = name
+                    except ValueError:
+                        pass
         return cls(addr_to_name)
 
     @classmethod
     def from_map_file(cls, map_path):
-        """Build a function table from a linker map file.
-
-        Parses lines like: 0x06012345 function_name
-        """
+        """Build a function table from a linker map file."""
         addr_to_name = {}
         if not os.path.exists(map_path):
             return cls()
@@ -77,28 +85,46 @@ class FunctionTable:
             for line in f:
                 parts = line.strip().split()
                 if len(parts) >= 2:
+                    raw = parts[0]
+                    if raw.startswith("0x") or raw.startswith("0X"):
+                        raw = raw[2:]
                     try:
-                        addr = int(parts[0].replace("0x", ""), 16)
+                        addr = int(raw, 16)
                         addr_to_name[addr] = parts[1]
                     except ValueError:
                         pass
         return cls(addr_to_name)
 
     def name_at(self, addr):
-        """Find the function containing this address."""
+        """Find the function containing this address.
+
+        Returns the function name if the address is within MAX_FUNCTION_SIZE
+        of a known function start. Otherwise returns a hex string.
+        """
         if isinstance(addr, str):
-            addr = int(addr.replace("0x", ""), 16)
+            try:
+                addr = int(addr.replace("0x", "").replace("0X", ""), 16)
+            except ValueError:
+                return f"0x{addr}"
         idx = bisect.bisect_right(self.addrs, addr) - 1
         if idx >= 0:
-            return self.names[idx]
+            offset = addr - self.addrs[idx]
+            if offset <= self.MAX_FUNCTION_SIZE:
+                return self.names[idx]
         return f"0x{addr:08X}"
 
 
-def analyze_calls(raw_calls, ftable=None, master_only=True):
-    """Analyze raw call trace into structured edge data.
+def _normalize_addr(hex_str):
+    """Normalize a hex address string to consistent uppercase format."""
+    try:
+        val = int(hex_str, 16)
+        return f"0x{val:08X}"
+    except ValueError:
+        return f"0x{hex_str}"
 
-    Returns dict with edges, functions, callers_of, callees_of, roots.
-    """
+
+def analyze_calls(raw_calls, ftable=None, master_only=True):
+    """Analyze raw call trace into structured edge data."""
     edges = Counter()
     functions = set()
     callers_of = defaultdict(set)
@@ -108,12 +134,13 @@ def analyze_calls(raw_calls, ftable=None, master_only=True):
         if master_only and cpu != "M":
             continue
 
-        if ftable:
+        if ftable and len(ftable.addrs) > 0:
             caller_name = ftable.name_at(caller_hex)
             target_name = ftable.name_at(target_hex)
         else:
-            caller_name = f"0x{caller_hex}"
-            target_name = f"0x{target_hex}"
+            # Normalize to consistent format when no symbol table
+            caller_name = _normalize_addr(caller_hex)
+            target_name = _normalize_addr(target_hex)
 
         edge = (caller_name, target_name)
         edges[edge] += 1
@@ -126,6 +153,13 @@ def analyze_calls(raw_calls, ftable=None, master_only=True):
     all_callers = set(callees_of.keys())
     all_callees = set(callers_of.keys())
     roots = all_callers - all_callees
+
+    # If no roots (pure cycles), pick the highest-call-count function
+    if not roots and edges:
+        func_counts = Counter()
+        for (caller, _), count in edges.items():
+            func_counts[caller] += count
+        roots = {func_counts.most_common(1)[0][0]}
 
     return {
         "edges": dict(edges),
@@ -141,66 +175,49 @@ def format_tree(analysis):
     edges = analysis["edges"]
     roots = analysis["roots"]
 
-    # Build adjacency list
-    children = defaultdict(list)
-    for (caller, callee), count in sorted(edges.items()):
-        children[caller].append((callee, count))
+    if not edges:
+        return "(empty call graph)"
 
-    # Sort children by count (most called first)
+    # Build adjacency list sorted by call count (most called first)
+    children = defaultdict(list)
+    for (caller, callee), count in edges.items():
+        children[caller].append((callee, count))
     for k in children:
         children[k].sort(key=lambda x: -x[1])
 
     lines = []
     visited = set()
 
-    def _render(node, prefix="", is_last=True):
-        if node in visited:
-            lines.append(f"{prefix}{'`-- ' if is_last else '|-- '}{node} (recursive)")
-            return
+    def _render(node, count=0, prefix="", is_last=True, depth=0):
+        """Render a node and all its descendants recursively."""
+        # Build this node's line
+        if depth == 0:
+            # Root node — no connector
+            lines.append(node)
+        else:
+            connector = "`-- " if is_last else "|-- "
+            count_str = f" (x{count})" if count > 1 else ""
+            if node in visited:
+                lines.append(f"{prefix}{connector}{node}{count_str} (*)")
+                return
+            lines.append(f"{prefix}{connector}{node}{count_str}")
+
         visited.add(node)
 
-        connector = "`-- " if is_last else "|-- "
-        lines.append(f"{prefix}{connector}{node}")
-
+        # Render children
         kids = children.get(node, [])
-        for i, (child, count) in enumerate(kids):
+        for i, (child, child_count) in enumerate(kids):
             is_child_last = (i == len(kids) - 1)
-            child_prefix = prefix + ("    " if is_last else "|   ")
-            count_str = f" (x{count})" if count > 1 else ""
-
-            if child in visited:
-                child_connector = "`-- " if is_child_last else "|-- "
-                lines.append(f"{child_prefix}{child_connector}{child}{count_str} (recursive)")
+            if depth == 0:
+                child_prefix = "    "
             else:
-                visited.add(child)
-                child_connector = "`-- " if is_child_last else "|-- "
-                lines.append(f"{child_prefix}{child_connector}{child}{count_str}")
-
-                grandkids = children.get(child, [])
-                for j, (gc, gc_count) in enumerate(grandkids):
-                    is_gc_last = (j == len(grandkids) - 1)
-                    gc_prefix = child_prefix + ("    " if is_child_last else "|   ")
-                    _render(gc, gc_prefix, is_gc_last)
+                child_prefix = prefix + ("    " if is_last else "|   ")
+            _render(child, child_count, child_prefix, is_child_last, depth + 1)
 
     for i, root in enumerate(sorted(roots)):
         if i > 0:
             lines.append("")
-        lines.append(root)
-        kids = children.get(root, [])
-        for j, (child, count) in enumerate(kids):
-            is_last_child = (j == len(kids) - 1)
-            count_str = f" (x{count})" if count > 1 else ""
-            if child in visited:
-                connector = "`-- " if is_last_child else "|-- "
-                lines.append(f"    {connector}{child}{count_str} (recursive)")
-            else:
-                visited.add(child)
-                connector = "`-- " if is_last_child else "|-- "
-                lines.append(f"    {connector}{child}{count_str}")
-                grandkids = children.get(child, [])
-                for k, (gc, gc_count) in enumerate(grandkids):
-                    is_gc_last = (k == len(grandkids) - 1)
-                    _render(gc, "    " + ("    " if is_last_child else "|   "), is_gc_last)
+        _render(root, depth=0)
 
     return "\n".join(lines)
 
@@ -242,11 +259,7 @@ def diff_analyses(baseline, with_input):
 
 
 def cross_reference(scenario_analyses):
-    """Cross-reference multiple scenario analyses.
-
-    scenario_analyses: dict of label -> analysis dict
-    Returns common core edges and per-scenario unique edges.
-    """
+    """Cross-reference multiple scenario analyses."""
     if not scenario_analyses:
         return {"common": set(), "unique": {}}
 
@@ -255,10 +268,8 @@ def cross_reference(scenario_analyses):
         for label, a in scenario_analyses.items()
     }
 
-    # Common core: edges in ALL scenarios
-    common = set.intersection(*all_edge_sets.values()) if all_edge_sets else set()
+    common = set.intersection(*all_edge_sets.values())
 
-    # Unique per scenario
     unique = {}
     for label, edges in all_edge_sets.items():
         others = set()
@@ -267,12 +278,10 @@ def cross_reference(scenario_analyses):
                 others |= other_edges
         unique[label] = edges - others
 
-    # All edges
     all_edges = set()
     for edges in all_edge_sets.values():
         all_edges |= edges
 
-    # Function reach: which scenarios call each function
     func_scenarios = defaultdict(set)
     for label, a in scenario_analyses.items():
         for func in a["functions"]:
@@ -290,18 +299,22 @@ def find_gaps(analysis, observations_dir):
     """Find functions in the call graph that have no observation file.
 
     Returns list of (function_name, call_count) sorted by call count.
+    Checks both callees and callers (root functions that only call others).
     """
-    # Count total calls per function (as callee)
+    # Count total calls per function (as callee + as caller)
     func_calls = Counter()
     for (caller, callee), count in analysis["edges"].items():
         func_calls[callee] += count
+        if caller not in func_calls:
+            func_calls[caller] = 0  # ensure roots appear
 
     # Check which have observations
     observed = set()
     if os.path.exists(observations_dir):
         for f in os.listdir(observations_dir):
             if f.endswith("_obs.md"):
-                observed.add(f.replace("_obs.md", ""))
+                name = f[:-7]  # strip "_obs.md" (7 chars)
+                observed.add(name)
 
     gaps = []
     for func, count in func_calls.most_common():
