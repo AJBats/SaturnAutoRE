@@ -695,19 +695,12 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
     os.makedirs(cg_dir, exist_ok=True)
     os.makedirs(traces_dir, exist_ok=True)
     # Ensure traces dir is gitignored (raw traces are build artifacts)
-    # Ensure traces dir is gitignored (raw traces are build artifacts)
     traces_gi = os.path.join(traces_dir, ".gitignore")
     if not os.path.exists(traces_gi):
         with open(traces_gi, "w") as f:
             f.write("# Raw traces are build artifacts -- too large to commit.\n")
             f.write("# Analyzed graphs in call_graphs/ are the committed output.\n")
             f.write("*\n!.gitignore\n")
-    # Also prevent stale traces in call_graphs/ from being committed
-    cg_gi = os.path.join(cg_dir, ".gitignore")
-    if not os.path.exists(cg_gi):
-        with open(cg_gi, "w") as f:
-            f.write("# Raw traces belong in traces/, not here.\n")
-            f.write("*_trace.txt\n")
 
     print(f"=== Call Graph Analysis ===")
     print()
