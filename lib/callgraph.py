@@ -53,19 +53,31 @@ class FunctionTable:
 
     @classmethod
     def from_assembly_dir(cls, asm_dir):
-        """Build a function table from assembly source filenames.
+        """Build a function table from assembly source files.
 
-        Expects files named like FUN_06012345.s or sym_06012345.s.
+        Supports two layouts:
+        1. One file per function (FUN_06012345.s) — filename IS the function
+        2. Multi-function files (disassembly.s) — scans contents for labels
+
         Recurses into subdirectories.
         """
         addr_to_name = {}
         if not asm_dir or not os.path.exists(asm_dir):
             return cls()
+
+        # Pattern for function labels inside .s files
+        # Matches: "FUN_060a0480:" or "sym_06012345:" at start of line
+        label_pattern = re.compile(r"^((?:FUN_|sym_)[0-9A-Fa-f]{6,8})\s*:", re.MULTILINE)
+        # Also matches: "; Entry: 060a0480" comment headers from Ghidra exports
+        entry_pattern = re.compile(r";\s*Entry:\s*([0-9A-Fa-f]{6,8})", re.MULTILINE)
+
         for dirpath, _dirnames, filenames in os.walk(asm_dir):
             for f in filenames:
                 if not f.endswith(".s"):
                     continue
                 name = f[:-2]  # strip .s
+
+                # Try filename-as-function first (one file per function)
                 m = re.match(r"^(?:FUN_|sym_)([0-9A-Fa-f]{6,8})$", name)
                 if m:
                     try:
@@ -73,6 +85,36 @@ class FunctionTable:
                         addr_to_name[addr] = name
                     except ValueError:
                         pass
+                    continue
+
+                # Filename doesn't match — scan contents for function labels
+                filepath = os.path.join(dirpath, f)
+                try:
+                    with open(filepath, encoding="utf-8", errors="replace") as fh:
+                        content = fh.read()
+                except (IOError, OSError):
+                    continue
+
+                # Find labels like "FUN_060a0480:"
+                for lm in label_pattern.finditer(content):
+                    label = lm.group(1)
+                    addr_hex = re.match(r"(?:FUN_|sym_)([0-9A-Fa-f]+)", label)
+                    if addr_hex:
+                        try:
+                            addr = int(addr_hex.group(1), 16)
+                            addr_to_name[addr] = label
+                        except ValueError:
+                            pass
+
+                # Also find "; Entry: XXXXXXXX" headers
+                for em in entry_pattern.finditer(content):
+                    try:
+                        addr = int(em.group(1), 16)
+                        if addr not in addr_to_name:
+                            addr_to_name[addr] = f"FUN_{em.group(1)}"
+                    except ValueError:
+                        pass
+
         return cls(addr_to_name)
 
     @classmethod

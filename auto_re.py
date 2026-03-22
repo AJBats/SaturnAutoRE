@@ -623,9 +623,10 @@ def cmd_review(config):
     print(f"")
     # Check what bulk analysis exists
     cg_dir = os.path.join(auto_re_dir, "call_graphs")
-    has_callgraph = (os.path.exists(cg_dir) and
-                     any(f.endswith("_trace.txt") for f in os.listdir(cg_dir))
-                     ) if os.path.exists(cg_dir) else False
+    traces_dir = os.path.join(auto_re_dir, "traces")
+    has_callgraph = False
+    if os.path.exists(cg_dir):
+        has_callgraph = any(f.endswith("_graph.txt") for f in os.listdir(cg_dir))
 
     print(f"  Current state: {obs_count} observations, {claims_count} claims, {len(results)} results.")
     print(f"  Call graph analysis: {'done' if has_callgraph else 'NOT done'}")
@@ -691,7 +692,16 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
     observations_dir = config["_observations_dir"]
 
     cg_dir = os.path.join(auto_re_dir, "call_graphs")
+    traces_dir = os.path.join(auto_re_dir, "traces")
     os.makedirs(cg_dir, exist_ok=True)
+    os.makedirs(traces_dir, exist_ok=True)
+    # Ensure traces dir is gitignored (raw traces are build artifacts)
+    traces_gi = os.path.join(traces_dir, ".gitignore")
+    if not os.path.exists(traces_gi):
+        with open(traces_gi, "w") as f:
+            f.write("# Raw traces are build artifacts -- too large to commit.\n")
+            f.write("# Analyzed graphs in call_graphs/ are the committed output.\n")
+            f.write("*\n!.gitignore\n")
 
     print(f"=== Call Graph Analysis ===")
     print()
@@ -770,7 +780,7 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
                 skip_frames = skip_frames or 0
                 capture_frames = frames
 
-        trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
+        trace_path = os.path.join(traces_dir, f"{name}_trace.txt")
 
         print(f"--- Scenario: {name} ---")
         if notes:
@@ -814,7 +824,7 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
 
     existing_traces = {}
     for name in targets:
-        trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
+        trace_path = os.path.join(traces_dir, f"{name}_trace.txt")
         if os.path.exists(trace_path):
             existing_traces[name] = trace_path
 
@@ -823,7 +833,7 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
     if os.path.exists(ipc_trace):
         missing = [n for n in targets if n not in existing_traces]
         if len(missing) == 1:
-            dest = os.path.join(cg_dir, f"{missing[0]}_trace.txt")
+            dest = os.path.join(traces_dir, f"{missing[0]}_trace.txt")
             import shutil
             shutil.copy2(ipc_trace, dest)
             existing_traces[missing[0]] = dest
@@ -834,7 +844,7 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
             print(f"Trace file found at {ipc_trace} but {len(missing)} scenarios")
             print(f"still need traces. Copy it manually to the right scenario:")
             for n in missing:
-                print(f"  cp {ipc_trace} {os.path.join(cg_dir, f'{n}_trace.txt')}")
+                print(f"  cp {ipc_trace} {os.path.join(traces_dir, f'{n}_trace.txt')}")
             print()
 
     if existing_traces:
