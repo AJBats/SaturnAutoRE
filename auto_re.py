@@ -761,19 +761,14 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         capture_frames = cg_hints.get("capture", 0)
 
         if not capture_frames:
-            # Smart defaults based on scenario length
-            if frames <= 10 or frames == 0:
-                # Short or unspecified — capture from the start
-                skip_frames = skip_frames or 0
-                capture_frames = max(frames, 5)
-            elif frames <= 60:
-                # Medium — capture the last portion (event likely near end)
-                skip_frames = skip_frames or max(0, frames - 15)
-                capture_frames = min(15, frames - skip_frames)
+            # Default: capture the entire scenario. Events are fuzzy —
+            # the buildup matters as much as the event itself. The trace
+            # file is just text; bigger is fine for analysis.
+            if frames <= 0:
+                capture_frames = 5  # unspecified — just grab a few frames
             else:
-                # Long — capture near the end where events happen
-                skip_frames = skip_frames or int(frames * 0.85)
-                capture_frames = min(30, frames - skip_frames)
+                skip_frames = skip_frames or 0
+                capture_frames = frames
 
         trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
 
