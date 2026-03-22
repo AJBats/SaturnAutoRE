@@ -114,30 +114,9 @@ def cmd_status(config):
         print()
         print(f"Next, run: auto_re.py verify {func}")
     else:
-        # Check if call graph analysis has been done
-        cg_dir = os.path.join(auto_re_dir, "call_graphs")
-        has_callgraph = os.path.exists(cg_dir) and any(
-            f.endswith("_trace.txt") for f in os.listdir(cg_dir)
-        ) if os.path.exists(cg_dir) else False
-
-        print(f"All current observations are verified.")
+        print(f"All current observations are verified. Pick a new function to explore.")
         print()
-        if not has_callgraph and len(config.get("save_states", {})) > 0:
-            print(f"Before picking new targets, consider running a call graph analysis")
-            print(f"to map the full system architecture and find high-value gaps:")
-            print()
-            print(f"  auto_re.py callgraph --all")
-            print()
-            print(f"This captures the complete call tree for each scenario, identifies")
-            print(f"functions that fire per frame but have no observation, and produces")
-            print(f"informed targets for exploration.")
-            print()
-            print(f"Or skip straight to exploration:")
-            print(f"  auto_re.py pick")
-        else:
-            print(f"Pick a new function to explore.")
-            print()
-            print(f"Next, run: auto_re.py pick")
+        print(f"Next, run: auto_re.py pick")
 
 
 def cmd_pick(config):
