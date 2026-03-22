@@ -12,18 +12,38 @@
 # Fields:
 #   function    — the function being tested (FUN_XXXXXXXX)
 #   field       — the struct field being NOPed (e.g. +0x24)
-#   patch_addr  — address to poke with 00 09 (the actual write instruction)
+#   patch_addr  — address of the STORE instruction to NOP (NOT the claim PC)
+#   patch_verified — true if you confirmed the opcode at patch_addr is a store
 #   scenario    — save state scenario to use
 #   prediction  — what we expect to happen
 #   status      — proposed | confirmed | disproved | inconclusive
 #   result      — what actually happened (filled in after test)
 #   conclusion  — one-line summary of what we learned
 #   name        — proposed function/field name if confirmed
+#
+# IMPORTANT: patch_addr verification
+#
+#   Claim PCs from writes_to watchpoints report the PC AFTER the store
+#   instruction (SH-2 pipeline delay). The actual store is typically 2-4
+#   bytes EARLIER. Always verify before writing patch_addr:
+#
+#   1. Read memory at the candidate address:
+#        read_memory <addr> 4
+#   2. Check that the opcode is a store instruction:
+#        mov.l Rm, @(...) = various encodings
+#        mov.w Rm, @(...) = various encodings
+#        mov.b Rm, @(...) = various encodings
+#   3. If it's NOT a store, try addr-2 or addr+2
+#   4. Set patch_verified: true once confirmed
+#
+#   Getting this wrong NOPs the wrong instruction, producing misleading
+#   results (crashes, register corruption instead of clean field disable).
 
 experiments:
   # - function: FUN_060366EC
   #   field: "+0x24"
   #   patch_addr: "0x060366F6"
+  #   patch_verified: true
   #   scenario: straight_throttle
   #   prediction: "Car stays still despite throttle — velocity never integrates"
   #   status: confirmed

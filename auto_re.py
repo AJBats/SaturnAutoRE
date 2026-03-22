@@ -1362,9 +1362,14 @@ def cmd_nop_candidates(config):
                 print(f"  {c['function']}: Tier {c['tier']} (observation-based, writes_to blocked)")
         print()
 
-    # Guidance + pre-generated YAML entries for standard candidates
+    # Guidance
     nop_yaml = os.path.join(auto_re_dir, "nop_experiments.yaml")
     print(f"--- Adding NOP experiments ---")
+    print()
+    print(f"WARNING: Claim PCs are NOT patch addresses. SH-2 watchpoints report")
+    print(f"the PC 2-4 bytes AFTER the store instruction. Always verify the opcode")
+    print(f"at the candidate address is a store (mov.l/mov.w/mov.b) before writing")
+    print(f"patch_addr. See the template for the verification procedure.")
     print()
     print(f"Add experiments to: {nop_yaml}")
     if not os.path.exists(nop_yaml):
