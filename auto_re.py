@@ -114,9 +114,30 @@ def cmd_status(config):
         print()
         print(f"Next, run: auto_re.py verify {func}")
     else:
-        print(f"All current observations are verified. Pick a new function to explore.")
+        # Check if call graph analysis has been done
+        cg_dir = os.path.join(auto_re_dir, "call_graphs")
+        has_callgraph = os.path.exists(cg_dir) and any(
+            f.endswith("_trace.txt") for f in os.listdir(cg_dir)
+        ) if os.path.exists(cg_dir) else False
+
+        print(f"All current observations are verified.")
         print()
-        print(f"Next, run: auto_re.py pick")
+        if not has_callgraph and len(config.get("save_states", {})) > 0:
+            print(f"Before picking new targets, consider running a call graph analysis")
+            print(f"to map the full system architecture and find high-value gaps:")
+            print()
+            print(f"  auto_re.py callgraph --all")
+            print()
+            print(f"This captures the complete call tree for each scenario, identifies")
+            print(f"functions that fire per frame but have no observation, and produces")
+            print(f"informed targets for exploration.")
+            print()
+            print(f"Or skip straight to exploration:")
+            print(f"  auto_re.py pick")
+        else:
+            print(f"Pick a new function to explore.")
+            print()
+            print(f"Next, run: auto_re.py pick")
 
 
 def cmd_pick(config):
@@ -616,7 +637,14 @@ def cmd_review(config):
     print(f"  - Scan workstreams/auto_re/observations/ (all _obs.md files)")
     print(f"  - Scan workstreams/auto_re/claims/ (all .yaml files)")
     print(f"")
+    # Check what bulk analysis exists
+    cg_dir = os.path.join(auto_re_dir, "call_graphs")
+    has_callgraph = (os.path.exists(cg_dir) and
+                     any(f.endswith("_trace.txt") for f in os.listdir(cg_dir))
+                     ) if os.path.exists(cg_dir) else False
+
     print(f"  Current state: {obs_count} observations, {claims_count} claims, {len(results)} results.")
+    print(f"  Call graph analysis: {'done' if has_callgraph else 'NOT done'}")
     print(f"")
     print(f"  Check for these issues and return a SHORT list of action items:")
     print(f"")
@@ -630,6 +658,16 @@ def cmd_review(config):
     print(f"  - Read mission.md. Is the recent work aligned with the mission objective?")
     print(f"  - Are there mission-critical gaps being ignored in favor of easier targets?")
     print(f"  - Is the knowledge base up to date with recent findings?")
+    print(f"")
+    print(f"  STRATEGY:")
+    print(f"  - Has the agent run bulk analysis tools (auto_re.py callgraph, inputdiff,")
+    print(f"    discmap)? These map the full system architecture in one shot.")
+    print(f"    If not, and the agent is picking functions by guesswork or low-value")
+    print(f"    call-chain following, suggest running callgraph --all first.")
+    print(f"  - Is the agent exploring functions that matter for the mission, or")
+    print(f"    drifting into utility code and AI subsystems?")
+    print(f"  - Are the exploration priorities informed by data (call graph gaps,")
+    print(f"    input-responsive memory regions) or by habit?")
     print(f"")
     print(f"  MOMENTUM:")
     print(f"  - Are there unfinished priorities in explorer_priorities.md?")
