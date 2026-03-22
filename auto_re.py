@@ -990,84 +990,114 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         print(f"Run: auto_re.py status")
 
 
+def _parse_mcp_tools(mcp_path):
+    """Extract tool names and docstrings from mcp_server.py.
+
+    Finds all @mcp.tool() decorated async functions and returns a list
+    of (name, first_line_of_docstring) tuples.
+    """
+    tools = []
+    try:
+        with open(mcp_path, encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except (IOError, OSError):
+        return tools
+
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("@mcp.tool"):
+            # Find the function def (may be next line or a few lines later)
+            for j in range(i + 1, min(i + 5, len(lines))):
+                defline = lines[j].strip()
+                m = re.match(r"async def (\w+)\(", defline)
+                if m:
+                    name = m.group(1)
+                    # Skip past the full signature (may span multiple lines)
+                    # Find the line ending with ":"
+                    sig_end = j
+                    for s in range(j, min(j + 20, len(lines))):
+                        if lines[s].rstrip().endswith(":"):
+                            sig_end = s
+                            break
+                    # Look for docstring after signature
+                    doc = ""
+                    for k in range(sig_end + 1, min(sig_end + 5, len(lines))):
+                        docline = lines[k].strip()
+                        if docline.startswith('"""') or docline.startswith("'''"):
+                            doc = docline.strip("\"'").strip()
+                            if not doc:
+                                # Multi-line — grab next line
+                                if k + 1 < len(lines):
+                                    doc = lines[k + 1].strip().strip("\"'").strip()
+                            break
+                        if docline and not docline.startswith("#"):
+                            break  # non-docstring code — no docstring exists
+                    tools.append((name, doc))
+                    break
+        i += 1
+    return tools
+
+
 def cmd_tools(config):
     """List available analysis tools and MCP capabilities."""
+    from lib.config import MEDNAFEN_DIR
+
     print(f"=== Available Analysis Tools ===")
     print()
-    print(f"These are capabilities available through the Mednafen MCP debugger")
-    print(f"and the auto_re CLI. Use them whenever they'd help your investigation.")
-    print()
+
+    # --- CLI Tools ---
     print(f"--- CLI Tools (auto_re.py) ---")
     print()
-    print(f"  auto_re.py callgraph [--all] [--diff]")
-    print(f"    Capture and analyze per-frame call trees. Shows caller->callee")
-    print(f"    edges, ASCII tree, cross-scenario comparison, gap analysis.")
+    print(f"  status            Show pipeline status and next action")
+    print(f"  pick              Pick the next function to investigate")
+    print(f"  explore-check     Validate an observation file")
+    print(f"  verify            Generate claims and run oracle")
+    print(f"  integrate         Check results, NOP candidates, suggest next steps")
+    print(f"  review            Quality and momentum check via reviewer subagent")
+    print(f"  callgraph         Capture and analyze per-frame call trees")
+    print(f"  memdiff           Compare two memory dumps byte-by-byte")
+    print(f"  nop-candidates    List functions ready for NOP testing")
+    print(f"  graduate          List or review function graduation candidates")
+    print(f"  tools             This listing")
     print()
-    print(f"  auto_re.py memdiff <dump_a> <dump_b> [--label-a X] [--label-b Y]")
-    print(f"    Compare two memory dumps byte-by-byte. Reports active regions,")
-    print(f"    classifies against known structs. Use for any comparison:")
-    print(f"    idle vs input, frame N vs N+1, normal vs NOPed.")
-    print()
-    print(f"--- MCP Debugger Tools (use during live sessions) ---")
-    print()
-    print(f"  TRACING:")
-    print(f"    call_trace_start / call_trace_stop")
-    print(f"      Record all JSR/BSR/BSRF calls. Output: call_trace.txt")
-    print(f"      Use with: auto_re.py callgraph (for analysis)")
-    print()
-    print(f"    pc_trace_frame")
-    print(f"      Full PC trace for one frame -- every instruction executed.")
-    print(f"      Heavy but complete. Good for finding which functions fire.")
-    print()
-    print(f"    dma_trace_start / dma_trace_stop")
-    print(f"      Log all DMA transfers (source, dest, size). Shows what data")
-    print(f"      moves where -- disc loads, VRAM fills, sound transfers.")
-    print()
-    print(f"    mem_profile_start <lo> <hi> / mem_profile_stop")
-    print(f"      Log all CPU writes to an address range. Shows every PC that")
-    print(f"      writes to the region and what values. Good for finding ALL")
-    print(f"      writers to a struct (not just one watchpoint at a time).")
-    print()
-    print(f"    cdl_start / cdl_stop / cdl_dump <path>")
-    print(f"      Code/Data Logging -- marks every byte as CODE, DATA_READ,")
-    print(f"      or DATA_WRITE. Shows what code executed and what data was")
-    print(f"      touched. Run across scenarios to build coverage maps.")
-    print()
-    print(f"  MEMORY:")
-    print(f"    dump_region <addr> <size> [path]")
-    print(f"      Dump raw memory to binary file. Use with: auto_re.py memdiff")
-    print()
-    print(f"    memory_snapshot <name> / memory_compare <old> <new>")
-    print(f"      In-session memory snapshots for cheat-engine-style searches.")
-    print(f"      Find addresses where values changed/stayed/increased/etc.")
-    print()
-    print(f"    sample_memory <addr> <size> <frames> [path]")
-    print(f"      Dump a memory region every frame at emulator speed.")
-    print(f"      No IPC overhead. Use for per-frame field analysis.")
-    print()
-    print(f"  DEBUGGING:")
-    print(f"    breakpoint_set / breakpoint_clear / breakpoint_list")
-    print(f"    watchpoint_set / watchpoint_clear / watchpoint_hits")
-    print(f"    step / dump_regs / read_memory / call_stack")
-    print(f"    poke (via raw_command) -- patch instructions at runtime")
-    print()
-    print(f"  INPUT:")
-    print(f"    input_press / input_release / input_clear / input_tap")
-    print(f"    input_playback (recorded input file for complex scenarios)")
-    print()
+
+    # --- MCP Tools (parsed from mcp_server.py) ---
+    mcp_path = os.path.join(MEDNAFEN_DIR, "mcp_server.py")
+    tools = _parse_mcp_tools(mcp_path)
+
+    if tools:
+        print(f"--- MCP Debugger Tools ({len(tools)} tools, from mcp_server.py) ---")
+        print()
+        for name, doc in tools:
+            if doc:
+                print(f"  {name:30s} {doc[:70]}")
+            else:
+                print(f"  {name}")
+        print()
+    else:
+        print(f"--- MCP Debugger Tools ---")
+        print()
+        print(f"  Could not parse tools from {mcp_path}")
+        print(f"  Run the MCP server interactively to see available tools.")
+        print()
+
+    # --- Static Analysis ---
+    asm_dir = get_assembly_dir(config)
+    project_dir = config["_project_dir"]
+    ghidra_dir = os.path.join(project_dir, "ghidra_reference")
+
     print(f"--- Static Analysis ---")
     print()
-    print(f"  If the project has ghidra_reference/ with decompiled C files,")
-    print(f"  read them to aid static analysis — understand control flow,")
-    print(f"  identify struct fields, and trace data dependencies before")
-    print(f"  running dynamic experiments.")
+    if asm_dir and os.path.exists(asm_dir):
+        count = sum(1 for f in os.listdir(asm_dir) if f.endswith(".s"))
+        print(f"  Assembly: {asm_dir} ({count} .s files)")
+    if os.path.exists(ghidra_dir):
+        count = sum(1 for f in os.listdir(ghidra_dir) if f.endswith(".c"))
+        print(f"  Ghidra C: {ghidra_dir} ({count} .c files)")
+        print(f"    Read decompiled C to aid static analysis — understand control")
+        print(f"    flow, identify struct fields, trace data dependencies.")
     print()
-    print(f"Combine these tools creatively. Examples:")
-    print(f"  - mem_profile a struct range to find ALL writers in one shot")
-    print(f"  - CDL capture across 4 scenarios to classify functions as")
-    print(f"    RACING_ONLY vs SHARED vs MENU_ONLY")
-    print(f"  - DMA trace during boot to map disc files to RAM addresses")
-    print(f"  - dump_region before/after a NOP test to see what changed")
 
 
 def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
@@ -1180,6 +1210,349 @@ def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
         print(f"  Override with: --region-lo 0xADDR --region-hi 0xADDR")
 
 
+def cmd_nop_candidates(config):
+    """List NOP-test-ready functions."""
+    auto_re_dir = config["_auto_re_dir"]
+    results_path = config["_results_path"]
+
+    print(f"=== NOP Test Candidates ===")
+    print()
+
+    results = parse_results(results_path)
+    if not results:
+        print(f"No results in results.tsv yet. Run the explore→verify cycle first.")
+        return
+
+    candidates = _find_nop_candidates(auto_re_dir, results)
+
+    if not candidates:
+        print(f"No NOP candidates found. Functions need:")
+        print(f"  - Tier 2 with a passing writes_to claim, OR")
+        print(f"  - Tier 1 with a rich observation (bypass path)")
+        return
+
+    standard = [c for c in candidates if c.get("path") == "standard"]
+    bypass = [c for c in candidates if c.get("path") == "bypass"]
+
+    if standard:
+        print(f"-- Tier 2 candidates (writes_to confirmed) --")
+        print()
+        for c in standard:
+            pc_info = f" at PC {c['writer_pc']}" if c.get("writer_pc") else ""
+            print(f"  {c['function']}: writes_to {c['target']}{pc_info}")
+            print(f"    Claim: {c['claim_id']}, Tier {c['tier']}")
+        print()
+
+    if bypass:
+        print(f"-- Tier 1 candidates (NOP bypass -- writes_to blocked) --")
+        print()
+        for c in bypass:
+            print(f"  {c['function']}: Tier {c['tier']} (observation-based)")
+            print(f"    writes_to claims failed or couldn't be written.")
+            print(f"    Read the observation and predict the NOP effect manually.")
+        print()
+
+    print(f"Total: {len(candidates)} candidate(s)")
+    print()
+    print(f"To write NOP experiments, read each function's observation and predict")
+    print(f"what breaks when the function is disabled. Document in nop_experiments.md.")
+    print()
+    print(f"After running NOP tests, graduated functions can be renamed:")
+    print(f"  auto_re.py graduate")
+
+
+def _parse_graduated(auto_re_dir):
+    """Read graduated.tsv and return dict of function -> graduation info."""
+    grad_path = os.path.join(auto_re_dir, "graduated.tsv")
+    graduated = {}
+    if not os.path.exists(grad_path):
+        return graduated
+    with open(grad_path, encoding="utf-8", errors="replace") as f:
+        header = None
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split("\t")
+            if header is None:
+                header = parts
+                continue
+            row = {}
+            for i, col in enumerate(header):
+                row[col] = parts[i] if i < len(parts) else ""
+            graduated[row.get("function", "")] = row
+    return graduated
+
+
+def _find_graduation_candidates(auto_re_dir, results):
+    """Find functions ready for graduation (rename + annotation).
+
+    A graduation candidate has:
+    - NOP test results (mentioned in nop_experiments.md with CONFIRMED), OR
+    - Tier 2 with writes_to + behavioral understanding
+    AND:
+    - Not already graduated (not in graduated.tsv)
+    """
+    candidates = []
+    graduated = _parse_graduated(auto_re_dir)
+
+    # Check NOP experiments file for confirmed functions
+    nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
+    nop_confirmed = {}
+    if os.path.exists(nop_file):
+        try:
+            with open(nop_file, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            # Find CONFIRMED results with function names
+            for m in re.finditer(
+                r"(FUN_[0-9A-Fa-f]+|sym_[0-9A-Fa-f]+).*?CONFIRMED[:\s]+(.+?)(?:\n|$)",
+                content, re.IGNORECASE
+            ):
+                nop_confirmed[m.group(1)] = m.group(2).strip()
+        except (IOError, OSError):
+            pass
+
+    # Also check for nop_experiments.md in sibling dirs (driving_model/)
+    dm_nop = os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md")
+    if os.path.exists(dm_nop):
+        try:
+            with open(dm_nop, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+            for m in re.finditer(
+                r"(FUN_[0-9A-Fa-f]+|sym_[0-9A-Fa-f]+).*?CONFIRMED[:\s]+(.+?)(?:\n|$)",
+                content, re.IGNORECASE
+            ):
+                if m.group(1) not in nop_confirmed:
+                    nop_confirmed[m.group(1)] = m.group(2).strip()
+        except (IOError, OSError):
+            pass
+
+    # Build candidate list
+    result_map = {r.get("function", ""): r for r in results}
+
+    for func, conclusion in nop_confirmed.items():
+        if func in graduated:
+            continue
+        tier = 0
+        if func in result_map:
+            try:
+                tier = int(result_map[func].get("tier", 0))
+            except ValueError:
+                pass
+        candidates.append({
+            "function": func,
+            "evidence": f"NOP-confirmed: {conclusion}",
+            "tier": tier,
+            "source": "nop",
+        })
+
+    # Also include Tier 2 functions with writes_to that haven't been NOP'd
+    # These are candidates for graduation IF the human is satisfied with
+    # the oracle evidence alone (without a NOP test)
+    for r in results:
+        func = r.get("function", "")
+        if func in graduated or func in nop_confirmed:
+            continue
+        try:
+            tier = int(r.get("tier", 0))
+        except ValueError:
+            continue
+        if tier < 2:
+            continue
+        # Check for writes_to PASS in notes (adjacent, not just anywhere)
+        notes = r.get("notes", "")
+        if re.search(r"writes_\w+\s+PASS", notes, re.IGNORECASE):
+            candidates.append({
+                "function": func,
+                "evidence": f"Tier 2 with writes_to PASS",
+                "tier": tier,
+                "source": "tier2",
+            })
+
+    return candidates
+
+
+def cmd_graduate(config, func_name=None, proposed_name=None):
+    """List graduation candidates or start graduation review for a function."""
+    auto_re_dir = config["_auto_re_dir"]
+    results_path = config["_results_path"]
+    results = parse_results(results_path)
+    graduated = _parse_graduated(auto_re_dir)
+
+    if func_name is None:
+        # List mode — show candidates
+        print(f"=== Graduation Candidates ===")
+        print()
+
+        if graduated:
+            print(f"Already graduated ({len(graduated)}):")
+            for func, info in graduated.items():
+                print(f"  {func} -> {info.get('name', '?')} ({info.get('date', '?')})")
+            print()
+
+        candidates = _find_graduation_candidates(auto_re_dir, results)
+
+        if not candidates:
+            print(f"No candidates ready for graduation.")
+            print()
+            print(f"Functions graduate when they have:")
+            print(f"  - NOP test confirmation (strongest), OR")
+            print(f"  - Tier 2 with a passing writes_to claim")
+            print()
+            print(f"Run: auto_re.py nop-candidates")
+            return
+
+        nop_cands = [c for c in candidates if c["source"] == "nop"]
+        tier2_cands = [c for c in candidates if c["source"] == "tier2"]
+
+        if nop_cands:
+            print(f"-- NOP-confirmed (ready for graduation) --")
+            print()
+            for c in nop_cands:
+                print(f"  {c['function']}: {c['evidence']}")
+            print()
+
+        if tier2_cands:
+            print(f"-- Tier 2 with writes_to (consider for graduation) --")
+            print()
+            for c in tier2_cands:
+                print(f"  {c['function']}: {c['evidence']}")
+            print()
+
+        print(f"To graduate a function:")
+        print(f"  auto_re.py graduate <FUNCTION_NAME> <proposed_name>")
+        print()
+        print(f"Example:")
+        print(f"  auto_re.py graduate FUN_060366EC velocity_integrator")
+        return
+
+    # Review mode — start graduation for a specific function
+    print(f"=== Graduate: {func_name} ===")
+    print()
+
+    if func_name in graduated:
+        info = graduated[func_name]
+        print(f"Already graduated as '{info.get('name', '?')}' on {info.get('date', '?')}")
+        return
+
+    # Gather all evidence
+    obs_path = os.path.join(auto_re_dir, "observations", f"{func_name}_obs.md")
+    claim_path = os.path.join(auto_re_dir, "claims", f"{func_name}.yaml")
+    result_map = {r.get("function", ""): r for r in results}
+
+    print(f"--- Evidence summary ---")
+    print()
+
+    # Results
+    if func_name in result_map:
+        r = result_map[func_name]
+        print(f"Oracle: {r.get('passed', '?')}/{r.get('total', '?')} passed, Tier {r.get('tier', '?')}")
+        if r.get("notes"):
+            print(f"  {r['notes'][:200]}")
+    else:
+        print(f"Oracle: no results")
+    print()
+
+    # NOP evidence
+    nop_files = [
+        os.path.join(auto_re_dir, "nop_experiments.md"),
+        os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md"),
+    ]
+    nop_evidence = []
+    for nf in nop_files:
+        if os.path.exists(nf):
+            try:
+                with open(nf, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+                if func_name in content:
+                    # Extract the relevant section
+                    idx = content.index(func_name)
+                    start = content.rfind("\n### ", 0, idx)
+                    if start == -1:
+                        start = max(0, idx - 200)
+                    end = content.find("\n### ", idx + 1)
+                    if end == -1:
+                        end = min(len(content), idx + 1000)
+                    snippet = content[start:end].strip()
+                    nop_evidence.append(snippet)
+            except (IOError, OSError):
+                pass
+
+    if nop_evidence:
+        print(f"NOP test evidence:")
+        for snippet in nop_evidence:
+            for line in snippet.split("\n")[:10]:
+                print(f"  {line}")
+            if len(snippet.split("\n")) > 10:
+                print(f"  ... ({len(snippet.split(chr(10)))} lines total)")
+        print()
+    else:
+        print(f"NOP test: none")
+        print()
+
+    # Observation
+    if os.path.exists(obs_path):
+        print(f"Observation: {obs_path}")
+    else:
+        print(f"Observation: none")
+    print()
+
+    # Assembly source
+    asm_dir = get_assembly_dir(config)
+    asm_file = None
+    if asm_dir:
+        # Search for the function's assembly file
+        for root, dirs, files in os.walk(asm_dir):
+            for f in files:
+                if f == f"{func_name}.s" or f.startswith(f"{func_name}."):
+                    asm_file = os.path.join(root, f)
+                    break
+            if asm_file:
+                break
+    if asm_file:
+        print(f"Assembly: {asm_file}")
+    else:
+        print(f"Assembly: not found in {asm_dir}")
+    print()
+
+    # The graduation instruction
+    print(f"--- Graduation review ---")
+    print()
+    if proposed_name:
+        print(f"Proposed name: {proposed_name}")
+    else:
+        print(f"No name proposed. Usage: auto_re.py graduate {func_name} <proposed_name>")
+        return
+    print()
+    print(f"TASK: Read {func_name} line by line with the interpretation '{proposed_name}'.")
+    print(f"For EVERY instruction, ask:")
+    print(f"  1. Does this make sense if this function is '{proposed_name}'?")
+    print(f"  2. Can I connect this line to one of the evidence data points above?")
+    print(f"  3. Does anything here CONTRADICT the interpretation?")
+    print()
+    print(f"If the function reads a field, ask: why would '{proposed_name}' need this input?")
+    print(f"If it writes a field, ask: is this output consistent with '{proposed_name}'?")
+    print(f"If it branches, ask: what condition would '{proposed_name}' check for?")
+    print()
+    print(f"If EVERYTHING checks out, record the graduation:")
+    print()
+
+    grad_path = os.path.join(auto_re_dir, "graduated.tsv")
+    if not os.path.exists(grad_path):
+        print(f"  Create {grad_path} with header:")
+        print(f"  function\tname\tdate\tevidence")
+        print()
+    print(f"  Add line:")
+    print(f"  {func_name}\t{proposed_name}\t<today's date>\t<one-line evidence summary>")
+    print()
+    print(f"Then annotate the assembly with Level 1 comments (evidence + pipeline context)")
+    print(f"and update the struct_defs.inc with any named offsets.")
+    print()
+    print(f"If something is FISHY, document the contradiction and DO NOT graduate.")
+    print(f"A failed graduation attempt is valuable — it means the interpretation is wrong")
+    print(f"or incomplete, and the function needs more investigation.")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="auto_re — Autonomous RE pipeline CLI",
@@ -1225,6 +1598,14 @@ def main():
 
     sub.add_parser("tools", help="List available analysis tools and MCP capabilities")
 
+    sub.add_parser("nop-candidates", help="List functions ready for NOP testing")
+
+    grad = sub.add_parser("graduate", help="List or review graduation candidates")
+    grad.add_argument("function", nargs="?", default=None,
+                       help="Function to graduate (e.g. FUN_060366EC)")
+    grad.add_argument("name", nargs="?", default=None,
+                       help="Proposed name (e.g. velocity_integrator)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -1258,6 +1639,10 @@ def main():
                     args.region_lo, args.region_hi)
     elif args.command == "tools":
         cmd_tools(config)
+    elif args.command == "nop-candidates":
+        cmd_nop_candidates(config)
+    elif args.command == "graduate":
+        cmd_graduate(config, args.function, args.name)
 
     return 0
 
