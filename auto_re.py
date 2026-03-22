@@ -643,14 +643,15 @@ def cmd_review(config):
     print(f"  - Is the knowledge base up to date with recent findings?")
     print(f"")
     print(f"  STRATEGY:")
-    print(f"  - Has the agent run bulk analysis tools (auto_re.py callgraph, inputdiff,")
-    print(f"    discmap)? These map the full system architecture in one shot.")
-    print(f"    If not, and the agent is picking functions by guesswork or low-value")
-    print(f"    call-chain following, suggest running callgraph --all first.")
+    print(f"  - Has the agent used the analysis tools available? Run auto_re.py tools")
+    print(f"    to see the full list. Key tools: callgraph (system architecture),")
+    print(f"    memdiff (memory comparison), mem_profile (write tracing),")
+    print(f"    CDL (code coverage), DMA trace (data movement).")
+    print(f"  - If the agent is picking functions by guesswork or blind call-chain")
+    print(f"    following, suggest running callgraph or memdiff to get data first.")
     print(f"  - Is the agent exploring functions that matter for the mission, or")
-    print(f"    drifting into utility code and AI subsystems?")
-    print(f"  - Are the exploration priorities informed by data (call graph gaps,")
-    print(f"    input-responsive memory regions) or by habit?")
+    print(f"    drifting into utility code and irrelevant subsystems?")
+    print(f"  - Are the exploration priorities informed by data or by habit?")
     print(f"")
     print(f"  MOMENTUM:")
     print(f"  - Are there unfinished priorities in explorer_priorities.md?")
@@ -928,6 +929,79 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         print(f"Run: auto_re.py status")
 
 
+def cmd_tools(config):
+    """List available analysis tools and MCP capabilities."""
+    print(f"=== Available Analysis Tools ===")
+    print()
+    print(f"These are capabilities available through the Mednafen MCP debugger")
+    print(f"and the auto_re CLI. Use them whenever they'd help your investigation.")
+    print()
+    print(f"--- CLI Tools (auto_re.py) ---")
+    print()
+    print(f"  auto_re.py callgraph [--all] [--diff]")
+    print(f"    Capture and analyze per-frame call trees. Shows caller->callee")
+    print(f"    edges, ASCII tree, cross-scenario comparison, gap analysis.")
+    print()
+    print(f"  auto_re.py memdiff <dump_a> <dump_b> [--label-a X] [--label-b Y]")
+    print(f"    Compare two memory dumps byte-by-byte. Reports active regions,")
+    print(f"    classifies against known structs. Use for any comparison:")
+    print(f"    idle vs input, frame N vs N+1, normal vs NOPed.")
+    print()
+    print(f"--- MCP Debugger Tools (use during live sessions) ---")
+    print()
+    print(f"  TRACING:")
+    print(f"    call_trace_start / call_trace_stop")
+    print(f"      Record all JSR/BSR/BSRF calls. Output: call_trace.txt")
+    print(f"      Use with: auto_re.py callgraph (for analysis)")
+    print()
+    print(f"    pc_trace_frame")
+    print(f"      Full PC trace for one frame -- every instruction executed.")
+    print(f"      Heavy but complete. Good for finding which functions fire.")
+    print()
+    print(f"    dma_trace_start / dma_trace_stop")
+    print(f"      Log all DMA transfers (source, dest, size). Shows what data")
+    print(f"      moves where -- disc loads, VRAM fills, sound transfers.")
+    print()
+    print(f"    mem_profile_start <lo> <hi> / mem_profile_stop")
+    print(f"      Log all CPU writes to an address range. Shows every PC that")
+    print(f"      writes to the region and what values. Good for finding ALL")
+    print(f"      writers to a struct (not just one watchpoint at a time).")
+    print()
+    print(f"    cdl_start / cdl_stop / cdl_dump <path>")
+    print(f"      Code/Data Logging -- marks every byte as CODE, DATA_READ,")
+    print(f"      or DATA_WRITE. Shows what code executed and what data was")
+    print(f"      touched. Run across scenarios to build coverage maps.")
+    print()
+    print(f"  MEMORY:")
+    print(f"    dump_region <addr> <size> [path]")
+    print(f"      Dump raw memory to binary file. Use with: auto_re.py memdiff")
+    print()
+    print(f"    memory_snapshot <name> / memory_compare <old> <new>")
+    print(f"      In-session memory snapshots for cheat-engine-style searches.")
+    print(f"      Find addresses where values changed/stayed/increased/etc.")
+    print()
+    print(f"    sample_memory <addr> <size> <frames> [path]")
+    print(f"      Dump a memory region every frame at emulator speed.")
+    print(f"      No IPC overhead. Use for per-frame field analysis.")
+    print()
+    print(f"  DEBUGGING:")
+    print(f"    breakpoint_set / breakpoint_clear / breakpoint_list")
+    print(f"    watchpoint_set / watchpoint_clear / watchpoint_hits")
+    print(f"    step / dump_regs / read_memory / call_stack")
+    print(f"    poke (via raw_command) -- patch instructions at runtime")
+    print()
+    print(f"  INPUT:")
+    print(f"    input_press / input_release / input_clear / input_tap")
+    print(f"    input_playback (recorded input file for complex scenarios)")
+    print()
+    print(f"Combine these tools creatively. Examples:")
+    print(f"  - mem_profile a struct range to find ALL writers in one shot")
+    print(f"  - CDL capture across 4 scenarios to classify functions as")
+    print(f"    RACING_ONLY vs SHARED vs MENU_ONLY")
+    print(f"  - DMA trace during boot to map disc files to RAM addresses")
+    print(f"  - dump_region before/after a NOP test to see what changed")
+
+
 def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
                 region_lo=None, region_hi=None):
     """Compare two memory dumps and report differences."""
@@ -1078,11 +1152,8 @@ def main():
     md.add_argument("--region-hi", default=None,
                      help="End address of dumped region (hex, default: 0x06100000)")
 
-    cg = sub.add_parser("callgraph", help="Capture and analyze call graphs")
-    cg.add_argument("--scenario", "-s", default=None,
-                     help="Capture/analyze one scenario (default: first)")
-    cg.add_argument("--all", action="store_true", dest="all_scenarios",
-                     help="Capture/analyze all scenarios")
+    sub.add_parser("tools", help="List available analysis tools and MCP capabilities")
+
     cg.add_argument("--diff", action="store_true",
                      help="Compute idle-vs-input differentials")
 
@@ -1117,6 +1188,8 @@ def main():
     elif args.command == "memdiff":
         cmd_memdiff(config, args.dump_a, args.dump_b, args.label_a, args.label_b,
                     args.region_lo, args.region_hi)
+    elif args.command == "tools":
+        cmd_tools(config)
 
     return 0
 
