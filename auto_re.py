@@ -749,7 +749,10 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         print(f"     frame_advance {trace_frames}")
         print(f"  5. Stop call trace:")
         print(f"     call_trace_stop")
-        print(f"  6. Copy trace to: {trace_path}")
+        print(f"  6. The trace file is saved by the emulator in the IPC directory")
+        print(f"     (typically build/mcp_ipc/call_trace.txt).")
+        print(f"     Copy it to: {trace_path}")
+        print(f"     Example: cp build/mcp_ipc/call_trace.txt {trace_path}")
         print()
 
     # Check for existing traces and analyze them
@@ -867,8 +870,19 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
                 if len(gaps) > 20:
                     print(f"  ... and {len(gaps) - 20} more")
                 print()
-                print(f"These are high-value targets for auto_re.py pick.")
-                print(f"They fire per frame but have no observation yet.")
+                print(f"These functions fire per frame but have no observation.")
+                print(f"Write the top targets to explorer_priorities.md so")
+                print(f"auto_re.py pick can find them:")
+                print()
+                priorities_path = config["_priorities_path"]
+                print(f"  File: {priorities_path}")
+                print(f"  For each target, document WHY (call count, callers),")
+                print(f"  WHAT to do (breakpoint, watchpoint, scenario), and")
+                print(f"  WHAT it unblocks.")
+                print()
+                print(f"COMMIT your priorities:")
+                print(f"  git add workstreams/auto_re/explorer_priorities.md")
+                print(f'  git commit -m "Set priorities from call graph gap analysis"')
 
     else:
         print(f"No existing traces found. Capture traces using the steps above,")
@@ -880,6 +894,15 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
     if not existing_traces:
         print(f"Capture call traces for each scenario listed above.")
         print(f"Then run: auto_re.py callgraph")
+        if len(targets) == 1 and len(save_states) > 1:
+            print()
+            print(f"TIP: You only captured 1 of {len(save_states)} scenarios.")
+            print(f"Run with --all to capture all scenarios for cross-reference:")
+            print(f"  auto_re.py callgraph --all")
+    elif len(existing_traces) == 1 and len(save_states) > 1:
+        print(f"You have 1 trace but {len(save_states)} scenarios defined.")
+        print(f"Capture more scenarios for differential and cross-reference analysis:")
+        print(f"  auto_re.py callgraph --all --diff")
     else:
         print(f"Run: auto_re.py status")
 
