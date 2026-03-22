@@ -771,18 +771,41 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         print(f"     frame_advance {trace_frames}")
         print(f"  5. Stop call trace:")
         print(f"     call_trace_stop")
-        print(f"  6. The trace file is saved by the emulator in the IPC directory")
-        print(f"     (typically build/mcp_ipc/call_trace.txt).")
-        print(f"     Copy it to: {trace_path}")
-        print(f"     Example: cp build/mcp_ipc/call_trace.txt {trace_path}")
+        print(f"  6. Run auto_re.py callgraph again -- it will auto-detect the")
+        print(f"     trace file from the IPC directory and copy it for you.")
         print()
 
-    # Check for existing traces and analyze them
+    # Check for existing traces — also auto-detect from IPC dir
+    med_config = config.get("mednafen", {})
+    ipc_dir = med_config.get("ipc_dir", "build/mcp_ipc")
+    if not os.path.isabs(ipc_dir):
+        ipc_dir = os.path.join(project_dir, ipc_dir)
+    ipc_trace = os.path.join(ipc_dir, "call_trace.txt")
+
     existing_traces = {}
     for name in targets:
         trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
         if os.path.exists(trace_path):
             existing_traces[name] = trace_path
+
+    # Auto-detect: if IPC has a fresh trace and we have exactly one
+    # scenario without a trace, auto-copy it
+    if os.path.exists(ipc_trace):
+        missing = [n for n in targets if n not in existing_traces]
+        if len(missing) == 1:
+            dest = os.path.join(cg_dir, f"{missing[0]}_trace.txt")
+            import shutil
+            shutil.copy2(ipc_trace, dest)
+            existing_traces[missing[0]] = dest
+            print(f"Auto-detected trace in {ipc_trace}")
+            print(f"  Copied to: {dest}")
+            print()
+        elif len(missing) > 1:
+            print(f"Trace file found at {ipc_trace} but {len(missing)} scenarios")
+            print(f"still need traces. Copy it manually to the right scenario:")
+            for n in missing:
+                print(f"  cp {ipc_trace} {os.path.join(cg_dir, f'{n}_trace.txt')}")
+            print()
 
     if existing_traces:
         print(f"=== Analyzing {len(existing_traces)} existing trace(s) ===")
