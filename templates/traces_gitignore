@@ -1,4 +1,0 @@
-# Raw trace files are build artifacts — too large to commit.
-# Analyzed graphs in call_graphs/ are the committed output.
-*
-!.gitignore
