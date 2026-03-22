@@ -1348,7 +1348,7 @@ def cmd_nop_candidates(config):
         standard = [c for c in new_candidates if c.get("path") == "standard"]
         bypass = [c for c in new_candidates if c.get("path") == "bypass"]
 
-        print(f"-- Additional candidates (not in nop_experiments.md) ({len(new_candidates)}) --")
+        print(f"-- Additional candidates (not in nop_experiments.yaml) ({len(new_candidates)}) --")
         print()
         if standard:
             for c in standard:
@@ -1359,13 +1359,22 @@ def cmd_nop_candidates(config):
                 print(f"  {c['function']}: Tier {c['tier']} (observation-based, writes_to blocked)")
         print()
 
-    print(f"Total: {len(candidates)} candidate(s)")
+    # Guidance + pre-generated YAML entries for standard candidates
+    nop_yaml = os.path.join(auto_re_dir, "nop_experiments.yaml")
+    print(f"--- Adding NOP experiments ---")
     print()
-    print(f"To write NOP experiments, read each function's observation and predict")
-    print(f"what breaks when the function is disabled. Document in nop_experiments.md.")
+    print(f"Add experiments to: {nop_yaml}")
+    if not os.path.exists(nop_yaml):
+        print(f"  (copy template: cp {os.path.join(SCRIPT_DIR, 'templates', 'nop_experiments.yaml')} {nop_yaml})")
     print()
-    print(f"After running NOP tests, graduated functions can be renamed:")
-    print(f"  auto_re.py graduate")
+
+    # Point to schema template
+    template_path = os.path.join(SCRIPT_DIR, "templates", "nop_experiments.yaml")
+    print(f"Schema and examples: {template_path}")
+    print()
+
+    print(f"After running NOP tests, update status to 'confirmed' and add result/conclusion.")
+    print(f"Then run: auto_re.py graduate")
 
 
 def _parse_graduated(auto_re_dir):
