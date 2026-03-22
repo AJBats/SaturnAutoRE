@@ -105,13 +105,39 @@ def parse_results(results_path):
     return results
 
 
+def _observation_is_unreachable(content):
+    """Check if an observation's YAML frontmatter marks it as unreachable."""
+    fm_match = re.match(r"---\n(.*?)\n---", content, re.DOTALL)
+    if fm_match:
+        # Quick check without full YAML parse
+        if "reachable: false" in fm_match.group(1).lower():
+            return True
+    # Also check for "unreachable" in the field analysis section itself
+    if "## Per-Frame Field Analysis" in content:
+        idx = content.index("## Per-Frame Field Analysis")
+        section = content[idx:idx + 300].lower()
+        if "unreachable" in section:
+            return True
+    return False
+
+
 def observation_has_field_analysis(obs_path):
-    """Check if an observation file has a populated Per-Frame Field Analysis."""
+    """Check if an observation file has a populated Per-Frame Field Analysis.
+
+    Returns True if:
+    - The function is unreachable (N/A is the correct analysis)
+    - The field analysis section has actual data rows with field offsets
+    """
     try:
         with open(obs_path, encoding="utf-8", errors="replace") as f:
             content = f.read()
     except (IOError, OSError):
         return False
+
+    # Unreachable functions don't need field analysis — the observation
+    # that they're unreachable IS the finding
+    if _observation_is_unreachable(content):
+        return True
 
     if "## Per-Frame Field Analysis" not in content:
         return False
@@ -126,15 +152,15 @@ def observation_has_field_analysis(obs_path):
 
     section_lower = section.lower()
 
-    # Check for explicit deferral or N/A markers
+    # Check for explicit deferral
     first_200 = section_lower[:200]
-    if "deferred" in first_200 or "n/a" in first_200:
-        # Make sure "n/a" isn't a false positive from hex values
-        # Look for "n/a" as a standalone word, not part of "0x0a"
-        if "deferred" in first_200:
-            return False
-        if re.search(r'\bn/a\b', first_200):
-            return False
+    if "deferred" in first_200:
+        return False
+
+    # N/A is valid IF the function is unreachable (handled above).
+    # For reachable functions, N/A means the analysis was skipped.
+    if re.search(r'\bn/a\b', first_200):
+        return False
 
     # Check for actual data rows — need at least one pipe-delimited row
     # that isn't a header or separator. A data row has content between pipes
@@ -212,8 +238,13 @@ def pipeline_summary(auto_re_dir, results_path):
             pass
 
     # Incomplete observations (missing field analysis)
+    # Exclude functions that already have results — they went through
+    # verification under a prior workflow and shouldn't block new work
+    result_funcs = {r.get("function", "") for r in results}
     incomplete = []
     for func, path in observations.items():
+        if func in result_funcs:
+            continue  # already verified, don't block on field analysis
         if not observation_has_field_analysis(path):
             incomplete.append(func)
 
