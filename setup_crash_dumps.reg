@@ -1,0 +1,14 @@
+Windows Registry Editor Version 5.00
+
+; Enable full crash dumps for mednafen.exe
+; Captures call stack, registers, and memory on any crash.
+; Dumps written to D:\Projects\SaturnAutoRE\crash_dumps\
+;
+; To install: right-click this file → Merge
+; To uninstall: delete the registry key:
+;   HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\mednafen.exe
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\mednafen.exe]
+"DumpFolder"="D:\\Projects\\SaturnAutoRE\\crash_dumps"
+"DumpType"=dword:00000002
+"DumpCount"=dword:0000000a

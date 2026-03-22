@@ -21,3 +21,4 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 *.png
+crash_dumps/*.dmp
