@@ -1,0 +1,32 @@
+# NOP Experiments — structured format for auto_re.py
+#
+# Each experiment tests what happens when a function's write is disabled.
+# The CLI reads this file for nop-candidates and graduate commands.
+#
+# Status values:
+#   proposed    — experiment designed but not yet run
+#   confirmed   — NOP test ran, result matches prediction
+#   disproved   — NOP test ran, result contradicts prediction
+#   inconclusive — NOP test ran, result unclear
+#
+# Fields:
+#   function    — the function being tested (FUN_XXXXXXXX)
+#   field       — the struct field being NOPed (e.g. +0x24)
+#   patch_addr  — address to poke with 00 09 (the actual write instruction)
+#   scenario    — save state scenario to use
+#   prediction  — what we expect to happen
+#   status      — proposed | confirmed | disproved | inconclusive
+#   result      — what actually happened (filled in after test)
+#   conclusion  — one-line summary of what we learned
+#   name        — proposed function/field name if confirmed
+
+experiments:
+  # - function: FUN_060366EC
+  #   field: "+0x24"
+  #   patch_addr: "0x060366F6"
+  #   scenario: straight_throttle
+  #   prediction: "Car stays still despite throttle — velocity never integrates"
+  #   status: confirmed
+  #   result: "Car completely frozen. 0 km/h, gear 1, no movement."
+  #   conclusion: "+0x24 is the velocity accumulator"
+  #   name: velocity_integrator

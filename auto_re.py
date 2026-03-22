@@ -380,17 +380,8 @@ def _find_nop_candidates(auto_re_dir, results):
     claims_dir = os.path.join(auto_re_dir, "claims")
     obs_dir = os.path.join(auto_re_dir, "observations")
 
-    # Check for existing NOP experiments file
-    nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
-    existing_nops = set()
-    if os.path.exists(nop_file):
-        try:
-            with open(nop_file, encoding="utf-8", errors="replace") as f:
-                content = f.read()
-            for m in re.findall(r"(FUN_[0-9A-Fa-f]+|sym_[0-9A-Fa-f]+)", content):
-                existing_nops.add(m)
-        except (IOError, OSError):
-            pass
+    # Check for existing NOP experiments (YAML or legacy MD)
+    existing_nops = set(_parse_nop_experiments(auto_re_dir).keys())
 
     for r in results:
         func = r.get("function", "")
@@ -1210,46 +1201,162 @@ def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
         print(f"  Override with: --region-lo 0xADDR --region-hi 0xADDR")
 
 
+def _parse_nop_experiments(auto_re_dir):
+    """Parse nop_experiments.yaml for experiment status.
+
+    Searches for nop_experiments.yaml in auto_re/ and sibling directories.
+    Falls back to legacy nop_experiments.md parsing if no YAML found.
+    Returns dict of function -> {status, field, conclusion, name, patch_addr}.
+    """
+    experiments = {}
+    search_paths = [
+        os.path.join(auto_re_dir, "nop_experiments.yaml"),
+        os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.yaml"),
+    ]
+
+    for nop_path in search_paths:
+        if not os.path.exists(nop_path):
+            continue
+        try:
+            with open(nop_path, encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+        except (yaml.YAMLError, IOError, OSError):
+            continue
+
+        if not data or "experiments" not in data:
+            continue
+
+        for exp in data.get("experiments", []) or []:
+            func = exp.get("function", "")
+            if not func:
+                continue
+            experiments[func] = {
+                "status": exp.get("status", "proposed").upper(),
+                "field": exp.get("field", ""),
+                "conclusion": exp.get("conclusion", ""),
+                "name": exp.get("name", ""),
+                "patch_addr": exp.get("patch_addr", ""),
+                "prediction": exp.get("prediction", ""),
+                "result": exp.get("result", ""),
+                "scenario": exp.get("scenario", ""),
+                "source": nop_path,
+            }
+
+    # Fallback: try legacy .md format if no YAML found
+    if not experiments:
+        md_paths = [
+            os.path.join(auto_re_dir, "nop_experiments.md"),
+            os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md"),
+        ]
+        for md_path in md_paths:
+            if not os.path.exists(md_path):
+                continue
+            try:
+                with open(md_path, encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except (IOError, OSError):
+                continue
+            # Simple scan: find CONFIRMED results with function names
+            for m in re.finditer(
+                r"(FUN_[0-9A-Fa-f]{6,8}|sym_[0-9A-Fa-f]{6,8}).*?CONFIRMED[:\s]+(.+?)(?:\n|$)",
+                content, re.IGNORECASE
+            ):
+                func = m.group(1)
+                if func not in experiments:
+                    experiments[func] = {
+                        "status": "CONFIRMED",
+                        "field": "",
+                        "conclusion": m.group(2).strip(),
+                        "name": "",
+                        "patch_addr": "",
+                        "prediction": "",
+                        "result": "",
+                        "scenario": "",
+                        "source": md_path,
+                    }
+
+    return experiments
+
+
 def cmd_nop_candidates(config):
-    """List NOP-test-ready functions."""
+    """List NOP tests — curated experiments first, then raw candidates."""
     auto_re_dir = config["_auto_re_dir"]
     results_path = config["_results_path"]
 
-    print(f"=== NOP Test Candidates ===")
+    print(f"=== NOP Tests ===")
     print()
 
+    # First: show curated experiments from nop_experiments.md
+    experiments = _parse_nop_experiments(auto_re_dir)
+
+    if experiments:
+        confirmed = {f: e for f, e in experiments.items() if e["status"] == "CONFIRMED"}
+        proposed = {f: e for f, e in experiments.items() if e["status"] == "PROPOSED"}
+        disproved = {f: e for f, e in experiments.items() if e["status"] == "DISPROVED"}
+        inconclusive = {f: e for f, e in experiments.items() if e["status"] == "INCONCLUSIVE"}
+
+        if confirmed:
+            print(f"-- CONFIRMED ({len(confirmed)}) --")
+            print()
+            for func, e in confirmed.items():
+                name = f" -> {e['name']}" if e.get("name") else ""
+                field = f" ({e['field']})" if e.get("field") else ""
+                print(f"  {func}{name}{field}: {e['conclusion'][:70]}")
+            print()
+
+        if inconclusive:
+            print(f"-- INCONCLUSIVE ({len(inconclusive)}) --")
+            print()
+            for func, e in inconclusive.items():
+                field = f" ({e['field']})" if e.get("field") else ""
+                print(f"  {func}{field}: {e.get('result', e.get('prediction', ''))[:70]}")
+            print()
+
+        if disproved:
+            print(f"-- DISPROVED ({len(disproved)}) --")
+            print()
+            for func, e in disproved.items():
+                print(f"  {func}: {e.get('result', '')[:70]}")
+            print()
+
+        if proposed:
+            print(f"-- PROPOSED (not yet tested) ({len(proposed)}) --")
+            print()
+            for func, e in proposed.items():
+                field = f" ({e['field']})" if e.get("field") else ""
+                addr = f" patch:{e['patch_addr']}" if e.get("patch_addr") else ""
+                print(f"  {func}{field}{addr}: {e.get('prediction', '')[:60]}")
+            print()
+    else:
+        print(f"No nop_experiments.yaml found. Create one from the template:")
+        print(f"  cp {os.path.join(SCRIPT_DIR, 'templates', 'nop_experiments.yaml')} \\")
+        print(f"     workstreams/auto_re/nop_experiments.yaml")
+        print()
+
+    # Second: find raw candidates not already in experiments
     results = parse_results(results_path)
     if not results:
-        print(f"No results in results.tsv yet. Run the explore→verify cycle first.")
+        if not experiments:
+            print(f"No results in results.tsv yet. Run the explore->verify cycle first.")
         return
 
     candidates = _find_nop_candidates(auto_re_dir, results)
+    # Filter out anything already in curated experiments
+    new_candidates = [c for c in candidates if c["function"] not in experiments]
 
-    if not candidates:
-        print(f"No NOP candidates found. Functions need:")
-        print(f"  - Tier 2 with a passing writes_to claim, OR")
-        print(f"  - Tier 1 with a rich observation (bypass path)")
-        return
+    if new_candidates:
+        standard = [c for c in new_candidates if c.get("path") == "standard"]
+        bypass = [c for c in new_candidates if c.get("path") == "bypass"]
 
-    standard = [c for c in candidates if c.get("path") == "standard"]
-    bypass = [c for c in candidates if c.get("path") == "bypass"]
-
-    if standard:
-        print(f"-- Tier 2 candidates (writes_to confirmed) --")
+        print(f"-- Additional candidates (not in nop_experiments.md) ({len(new_candidates)}) --")
         print()
-        for c in standard:
-            pc_info = f" at PC {c['writer_pc']}" if c.get("writer_pc") else ""
-            print(f"  {c['function']}: writes_to {c['target']}{pc_info}")
-            print(f"    Claim: {c['claim_id']}, Tier {c['tier']}")
-        print()
-
-    if bypass:
-        print(f"-- Tier 1 candidates (NOP bypass -- writes_to blocked) --")
-        print()
-        for c in bypass:
-            print(f"  {c['function']}: Tier {c['tier']} (observation-based)")
-            print(f"    writes_to claims failed or couldn't be written.")
-            print(f"    Read the observation and predict the NOP effect manually.")
+        if standard:
+            for c in standard:
+                pc_info = f" at PC {c['writer_pc']}" if c.get("writer_pc") else ""
+                print(f"  {c['function']}: writes_to {c['target']}{pc_info} (Tier {c['tier']})")
+        if bypass:
+            for c in bypass:
+                print(f"  {c['function']}: Tier {c['tier']} (observation-based, writes_to blocked)")
         print()
 
     print(f"Total: {len(candidates)} candidate(s)")
@@ -1404,26 +1511,57 @@ def cmd_graduate(config, func_name=None, proposed_name=None):
 
         nop_cands = [c for c in candidates if c["source"] == "nop"]
         tier2_cands = [c for c in candidates if c["source"] == "tier2"]
+        obs_dir = config["_observations_dir"]
 
         if nop_cands:
             print(f"-- NOP-confirmed (ready for graduation) --")
             print()
             for c in nop_cands:
-                print(f"  {c['function']}: {c['evidence']}")
+                func = c["function"]
+                obs = os.path.join(obs_dir, f"{func}_obs.md")
+                obs_ref = f"  obs: {obs}" if os.path.exists(obs) else ""
+                print(f"  {func}: {c['evidence']}")
+                if obs_ref:
+                    print(obs_ref)
             print()
 
         if tier2_cands:
             print(f"-- Tier 2 with writes_to (consider for graduation) --")
             print()
             for c in tier2_cands:
-                print(f"  {c['function']}: {c['evidence']}")
+                func = c["function"]
+                obs = os.path.join(obs_dir, f"{func}_obs.md")
+                obs_ref = f"  obs: {obs}" if os.path.exists(obs) else ""
+                print(f"  {func}: {c['evidence']}")
+                if obs_ref:
+                    print(obs_ref)
             print()
 
-        print(f"To graduate a function:")
-        print(f"  auto_re.py graduate <FUNCTION_NAME> <proposed_name>")
+        # Skill-like instruction for the agent
+        nop_file = os.path.join(auto_re_dir, "nop_experiments.yaml")
+        if not os.path.exists(nop_file):
+            nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
+        if not os.path.exists(nop_file):
+            nop_file = os.path.join(auto_re_dir, "..", "driving_model", "nop_experiments.md")
+
+        print(f"--- How to graduate a function ---")
         print()
-        print(f"Example:")
-        print(f"  auto_re.py graduate FUN_060366EC velocity_integrator")
+        print(f"1. Pick a candidate from the list above.")
+        print(f"2. Read its observation file and NOP test results:")
+        if os.path.exists(nop_file):
+            print(f"     NOP evidence: {nop_file}")
+        print(f"     Observations: {obs_dir}/")
+        print(f"     Results: {config['_results_path']}")
+        print(f"3. Based on the evidence, propose a human-readable name for the")
+        print(f"   function. The name should describe WHAT the function does,")
+        print(f"   not HOW (e.g. 'velocity_integrator' not 'add_F0_to_24').")
+        print(f"4. Discuss the proposed name with the human. They approve or revise.")
+        print(f"5. Once agreed, run:")
+        print(f"     auto_re.py graduate <FUNCTION> <approved_name>")
+        print(f"6. Follow the line-by-line review instructions in the output.")
+        print(f"   Read EVERY instruction in the assembly and check it against")
+        print(f"   the proposed name. If anything contradicts the interpretation,")
+        print(f"   DO NOT graduate — document the contradiction instead.")
         return
 
     # Review mode — start graduation for a specific function
