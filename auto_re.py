@@ -623,7 +623,6 @@ def cmd_review(config):
     print(f"")
     # Check what bulk analysis exists
     cg_dir = os.path.join(auto_re_dir, "call_graphs")
-    traces_dir = os.path.join(auto_re_dir, "traces")
     has_callgraph = False
     if os.path.exists(cg_dir):
         has_callgraph = any(f.endswith("_graph.txt") for f in os.listdir(cg_dir))
@@ -777,8 +776,7 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
             if frames <= 0:
                 capture_frames = 5  # unspecified — just grab a few frames
             else:
-                skip_frames = skip_frames or 0
-                capture_frames = frames
+                capture_frames = frames - skip_frames
 
         trace_path = os.path.join(traces_dir, f"{name}_trace.txt")
 
@@ -1057,12 +1055,23 @@ def cmd_tools(config):
     print(f"    input_press / input_release / input_clear / input_tap")
     print(f"    input_playback (recorded input file for complex scenarios)")
     print()
+    print(f"--- Static Analysis (Ghidra MCP, if configured) ---")
+    print()
+    print(f"  If a Ghidra MCP server is configured, you also have access to:")
+    print(f"    get_code / get_function_info / get_call_graph")
+    print(f"    xrefs / list_functions / search_bytes")
+    print(f"    struct / list_data_types / get_hexdump")
+    print(f"    rename_symbol / set_comment")
+    print(f"  These provide decompiled C, cross-references, and type information")
+    print(f"  for static analysis alongside the dynamic emulator tools above.")
+    print()
     print(f"Combine these tools creatively. Examples:")
     print(f"  - mem_profile a struct range to find ALL writers in one shot")
     print(f"  - CDL capture across 4 scenarios to classify functions as")
     print(f"    RACING_ONLY vs SHARED vs MENU_ONLY")
     print(f"  - DMA trace during boot to map disc files to RAM addresses")
     print(f"  - dump_region before/after a NOP test to see what changed")
+    print(f"  - Ghidra xrefs to find all consumers of a struct field")
 
 
 def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
@@ -1203,6 +1212,9 @@ def main():
                      help="Capture/analyze one scenario (default: first)")
     cg.add_argument("--all", action="store_true", dest="all_scenarios",
                      help="Capture/analyze all scenarios")
+    cg.add_argument("--diff", action="store_true",
+                     help="Compute idle-vs-input differentials")
+
     md = sub.add_parser("memdiff", help="Compare two memory dumps")
     md.add_argument("dump_a", nargs="?", default=None,
                      help="First dump file (or omit for instructions)")
@@ -1216,9 +1228,6 @@ def main():
                      help="End address of dumped region (hex, default: 0x06100000)")
 
     sub.add_parser("tools", help="List available analysis tools and MCP capabilities")
-
-    cg.add_argument("--diff", action="store_true",
-                     help="Compute idle-vs-input differentials")
 
     args = parser.parse_args()
 
