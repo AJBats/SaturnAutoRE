@@ -515,47 +515,50 @@ def cmd_integrate(config):
         print(f"=== NOP Test Candidates ({len(nop_candidates)}) ===")
         print()
 
-        if standard:
-            print(f"-- Tier 2 candidates (writes_to confirmed) --")
-            print()
-            for nc in standard:
-                print(f"  {nc['function']}: writes_to {nc['target']}")
-                if nc.get("writer_pc"):
-                    print(f"    Writer PC: {nc['writer_pc']}")
-                print(f"    Claim: {nc['claim_id']}")
-                print(f"    Observation: workstreams/auto_re/observations/{nc['function']}_obs.md")
-                print()
+        # Cross-reference against existing experiments
+        experiments = _parse_nop_experiments(auto_re_dir)
+        has_experiment = [c for c in nop_candidates if c["function"] in experiments]
+        needs_experiment = [c for c in nop_candidates if c["function"] not in experiments]
 
-        if bypass:
-            print(f"-- Tier 1 candidates (NOP bypass -- writes_to blocked) --")
+        if has_experiment:
+            print(f"-- Already in nop_experiments ({len(has_experiment)}) --")
             print()
-            print(f"  These functions can't reach Tier 2 due to shared write")
-            print(f"  addresses (VDP1 VRAM, cross-writers, etc.) but have enough")
-            print(f"  observational evidence to predict NOP effects. NOP tests")
-            print(f"  are stronger than Tier 2 -- write the test based on the")
-            print(f"  observation's behavioral understanding.")
+            for nc in has_experiment:
+                exp = experiments[nc["function"]]
+                print(f"  {nc['function']}: {exp['status']}"
+                      f"{' - ' + exp['conclusion'][:50] if exp.get('conclusion') else ''}")
             print()
-            for nc in bypass:
+
+        if needs_experiment:
+            needs_standard = [c for c in needs_experiment if c.get("path") == "standard"]
+            needs_bypass = [c for c in needs_experiment if c.get("path") == "bypass"]
+
+            print(f"-- NEEDS EXPERIMENT ({len(needs_experiment)} functions) --")
+            print()
+            print(f"  These functions are NOP-test-ready but have no entry in")
+            print(f"  nop_experiments.yaml. Write experiments for them NOW.")
+            print()
+            for nc in needs_standard:
+                pc_info = f" patch:{nc['writer_pc']}" if nc.get("writer_pc") else ""
+                print(f"  {nc['function']}: writes_to {nc['target']}{pc_info} (Tier {nc['tier']})")
+            for nc in needs_bypass:
                 print(f"  {nc['function']}: Tier {nc['tier']} (observation-based)")
-                print(f"    Read the observation, predict what breaks, document the test.")
-                print(f"    Observation: workstreams/auto_re/observations/{nc['function']}_obs.md")
-                print()
+            print()
 
-        print(f"Document NOP tests in: {nop_file}")
-        print(f"Format for each test:")
-        print(f"  - What to NOP (instruction PC, original bytes -> 00 09)")
-        print(f"  - Writer function and oracle confirmation")
-        print(f"  - Expected effect (what breaks when this write is removed)")
-        print(f"  - Best scenario (which save state reveals the effect)")
-        print(f"  - Confidence level (HIGH/MEDIUM/LOW)")
-        print()
-        print(f"The human (or another agent) executes the NOP test by patching")
-        print(f"the instruction with the debugger's poke command and observing the game.")
+            nop_yaml = os.path.join(auto_re_dir, "nop_experiments.yaml")
+            template = os.path.join(SCRIPT_DIR, "templates", "nop_experiments.yaml")
+            print(f"  Add to: {nop_yaml}")
+            print(f"  Schema: {template}")
+            if not os.path.exists(nop_yaml):
+                print(f"  Create: cp {template} {nop_yaml}")
+            print()
+        elif has_experiment:
+            print(f"All NOP candidates already have experiments. Good.")
+            print()
     else:
         if tier_2_count > 0:
             print()
-            print(f"No new NOP test candidates found. Existing Tier 2 functions either")
-            print(f"already have NOP tests or lack writes_to claims with identifiable PCs.")
+            print(f"No new NOP test candidates found.")
 
     print()
     print(f"COMMIT if you made any updates:")
