@@ -358,13 +358,18 @@ def cmd_verify(config, func_name):
 def _find_nop_candidates(auto_re_dir, results):
     """Scan results and claims for NOP-test-ready functions.
 
-    A candidate has:
-    - Tier 2 (enough evidence to be confident)
-    - At least one passing writes_to claim (confirmed writer)
-    - No existing NOP test (not already documented)
+    A candidate has EITHER:
+    - Tier 2 with a passing writes_to claim (standard path), OR
+    - Tier 1 with a rich observation (NOP bypass path — for cases where
+      writes_to claims can't pass due to shared addresses like VDP1 VRAM)
+
+    NOP tests are stronger evidence than Tier 2. A function doesn't need
+    Tier 2 to be NOP-tested — it needs enough understanding to predict
+    the effect. Tier 1 with a detailed observation qualifies.
     """
     candidates = []
     claims_dir = os.path.join(auto_re_dir, "claims")
+    obs_dir = os.path.join(auto_re_dir, "observations")
 
     # Check for existing NOP experiments file
     nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
@@ -373,7 +378,6 @@ def _find_nop_candidates(auto_re_dir, results):
         try:
             with open(nop_file, encoding="utf-8", errors="replace") as f:
                 content = f.read()
-            # Extract function names mentioned in NOP experiments
             for m in re.findall(r"(FUN_[0-9A-Fa-f]+|sym_[0-9A-Fa-f]+)", content):
                 existing_nops.add(m)
         except (IOError, OSError):
@@ -386,45 +390,67 @@ def _find_nop_candidates(auto_re_dir, results):
         except ValueError:
             continue
 
-        if tier < 2:
+        if tier < 1:
             continue
         if func in existing_nops:
             continue
 
-        # Check claim file for writes_to claims that passed
+        # Check claim file for writes_to claims
         claim_path = os.path.join(claims_dir, f"{func}.yaml")
-        if not os.path.exists(claim_path):
-            continue
+        has_writes_to = False
 
-        try:
-            with open(claim_path) as f:
-                claim_data = yaml.safe_load(f)
-        except (yaml.YAMLError, IOError):
-            continue
+        if os.path.exists(claim_path):
+            try:
+                with open(claim_path) as f:
+                    claim_data = yaml.safe_load(f)
+            except (yaml.YAMLError, IOError):
+                claim_data = {"claims": []}
 
-        for claim in claim_data.get("claims", []):
-            if claim.get("type") != "writes_to":
-                continue
+            for claim in claim_data.get("claims", []):
+                if claim.get("type") != "writes_to":
+                    continue
 
-            # Extract target address and writer PC from description
-            raw_target = claim.get("address", "unknown")
-            # Format target as hex if it's an integer
-            if isinstance(raw_target, int):
-                target = f"0x{raw_target:08X}"
-            else:
-                target = str(raw_target)
-            writer_pc = None
-            desc = claim.get("description", "")
-            pc_match = re.search(r"PC\s+0x([0-9A-Fa-f]+)", desc)
-            if pc_match:
-                writer_pc = f"0x{pc_match.group(1)}"
+                raw_target = claim.get("address", "unknown")
+                if isinstance(raw_target, int):
+                    target = f"0x{raw_target:08X}"
+                else:
+                    target = str(raw_target)
+                writer_pc = None
+                desc = claim.get("description", "")
+                pc_match = re.search(r"PC\s+0x([0-9A-Fa-f]+)", desc)
+                if pc_match:
+                    writer_pc = f"0x{pc_match.group(1)}"
 
-            candidates.append({
-                "function": func,
-                "target": target,
-                "writer_pc": writer_pc,
-                "claim_id": claim.get("id", ""),
-            })
+                has_writes_to = True
+                candidates.append({
+                    "function": func,
+                    "target": target,
+                    "writer_pc": writer_pc,
+                    "claim_id": claim.get("id", ""),
+                    "tier": tier,
+                    "path": "standard",
+                })
+
+        # Tier 1 NOP bypass: if no writes_to claims produced valid candidates
+        # (shared addresses, VDP1 VRAM, watchpoint limitations, cross-writers),
+        # the function can still be NOP-tested if it has a rich observation.
+        # NOP tests are stronger evidence than writes_to claims — the agent
+        # just needs to predict what breaks.
+        #
+        # Check the results notes for FAIL indicators on writes_to claims.
+        notes = r.get("notes", "").lower()
+        writes_to_all_failed = ("writes_to" in notes or "writes_" in notes) and "fail" in notes
+        if tier >= 1 and (not has_writes_to or writes_to_all_failed):
+            obs_path = os.path.join(obs_dir, f"{func}_obs.md")
+            if os.path.exists(obs_path):
+                candidates.append({
+                    "function": func,
+                    "target": "observation-based (no writes_to claim)",
+                    "writer_pc": None,
+                    "claim_id": "NOP-bypass",
+                    "tier": tier,
+                    "path": "bypass",
+                })
 
     return candidates
 
@@ -482,23 +508,38 @@ def cmd_integrate(config):
     nop_file = os.path.join(auto_re_dir, "nop_experiments.md")
 
     if nop_candidates:
+        standard = [c for c in nop_candidates if c.get("path") == "standard"]
+        bypass = [c for c in nop_candidates if c.get("path") == "bypass"]
+
         print()
         print(f"=== NOP Test Candidates ({len(nop_candidates)}) ===")
         print()
-        print(f"These functions have oracle-confirmed writes_to claims and may")
-        print(f"be ready for NOP testing. For each candidate:")
-        print(f"  1. Read the observation and claim to understand what the function writes")
-        print(f"  2. Read the assembly to find the exact store instruction PC")
-        print(f"  3. Predict what will break if the write is NOPed")
-        print(f"  4. Document the test in nop_experiments.md")
-        print()
-        for nc in nop_candidates:
-            print(f"  {nc['function']}: writes_to {nc['target']}")
-            if nc.get("writer_pc"):
-                print(f"    Writer PC: {nc['writer_pc']}")
-            print(f"    Claim: {nc['claim_id']}")
-            print(f"    Observation: workstreams/auto_re/observations/{nc['function']}_obs.md")
+
+        if standard:
+            print(f"-- Tier 2 candidates (writes_to confirmed) --")
             print()
+            for nc in standard:
+                print(f"  {nc['function']}: writes_to {nc['target']}")
+                if nc.get("writer_pc"):
+                    print(f"    Writer PC: {nc['writer_pc']}")
+                print(f"    Claim: {nc['claim_id']}")
+                print(f"    Observation: workstreams/auto_re/observations/{nc['function']}_obs.md")
+                print()
+
+        if bypass:
+            print(f"-- Tier 1 candidates (NOP bypass -- writes_to blocked) --")
+            print()
+            print(f"  These functions can't reach Tier 2 due to shared write")
+            print(f"  addresses (VDP1 VRAM, cross-writers, etc.) but have enough")
+            print(f"  observational evidence to predict NOP effects. NOP tests")
+            print(f"  are stronger than Tier 2 -- write the test based on the")
+            print(f"  observation's behavioral understanding.")
+            print()
+            for nc in bypass:
+                print(f"  {nc['function']}: Tier {nc['tier']} (observation-based)")
+                print(f"    Read the observation, predict what breaks, document the test.")
+                print(f"    Observation: workstreams/auto_re/observations/{nc['function']}_obs.md")
+                print()
 
         print(f"Document NOP tests in: {nop_file}")
         print(f"Format for each test:")
