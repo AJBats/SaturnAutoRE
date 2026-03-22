@@ -32,6 +32,10 @@ from lib.callgraph import (
     parse_call_trace, FunctionTable, analyze_calls,
     format_tree, format_edge_list, diff_analyses, cross_reference, find_gaps,
 )
+from lib.memdiff import (
+    load_dump, diff_dumps, block_heatmap, classify_regions,
+    format_diff_report, format_value_changes,
+)
 
 
 def cmd_status(config):
@@ -924,6 +928,116 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
         print(f"Run: auto_re.py status")
 
 
+def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
+                region_lo=None, region_hi=None):
+    """Compare two memory dumps and report differences."""
+    auto_re_dir = config["_auto_re_dir"]
+    diff_dir = os.path.join(auto_re_dir, "memdiffs")
+    os.makedirs(diff_dir, exist_ok=True)
+
+    known_structs = config.get("targets", {})
+    save_states = config.get("save_states", {})
+
+    # Default memory region: Work RAM High (1MB)
+    base_addr = int(region_lo, 16) if region_lo else 0x06000000
+    end_addr = int(region_hi, 16) if region_hi else 0x06100000
+    region_size = end_addr - base_addr
+
+    print(f"=== Memory Diff ===")
+    print()
+
+    if dump_a and dump_b:
+        # Both dumps provided — analyze them
+        if not os.path.exists(dump_a):
+            print(f"ERROR: Dump A not found: {dump_a}")
+            return
+        if not os.path.exists(dump_b):
+            print(f"ERROR: Dump B not found: {dump_b}")
+            return
+
+        data_a = load_dump(dump_a)
+        data_b = load_dump(dump_b)
+
+        if len(data_a) != len(data_b):
+            print(f"WARNING: Dump sizes differ ({len(data_a)} vs {len(data_b)})")
+            print(f"Comparing first {min(len(data_a), len(data_b))} bytes.")
+
+        diffs = diff_dumps(data_a, data_b, base_addr)
+        heatmap = block_heatmap(diffs, base_addr)
+        classified = classify_regions(heatmap, known_structs)
+
+        # Print report
+        report = format_diff_report(
+            diffs, heatmap, classified, min(len(data_a), len(data_b)),
+            label_a, label_b)
+        print(report)
+        print()
+
+        # Write report to file
+        out_name = f"diff_{label_a}_vs_{label_b}.txt"
+        out_path = os.path.join(diff_dir, out_name)
+        with open(out_path, "w") as f:
+            f.write(report)
+            f.write("\n\n")
+            f.write(format_value_changes(diffs, base_addr))
+        print(f"Full report written to: {out_path}")
+
+        print()
+        print(f"--- NEXT ACTION ---")
+        print()
+        if diffs:
+            print(f"Review the active regions. Unknown regions with many changed bytes")
+            print(f"are discovery targets — they may contain data structures you haven't")
+            print(f"mapped yet. Consider adding them to config.yaml targets.")
+        else:
+            print(f"No differences found. Try a different comparison (different input,")
+            print(f"more frames, different memory region).")
+        print()
+        print(f"Run: auto_re.py status")
+    else:
+        # No dumps — show instructions
+        print(f"Compare two memory dumps to find active/responsive regions.")
+        print(f"Use this to compare any two game states:")
+        print(f"  - Idle vs input (find input-responsive memory)")
+        print(f"  - Frame N vs frame N+1 (find per-frame updates)")
+        print(f"  - Normal vs NOPed function (find what a function affects)")
+        print(f"  - Different save states (find state-dependent regions)")
+        print()
+        print(f"CAPTURE INSTRUCTIONS:")
+        print()
+        print(f"  For each state you want to compare, dump memory to a file:")
+        print()
+        print(f"  1. Load save state:")
+        print(f"     load_state <path>")
+        print(f"  2. (Optional) apply input or advance frames")
+        print(f"  3. Dump memory region:")
+        print(f"     dump_region 0x{base_addr:08X} 0x{region_size:X} <output_path>")
+        print()
+        print(f"  Example -- comparing idle vs throttle after 60 frames:")
+        print()
+        print(f"     # Capture A: idle")
+        print(f"     load_state <save_state>")
+        print(f"     frame_advance 60")
+        print(f"     dump_region 0x{base_addr:08X} 0x{region_size:X} {diff_dir}/dump_idle.bin")
+        print()
+        print(f"     # Capture B: throttle")
+        print(f"     load_state <save_state>")
+
+        # Show first input button if available
+        controls = config.get("controls", {})
+        first_btn = next(iter(controls.values()), "BUTTON") if controls else "BUTTON"
+        print(f"     input_press {first_btn}")
+        print(f"     frame_advance 60")
+        print(f"     dump_region 0x{base_addr:08X} 0x{region_size:X} {diff_dir}/dump_{first_btn.lower()}.bin")
+        print()
+        print(f"  Then analyze:")
+        print(f"     auto_re.py memdiff {diff_dir}/dump_idle.bin {diff_dir}/dump_{first_btn.lower()}.bin")
+        print(f"       --label-a idle --label-b {first_btn.lower()}")
+        print()
+        print(f"  Memory region: 0x{base_addr:08X} - 0x{end_addr:08X} ({region_size // 1024}KB)")
+        print(f"  Override with: --region-lo 0xADDR --region-hi 0xADDR")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="auto_re — Autonomous RE pipeline CLI",
@@ -946,6 +1060,23 @@ def main():
 
     sub.add_parser("integrate", help="Check results and suggest next steps")
     sub.add_parser("review", help="Quality and momentum check via reviewer subagent")
+
+    cg = sub.add_parser("callgraph", help="Capture and analyze call graphs")
+    cg.add_argument("--scenario", "-s", default=None,
+                     help="Capture/analyze one scenario (default: first)")
+    cg.add_argument("--all", action="store_true", dest="all_scenarios",
+                     help="Capture/analyze all scenarios")
+    md = sub.add_parser("memdiff", help="Compare two memory dumps")
+    md.add_argument("dump_a", nargs="?", default=None,
+                     help="First dump file (or omit for instructions)")
+    md.add_argument("dump_b", nargs="?", default=None,
+                     help="Second dump file")
+    md.add_argument("--label-a", default="A", help="Label for first dump")
+    md.add_argument("--label-b", default="B", help="Label for second dump")
+    md.add_argument("--region-lo", default=None,
+                     help="Base address of dumped region (hex, default: 0x06000000)")
+    md.add_argument("--region-hi", default=None,
+                     help="End address of dumped region (hex, default: 0x06100000)")
 
     cg = sub.add_parser("callgraph", help="Capture and analyze call graphs")
     cg.add_argument("--scenario", "-s", default=None,
@@ -983,6 +1114,9 @@ def main():
         cmd_review(config)
     elif args.command == "callgraph":
         cmd_callgraph(config, args.scenario, args.diff, args.all_scenarios)
+    elif args.command == "memdiff":
+        cmd_memdiff(config, args.dump_a, args.dump_b, args.label_a, args.label_b,
+                    args.region_lo, args.region_hi)
 
     return 0
 
