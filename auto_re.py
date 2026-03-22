@@ -1055,15 +1055,12 @@ def cmd_tools(config):
     print(f"    input_press / input_release / input_clear / input_tap")
     print(f"    input_playback (recorded input file for complex scenarios)")
     print()
-    print(f"--- Static Analysis (Ghidra MCP, if configured) ---")
+    print(f"--- Static Analysis ---")
     print()
-    print(f"  If a Ghidra MCP server is configured, you also have access to:")
-    print(f"    get_code / get_function_info / get_call_graph")
-    print(f"    xrefs / list_functions / search_bytes")
-    print(f"    struct / list_data_types / get_hexdump")
-    print(f"    rename_symbol / set_comment")
-    print(f"  These provide decompiled C, cross-references, and type information")
-    print(f"  for static analysis alongside the dynamic emulator tools above.")
+    print(f"  If the project has ghidra_reference/ with decompiled C files,")
+    print(f"  read them to aid static analysis — understand control flow,")
+    print(f"  identify struct fields, and trace data dependencies before")
+    print(f"  running dynamic experiments.")
     print()
     print(f"Combine these tools creatively. Examples:")
     print(f"  - mem_profile a struct range to find ALL writers in one shot")
@@ -1071,7 +1068,6 @@ def cmd_tools(config):
     print(f"    RACING_ONLY vs SHARED vs MENU_ONLY")
     print(f"  - DMA trace during boot to map disc files to RAM addresses")
     print(f"  - dump_region before/after a NOP test to see what changed")
-    print(f"  - Ghidra xrefs to find all consumers of a struct field")
 
 
 def cmd_memdiff(config, dump_a=None, dump_b=None, label_a="A", label_b="B",
