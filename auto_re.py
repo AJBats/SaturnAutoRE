@@ -16,6 +16,7 @@ import os
 import sys
 import re
 import argparse
+from collections import Counter
 import yaml
 
 # Add our lib to path
