@@ -752,11 +752,36 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
     for name, state in targets.items():
         state_file = state.get("file", "")
         inputs = state.get("inputs", [])
-        frames = state.get("frames", 5)
-        trace_frames = min(frames, 5)  # call trace for just a few frames
+        frames = state.get("frames", 0)
+        notes = state.get("notes", "")
+
+        # Check for callgraph hints in config
+        cg_hints = state.get("callgraph", {})
+        skip_frames = cg_hints.get("skip", 0)
+        capture_frames = cg_hints.get("capture", 0)
+
+        if not capture_frames:
+            # Smart defaults based on scenario length
+            if frames <= 10 or frames == 0:
+                # Short or unspecified — capture from the start
+                skip_frames = skip_frames or 0
+                capture_frames = max(frames, 5)
+            elif frames <= 60:
+                # Medium — capture the last portion (event likely near end)
+                skip_frames = skip_frames or max(0, frames - 15)
+                capture_frames = min(15, frames - skip_frames)
+            else:
+                # Long — capture near the end where events happen
+                skip_frames = skip_frames or int(frames * 0.85)
+                capture_frames = min(30, frames - skip_frames)
+
         trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
 
         print(f"--- Scenario: {name} ---")
+        if notes:
+            print(f"  {notes}")
+        if frames > 0:
+            print(f"  Total runway: {frames} frames")
         print()
         print(f"  1. Load save state: {state_file}")
         if inputs:
@@ -766,14 +791,23 @@ def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
                 print(f"  2. Hold buttons: {', '.join(inputs)}")
         else:
             print(f"  2. No input (idle)")
-        print(f"  3. Start call trace:")
-        print(f"     call_trace_start")
-        print(f"  4. Advance {trace_frames} frames:")
-        print(f"     frame_advance {trace_frames}")
-        print(f"  5. Stop call trace:")
-        print(f"     call_trace_stop")
-        print(f"  6. Run auto_re.py callgraph again -- it will auto-detect the")
-        print(f"     trace file from the IPC directory and copy it for you.")
+        if skip_frames > 0:
+            print(f"  3. Advance to the interesting part:")
+            print(f"     frame_advance {skip_frames}")
+            print(f"  4. Start call trace:")
+            print(f"     call_trace_start")
+            print(f"  5. Capture through the event ({capture_frames} frames):")
+            print(f"     frame_advance {capture_frames}")
+            print(f"  6. Stop call trace:")
+            print(f"     call_trace_stop")
+        else:
+            print(f"  3. Start call trace:")
+            print(f"     call_trace_start")
+            print(f"  4. Advance {capture_frames} frames:")
+            print(f"     frame_advance {capture_frames}")
+            print(f"  5. Stop call trace:")
+            print(f"     call_trace_stop")
+        print(f"  Then run auto_re.py callgraph again to auto-detect and analyze.")
         print()
 
     # Check for existing traces — also auto-detect from IPC dir
