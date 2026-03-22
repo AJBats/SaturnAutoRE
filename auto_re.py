@@ -28,6 +28,10 @@ from lib.pipeline import (
     pipeline_summary, get_function_status, observation_has_field_analysis,
 )
 from lib.claim_generator import extract_observation_data, generate_claims, write_claim_file
+from lib.callgraph import (
+    parse_call_trace, FunctionTable, analyze_calls,
+    format_tree, format_edge_list, diff_analyses, cross_reference, find_gaps,
+)
 
 
 def cmd_status(config):
@@ -655,6 +659,217 @@ def cmd_review(config):
     print(f"without summarizing what you just did.")
 
 
+def cmd_callgraph(config, scenario=None, diff=False, all_scenarios=False):
+    """Capture and analyze call graphs from save state scenarios."""
+    auto_re_dir = config["_auto_re_dir"]
+    project_dir = config["_project_dir"]
+    asm_dir = get_assembly_dir(config)
+    save_states = config.get("save_states", {})
+    observations_dir = config["_observations_dir"]
+
+    cg_dir = os.path.join(auto_re_dir, "call_graphs")
+    os.makedirs(cg_dir, exist_ok=True)
+
+    print(f"=== Call Graph Analysis ===")
+    print()
+
+    # Build function table for symbol resolution
+    ftable = None
+    if asm_dir and os.path.exists(asm_dir):
+        ftable = FunctionTable.from_assembly_dir(asm_dir)
+        print(f"Symbol table: {len(ftable.addrs)} functions from {asm_dir}")
+    else:
+        # Check for linker map
+        map_candidates = [
+            os.path.join(project_dir, "build", "daytona.map"),
+            os.path.join(project_dir, "reimpl", "build", "daytona.map"),
+        ]
+        for mp in map_candidates:
+            if os.path.exists(mp):
+                ftable = FunctionTable.from_map_file(mp)
+                print(f"Symbol table: {len(ftable.addrs)} functions from {mp}")
+                break
+
+    if not ftable or len(ftable.addrs) == 0:
+        print(f"No symbol table found. Call graph will use raw addresses.")
+        print(f"  (Add assembly files to {asm_dir or 'assembly_dir'} for function names)")
+        ftable = FunctionTable()
+    print()
+
+    # Determine which scenarios to capture
+    if scenario:
+        targets = {scenario: save_states.get(scenario, {})}
+        if not targets[scenario]:
+            print(f"ERROR: Unknown scenario '{scenario}'")
+            print(f"Available: {', '.join(save_states.keys())}")
+            return
+    elif all_scenarios:
+        targets = save_states
+    else:
+        # Default: first scenario only
+        if not save_states:
+            print(f"No save states defined in config.yaml.")
+            print(f"Define scenarios under save_states: to use callgraph.")
+            return
+        first = next(iter(save_states))
+        targets = {first: save_states[first]}
+        print(f"Capturing scenario '{first}' (use --all for all scenarios)")
+
+    print(f"Scenarios to capture: {', '.join(targets.keys())}")
+    print()
+
+    # Tell the agent what to do
+    print(f"For each scenario, use the Mednafen debugger to capture a call trace:")
+    print()
+
+    for name, state in targets.items():
+        state_file = state.get("file", "")
+        inputs = state.get("inputs", [])
+        frames = state.get("frames", 5)
+        trace_frames = min(frames, 5)  # call trace for just a few frames
+        trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
+
+        print(f"--- Scenario: {name} ---")
+        print()
+        print(f"  1. Load save state: {state_file}")
+        if inputs:
+            if isinstance(inputs[0], list):
+                print(f"  2. Apply timed inputs (see save_states.md)")
+            else:
+                print(f"  2. Hold buttons: {', '.join(inputs)}")
+        else:
+            print(f"  2. No input (idle)")
+        print(f"  3. Start call trace:")
+        print(f"     call_trace_start")
+        print(f"  4. Advance {trace_frames} frames:")
+        print(f"     frame_advance {trace_frames}")
+        print(f"  5. Stop call trace:")
+        print(f"     call_trace_stop")
+        print(f"  6. Copy trace to: {trace_path}")
+        print()
+
+    # Check for existing traces and analyze them
+    existing_traces = {}
+    for name in targets:
+        trace_path = os.path.join(cg_dir, f"{name}_trace.txt")
+        if os.path.exists(trace_path):
+            existing_traces[name] = trace_path
+
+    if existing_traces:
+        print(f"=== Analyzing {len(existing_traces)} existing trace(s) ===")
+        print()
+
+        all_analyses = {}
+        for name, path in existing_traces.items():
+            raw = parse_call_trace(path)
+            if not raw:
+                print(f"  {name}: empty trace (0 calls)")
+                continue
+
+            analysis = analyze_calls(raw, ftable)
+            all_analyses[name] = analysis
+
+            # Write formatted output
+            out_path = os.path.join(cg_dir, f"{name}_graph.txt")
+            with open(out_path, "w") as f:
+                f.write(f"CALL GRAPH: {name}\n")
+                f.write(f"{len(analysis['edges'])} edges, {len(analysis['functions'])} functions\n\n")
+                f.write(f"TREE:\n\n")
+                f.write(format_tree(analysis))
+                f.write(f"\n\n{'=' * 60}\n")
+                f.write(f"EDGES ({len(analysis['edges'])}):\n\n")
+                f.write(format_edge_list(analysis))
+                f.write("\n")
+
+            print(f"  {name}: {len(analysis['edges'])} edges, {len(analysis['functions'])} functions")
+            print(f"    Written to: {out_path}")
+
+        # Differential analysis
+        if diff and len(all_analyses) >= 2:
+            print()
+            print(f"=== Differential Analysis ===")
+            print()
+
+            # Find idle scenario (no inputs)
+            idle_name = None
+            for name in all_analyses:
+                state = targets.get(name, {})
+                if not state.get("inputs"):
+                    idle_name = name
+                    break
+
+            if idle_name:
+                baseline = all_analyses[idle_name]
+                for name, analysis in all_analyses.items():
+                    if name == idle_name:
+                        continue
+                    d = diff_analyses(baseline, analysis)
+                    print(f"  {idle_name} vs {name}:")
+                    if d["new"]:
+                        print(f"    NEW edges ({len(d['new'])}):")
+                        for (caller, callee), count in sorted(d["new"].items(), key=lambda x: -x[1])[:10]:
+                            print(f"      {caller} -> {callee} (x{count})")
+                    if d["increased"]:
+                        print(f"    INCREASED ({len(d['increased'])}):")
+                        for (caller, callee), (new_c, old_c) in sorted(d["increased"].items(), key=lambda x: -x[1][0])[:10]:
+                            print(f"      {caller} -> {callee}: {old_c} -> {new_c}")
+                    print()
+
+        # Cross-reference
+        if len(all_analyses) >= 2:
+            xref = cross_reference(all_analyses)
+            xref_path = os.path.join(cg_dir, "cross_reference.txt")
+            with open(xref_path, "w") as f:
+                f.write(f"CROSS-REFERENCE: {len(all_analyses)} scenarios, {len(xref['all_edges'])} unique edges\n\n")
+                f.write(f"COMMON CORE ({len(xref['common'])} edges -- in all scenarios):\n")
+                for caller, callee in sorted(xref["common"]):
+                    f.write(f"  {caller} -> {callee}\n")
+                f.write(f"\nPER-SCENARIO UNIQUE EDGES:\n")
+                for label, edges in sorted(xref["unique"].items()):
+                    if edges:
+                        f.write(f"\n  {label} only ({len(edges)}):\n")
+                        for caller, callee in sorted(edges):
+                            f.write(f"    {caller} -> {callee}\n")
+            print(f"  Cross-reference: {xref_path}")
+
+        # Gap analysis
+        if all_analyses:
+            # Merge all analyses for gap finding
+            merged_edges = Counter()
+            for a in all_analyses.values():
+                for edge, count in a["edges"].items():
+                    merged_edges[edge] += count
+            merged = {"edges": dict(merged_edges), "functions": set()}
+            for a in all_analyses.values():
+                merged["functions"] |= a["functions"]
+
+            gaps = find_gaps(merged, observations_dir)
+            if gaps:
+                print()
+                print(f"=== Gap Analysis: {len(gaps)} unobserved functions in call graph ===")
+                print()
+                for func, count in gaps[:20]:
+                    print(f"  {func}: {count} calls (no observation)")
+                if len(gaps) > 20:
+                    print(f"  ... and {len(gaps) - 20} more")
+                print()
+                print(f"These are high-value targets for auto_re.py pick.")
+                print(f"They fire per frame but have no observation yet.")
+
+    else:
+        print(f"No existing traces found. Capture traces using the steps above,")
+        print(f"then run auto_re.py callgraph again to analyze them.")
+
+    print()
+    print(f"--- NEXT ACTION ---")
+    print()
+    if not existing_traces:
+        print(f"Capture call traces for each scenario listed above.")
+        print(f"Then run: auto_re.py callgraph")
+    else:
+        print(f"Run: auto_re.py status")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="auto_re — Autonomous RE pipeline CLI",
@@ -677,6 +892,14 @@ def main():
 
     sub.add_parser("integrate", help="Check results and suggest next steps")
     sub.add_parser("review", help="Quality and momentum check via reviewer subagent")
+
+    cg = sub.add_parser("callgraph", help="Capture and analyze call graphs")
+    cg.add_argument("--scenario", "-s", default=None,
+                     help="Capture/analyze one scenario (default: first)")
+    cg.add_argument("--all", action="store_true", dest="all_scenarios",
+                     help="Capture/analyze all scenarios")
+    cg.add_argument("--diff", action="store_true",
+                     help="Compute idle-vs-input differentials")
 
     args = parser.parse_args()
 
@@ -704,6 +927,8 @@ def main():
         cmd_integrate(config)
     elif args.command == "review":
         cmd_review(config)
+    elif args.command == "callgraph":
+        cmd_callgraph(config, args.scenario, args.diff, args.all_scenarios)
 
     return 0
 
