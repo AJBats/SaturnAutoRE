@@ -1,5 +1,7 @@
 # SaturnAutoRE — Autonomous Reverse Engineering Pipeline
 
+[![Demo Video](https://img.youtube.com/vi/wgwie6i-ASU/maxresdefault.jpg)](https://www.youtube.com/watch?v=wgwie6i-ASU)
+
 A reusable harness for reverse engineering Sega Saturn games using Claude
 and the Mednafen emulator. Provides a CLI that guides a single Claude agent
 through a structured explore → verify → integrate cycle.
@@ -235,8 +237,7 @@ The oracle tests 4 types of claims:
 | `value_stable` | Value at A stays constant when idle |
 
 Claims are generated automatically from observation data. The oracle
-(`tools/test_claim.py` in your project) runs them mechanically against
-Mednafen.
+(`test_claim.py` in this repo) runs them mechanically against Mednafen.
 
 ## Tier System
 
