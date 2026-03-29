@@ -41,14 +41,23 @@
 #
 # EXECUTION PROCEDURE:
 #
+#   NOP tests are INTERACTIVE with the human. You cannot judge visual
+#   behavior (rendering, car movement, camera) from screenshots. The
+#   human observes the emulator window and reports what they see.
+#
 #   NOP tests are runtime memory pokes on the RETAIL build — NOT build
 #   modifications. This gives pinpoint before/after behavioral comparison.
 #
-#   1. Load save state:     load_state <scenario_path>
-#   2. Poke NOP over store: raw_command "poke <patch_addr> 0009"
-#      (0x0009 is the SH-2 NOP opcode)
-#   3. Free-run and observe behavior (screenshot, memory read, etc.)
-#   4. Reload SAME save state to compare with vs without the NOP
+#   1. Tell the human what you're about to do and what to look for:
+#      "I'm going to load save state [scenario], NOP the store at
+#       [patch_addr] in [function]. I expect [prediction].
+#       Please [play normally / hold throttle / etc] and tell me
+#       what you see."
+#   2. Load save state:     load_state <scenario_path>
+#   3. Poke NOP over store: raw_command "poke <patch_addr> 00 09"
+#      (two separate bytes: 00 then 09 — poke takes individual bytes)
+#   4. Free-run. The human watches and reports what changed (or didn't).
+#   5. Reload SAME save state to compare with vs without the NOP
 
 experiments:
   # - function: FUN_060366EC
