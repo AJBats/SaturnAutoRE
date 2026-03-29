@@ -3,298 +3,89 @@
 [![Demo Video](https://img.youtube.com/vi/wgwie6i-ASU/maxresdefault.jpg)](https://www.youtube.com/watch?v=wgwie6i-ASU)
 
 A reusable harness for reverse engineering Sega Saturn games using Claude
-and the Mednafen emulator. Provides a CLI that guides a single Claude agent
-through a structured explore → verify → integrate cycle.
-
-## What This Is
-
-You give it a Saturn game project. It gives you a pipeline that:
-1. Picks functions to investigate (from priorities or call-chain exploration)
-2. Validates observation reports for completeness
-3. Generates testable claims from observation data
-4. Runs claims against the emulator (oracle testing)
-5. Tracks progress and tells the agent what to do next
+and the Mednafen emulator. A CLI guides the agent through a structured
+explore → verify → integrate cycle, with NOP testing, graduation, call
+graph analysis, memory diffing, and more.
 
 Every command output ends with the next command to run. The agent never
 has to decide what to do — the tool decides.
 
-## Quick Start — Setting Up a New Project
+## Setup
 
-### Prerequisites
+### 1. Build Mednafen
 
-- A Saturn game project directory with:
-  - A disc image (.cue/.bin) of the game
-  - Mednafen save states for in-game scenarios (human creates these)
-  - Optionally: disassembled code (not required for early-stage RE)
-- Python 3 with `pyyaml` installed
-- The Mednafen emulator built (see "Building Mednafen" below)
-
-### Step 1: Create the auto_re directory structure
-
-In your game project directory:
-
-```bash
-mkdir -p workstreams/auto_re/observations
-mkdir -p workstreams/auto_re/claims
-mkdir -p workstreams/auto_re/reviews
-mkdir -p build/save_states
-mkdir -p build/samples
-mkdir -p build/mcp_ipc
-mkdir -p build/mednafen_home
-```
-
-### Step 2: Create config.yaml
-
-Copy `templates/config.yaml` from this repo to your project at
-`workstreams/auto_re/config.yaml`. Fill in:
-
-```yaml
-game_name: "Your Game Name"
-
-# Where disassembled code lives (relative to project root)
-# Leave empty if no disassembly exists yet
-assembly_dir: ""
-
-# Memory regions to investigate. Name them whatever makes sense.
-# You may not know these yet — add them as you discover them.
-targets:
-  # Example for a 3D game:
-  # vdp1_vram:
-  #   base: 0x25C00000
-  #   stride: 0
-  #   count: 1
-  #   addressing: direct
-  #   notes: "VDP1 command table"
-
-# Game controls — map roles to Saturn buttons
-# Use whatever roles make sense for your game
-controls:
-  # Examples:
-  # throttle: C
-  # shoot: A
-  # jump: B
-
-# Save states — each is a scenario for deterministic testing
-# Human creates these by playing the game and saving at key moments
-save_states: {}
-  # Example:
-  # level1_start:
-  #   file: build/save_states/level1.mc0
-  #   inputs: []
-  #   frames: 300
-  #   notes: "Level 1, player standing still, enemies approaching"
-
-# Where to store accumulated RE knowledge (relative to project root)
-knowledge_base: workstreams/auto_re/struct_map.md
-
-# Disc image path (relative to project root)
-cue_path: "external_resources/Your Game/Your Game.cue"
-
-# Mednafen IPC and home directories (for parallel operation)
-mednafen:
-  ipc_dir: build/mcp_ipc
-  home_dir: build/mednafen_home
-```
-
-### Step 3: Write mission.md
-
-Copy `templates/mission.md` to `workstreams/auto_re/mission.md`. This is
-the most important file — it tells the agent what to investigate and why.
-
-```markdown
-# Mission — Your Game
-
-## Objective
-
-What are you trying to understand? Be specific about what "done" looks like.
-
-## What We Know
-
-Starting knowledge — known addresses, confirmed fields, prior discoveries.
-
-## What We Need to Find
-
-Specific unknowns. Each should be concrete enough to investigate.
-
-## Phases
-
-### Phase 1: [First thing to investigate]
-What to look for, how to look for it.
-
-## Game-Specific Context
-
-Controls, game modes, hardware usage, frame timing, anything relevant.
-```
-
-### Step 4: Set up the Mednafen MCP server
-
-Create `.mcp.json` in your project root. This connects Claude Code to the
-Mednafen debugger:
-
-```json
-{
-  "mcpServers": {
-    "mednafen": {
-      "type": "stdio",
-      "command": "python",
-      "args": [
-        "REPLACE_WITH_PATH/SaturnAutoRE/mednafen/mcp_server.py",
-        "--ipc-dir",
-        "build/mcp_ipc",
-        "--home-dir",
-        "build/mednafen_home"
-      ],
-      "env": {}
-    }
-  }
-}
-```
-
-Replace `REPLACE_WITH_PATH` with the actual path to this SaturnAutoRE repo.
-
-### Step 5: Create save states and catalog
-
-This requires a human. Boot the game in Mednafen, navigate to the gameplay
-situation you want to investigate, and save state.
-
-Copy `templates/save_states.md` to `workstreams/auto_re/save_states.md`.
-Document each save state with:
-- What game mode/level/screen
-- What's happening (player position, speed, enemies, etc.)
-- **Temporal constraints** — how many frames before the scene changes
-- **Best for / avoid for** — what this state is good for investigating
-- **Deterministic scenarios** — what inputs to hold for replay
-
-Add each save state to your `config.yaml` under `save_states:`.
-The catalog and config must stay in sync — the catalog has human context
-(why this state matters), the config has machine parameters (file path,
-inputs, frame count).
-
-### Step 6: Run the pipeline
-
-From your project directory:
-
-```bash
-# See current status and what to do next
-python /path/to/SaturnAutoRE/auto_re.py status
-
-# Pick a function to investigate
-python /path/to/SaturnAutoRE/auto_re.py pick
-
-# After investigating, validate the observation
-python /path/to/SaturnAutoRE/auto_re.py explore-check FUN_XXXXXXXX
-
-# Generate claims and test them
-python /path/to/SaturnAutoRE/auto_re.py verify FUN_XXXXXXXX
-
-# Check results and get next action
-python /path/to/SaturnAutoRE/auto_re.py integrate
-```
-
-Each command tells you what to do next. Follow the chain.
-
-## The Pipeline Cycle
-
-```
-pick → investigate with debugger → explore-check → verify → integrate → pick
-                                        ↑                        |
-                                        └── fix observation ─────┘
-```
-
-1. **Pick** — select next function from priorities or call-chain
-2. **Explore** — use Mednafen debugger (breakpoints, watchpoints, memory
-   sampling) to observe what the function does at runtime
-3. **Explore-check** — validate the observation report has all required
-   sections (call frequency, register context, memory writes, field analysis)
-4. **Verify** — auto-generate claims from observation data and test them
-   against the emulator (oracle)
-5. **Integrate** — review results, update knowledge base, pick next target
-
-## Observation Reports
-
-Each investigated function gets an observation report at
-`workstreams/auto_re/observations/FUN_XXXXXXXX_obs.md`. The report must
-include:
-
-- **YAML frontmatter** — function address, scenarios tested, reachability
-- **Call Frequency** — how many times per frame in each scenario
-- **Register Context** — register values at function entry
-- **Memory Writes** — watchpoint data showing what the function writes
-- **Per-Frame Field Analysis** — behavioral classification of fields from
-  sample CSV data (MANDATORY — the pipeline gates on this)
-
-See `templates/observation_report.md` for the full template.
-
-## Claim Types
-
-The oracle tests 4 types of claims:
-
-| Type | What it tests |
-|------|---------------|
-| `writes_to` | Function F writes to address A during scenario S |
-| `call_count_per_frame` | Function F is called N±T times per frame |
-| `value_changes_with_input` | Value at A increases/decreases with input I |
-| `value_stable` | Value at A stays constant when idle |
-
-Claims are generated automatically from observation data. The oracle
-(`test_claim.py` in this repo) runs them mechanically against Mednafen.
-
-## Tier System
-
-- **Tier 0** — no claims passed (hypothesis only)
-- **Tier 1** — 1 claim passed (one empirical data point)
-- **Tier 2** — 3+ claims passed, 2+ types, at least 1 function-specific
-
-Function-specific means the claim tests something unique to this function
-(e.g., `writes_to` with a PC in the function's range), not a generic
-`value_stable` on a globally static field.
-
-## Building Mednafen
-
-The emulator lives in `mednafen/` as a git submodule. Build it once:
+The emulator lives in `mednafen/` as a git submodule. Build once in WSL:
 
 ```bash
 cd mednafen
-wsl bash build_with_gcc494.sh
+wsl bash build_with_gcc494.sh         # release build
+wsl bash build_with_gcc494.sh --debug # debug build (symbols + crash dumps)
 ```
 
-This cross-compiles a Windows `.exe` using GCC 4.9.4 in WSL. The build
-takes a few minutes. The resulting `src/mednafen.exe` is used by all
-projects.
+Requires GCC 4.9.4 MinGW cross-compiler at `/opt/gcc-4.9.4-mingw64/` in WSL.
 
-Prerequisites for building:
-- WSL with the GCC 4.9.4 MinGW cross-compiler at `/opt/gcc-4.9.4-mingw64/`
-- SDL2, FLAC, zlib, iconv dev packages for MinGW
+### 2. Set up your game project
 
-## File Layout
+Create the directory structure and config from the templates in this repo:
 
-```
-SaturnAutoRE/                          ← this repo (the harness)
-  auto_re.py                           ← CLI entry point
-  test_claim.py                        ← oracle test runner (game-agnostic)
-  lib/
-    config.py                          ← project config loader
-    pipeline.py                        ← filesystem-based state tracking
-    claim_generator.py                 ← observation → claims
-  templates/
-    config.yaml                        ← template for new projects
-    mission.md                         ← template for RE mission
-    observation_report.md              ← template for function observations
-    mcp.json                           ← template for MCP server config
-  mednafen/                            ← emulator submodule (shared)
+```bash
+# In your game project directory:
+mkdir -p workstreams/auto_re/observations
+mkdir -p workstreams/auto_re/claims
+mkdir -p build/save_states build/samples build/mcp_ipc build/mednafen_home
 
-YourGameProject/                       ← your project (uses the harness)
-  workstreams/auto_re/
-    config.yaml                        ← game-specific parameters
-    mission.md                         ← RE objective and phases
-    observations/                      ← function observation reports
-    claims/                            ← generated claim YAML files
-    reviews/                           ← reviewer feedback (optional)
-  build/
-    save_states/                       ← emulator save states
-    samples/                           ← per-frame memory capture CSVs
-    mcp_ipc/                           ← MCP server IPC (auto-created)
-    mednafen_home/                     ← Mednafen config dir (auto-created)
-  .mcp.json                           ← MCP server config (points here)
+# Copy and fill in the essentials:
+cp /path/to/SaturnAutoRE/templates/config.yaml  workstreams/auto_re/config.yaml
+cp /path/to/SaturnAutoRE/templates/mission.md    workstreams/auto_re/mission.md
+cp /path/to/SaturnAutoRE/templates/mcp.json      .mcp.json
 ```
 
+Edit `config.yaml` with your game's disc image path, save states, memory
+regions, and controls. Edit `mission.md` with what you're trying to reverse
+engineer. Edit `.mcp.json` to point to this repo's `mednafen/mcp_server.py`.
+
+### 3. Create save states
+
+Boot the game in Mednafen, navigate to the gameplay situations you want to
+investigate, and save state. Add each to `config.yaml` under `save_states:`.
+This is the one step that requires a human playing the game.
+
+### 4. Point your Claude at the entry point
+
+From your game project directory, tell Claude:
+
+> Read `/path/to/SaturnAutoRE/auto_re.py` and run `python /path/to/SaturnAutoRE/auto_re.py status`
+
+The CLI will take over from there — every command tells the agent exactly
+what to do next. The templates in this repo are self-documenting, and
+`auto_re.py tools` lists every available debugger capability.
+
+## How It Works
+
+```
+status → pick → explore → explore-check → verify → integrate
+                                                       ↓
+                          review ← graduate ← nop-candidates
+                            ↓
+                          status → pick → ...
+```
+
+The agent uses the Mednafen debugger (via MCP server) to set breakpoints,
+watchpoints, capture memory samples, trace calls, and profile reads/writes.
+Observations become testable claims, claims get tested mechanically against
+the emulator, and confirmed functions graduate to human-readable names.
+
+NOP tests are interactive — the agent pokes instructions at runtime and the
+human observes the visual result.
+
+## What's In This Repo
+
+| Path | Purpose |
+|------|---------|
+| `auto_re.py` | CLI entry point (11 commands) |
+| `test_claim.py` | Oracle test runner |
+| `lib/` | Config, pipeline state, claim generation, call graphs, memdiff |
+| `tools/del_recon.py` | Dependency recon for safe function deletion |
+| `watchdog.py` | Agent stall detection and auto-nudge (experimental, untested) |
+| `templates/` | Config, mission, observation, NOP experiment, save state templates |
+| `mednafen/` | Emulator submodule with automation, MCP server, debug features |
