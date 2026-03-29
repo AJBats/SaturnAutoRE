@@ -538,6 +538,11 @@ def cmd_integrate(config):
             print(f"  These functions are NOP-test-ready but have no entry in")
             print(f"  nop_experiments.yaml. Write experiments for them NOW.")
             print()
+            print(f"  NOP tests are runtime memory pokes — NOT build modifications.")
+            print(f"  Poke 0x0009 over a store instruction after loading a save state,")
+            print(f"  then observe the behavioral difference. See nop-candidates for")
+            print(f"  the full execution procedure.")
+            print()
             for nc in needs_standard:
                 pc_info = f" patch:{nc['writer_pc']}" if nc.get("writer_pc") else ""
                 print(f"  {nc['function']}: writes_to {nc['target']}{pc_info} (Tier {nc['tier']})")
@@ -1381,6 +1386,17 @@ def cmd_nop_candidates(config):
     print(f"Schema and examples: {template_path}")
     print()
 
+    print(f"--- Executing a NOP test ---")
+    print()
+    print(f"NOP tests are runtime memory pokes on the RETAIL build, NOT build")
+    print(f"modifications. This gives pinpoint before/after comparison.")
+    print()
+    print(f"  1. Load a save state:  load_state <scenario_path>")
+    print(f"  2. Poke NOP (0x0009) over the store instruction:")
+    print(f"     raw_command \"poke <patch_addr> 0009\"")
+    print(f"  3. Free-run and observe behavior (screenshot, memory read, etc.)")
+    print(f"  4. Reload the SAME save state (clean slate) to compare with/without")
+    print()
     print(f"After running NOP tests, update status to 'confirmed' and add result/conclusion.")
     print(f"Then run: auto_re.py graduate")
 

@@ -38,6 +38,17 @@
 #
 #   Getting this wrong NOPs the wrong instruction, producing misleading
 #   results (crashes, register corruption instead of clean field disable).
+#
+# EXECUTION PROCEDURE:
+#
+#   NOP tests are runtime memory pokes on the RETAIL build — NOT build
+#   modifications. This gives pinpoint before/after behavioral comparison.
+#
+#   1. Load save state:     load_state <scenario_path>
+#   2. Poke NOP over store: raw_command "poke <patch_addr> 0009"
+#      (0x0009 is the SH-2 NOP opcode)
+#   3. Free-run and observe behavior (screenshot, memory read, etc.)
+#   4. Reload SAME save state to compare with vs without the NOP
 
 experiments:
   # - function: FUN_060366EC
