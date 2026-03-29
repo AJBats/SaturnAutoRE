@@ -98,9 +98,6 @@ def cmd_status(config):
         func = summary["claimed_not_tested"][0]
         claim_path = os.path.join(auto_re_dir, "claims", f"{func}.yaml")
         test_runner = os.path.join(SCRIPT_DIR, "test_claim.py")
-        local_runner = os.path.join(config["_project_dir"], "tools", "test_claim.py")
-        if os.path.exists(local_runner):
-            test_runner = local_runner
         print(f"Test the untested claims for {func}.")
         print()
         print(f"  python {test_runner} {claim_path} -v")
@@ -346,12 +343,7 @@ def cmd_verify(config, func_name):
     print(f"Claims written to: {claim_path}")
     print()
 
-    # Tell the agent to run the oracle — use central test_claim.py
     test_runner = os.path.join(SCRIPT_DIR, "test_claim.py")
-    # Fall back to project-local test_claim.py if it exists
-    local_runner = os.path.join(config["_project_dir"], "tools", "test_claim.py")
-    if os.path.exists(local_runner):
-        test_runner = local_runner
     print(f"Now run the oracle to test these claims:")
     print()
     print(f"  python {test_runner} {claim_path} -v")
