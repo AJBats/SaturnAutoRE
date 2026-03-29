@@ -573,8 +573,12 @@ def cmd_integrate(config):
     print()
     print(f"--- NEXT ACTION ---")
     print()
-    print(f"Run: auto_re.py review")
-    print(f"to get a quality check before continuing.")
+    if nop_candidates and any(c["function"] not in _parse_nop_experiments(auto_re_dir) for c in nop_candidates):
+        print(f"Run: auto_re.py nop-candidates")
+        print(f"for the full NOP test procedure and experiment authoring guide.")
+    else:
+        print(f"Run: auto_re.py review")
+        print(f"to get a quality check before continuing.")
 
 
 def cmd_review(config):
@@ -1398,7 +1402,9 @@ def cmd_nop_candidates(config):
     print(f"  4. Reload the SAME save state (clean slate) to compare with/without")
     print()
     print(f"After running NOP tests, update status to 'confirmed' and add result/conclusion.")
-    print(f"Then run: auto_re.py graduate")
+    print()
+    print(f"Next, run: auto_re.py review")
+    print(f"(or auto_re.py graduate if you have confirmed experiments ready)")
 
 
 def _parse_graduated(auto_re_dir):
