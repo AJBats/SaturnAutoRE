@@ -38,6 +38,12 @@ mkdir -p build/save_states build/samples build/mcp_ipc build/mednafen_home
 cp /path/to/SaturnAutoRE/templates/config.yaml  workstreams/auto_re/config.yaml
 cp /path/to/SaturnAutoRE/templates/mission.md    workstreams/auto_re/mission.md
 cp /path/to/SaturnAutoRE/templates/mcp.json      .mcp.json
+
+# Install the agent rules (pick one):
+# Per-project:
+cp /path/to/SaturnAutoRE/auto_re.md   .claude/rules/auto_re.md
+# Or user-global:
+cp /path/to/SaturnAutoRE/auto_re.md   ~/.claude/rules/auto_re.md
 ```
 
 Edit `config.yaml` with your game's disc image path, save states, memory
