@@ -37,6 +37,71 @@ header#header > #header-content {
 }
 .caught-up { color: #9d9; font-weight: bold; }
 
+/* RPG-style progress: % of race.bin verified */
+.progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5em;
+  margin-left: auto;
+  font-size: 11px;
+  color: #aaa;
+}
+.progress-bar {
+  display: inline-block;
+  width: 120px;
+  height: 0.7em;
+  background: #1a1a1a;
+  border: 1px solid #444;
+  border-radius: 0.15em;
+  overflow: hidden;
+  vertical-align: middle;
+}
+.progress-fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(to right, #4d8a4d, #6cc36c);
+  transition: width 0.5s ease-out;
+}
+.progress-pct { color: #cfc; font-weight: bold; }
+.progress-bytes { color: #777; }
+
+/* Archive agreement tag — green/red/gray by verdict */
+.archive {
+  padding: 0.1em 0.5em;
+  border-radius: 0.2em;
+  font-size: 11px;
+  font-weight: bold;
+  cursor: help;
+}
+.archive-agrees    { background: #2a4a2a; color: #9d9; }
+.archive-disagrees { background: #4a2a2a; color: #d99; }
+.archive-silent    { background: #333;   color: #999; }
+
+/* Static + runtime caller evidence */
+.evidence-pill {
+  padding: 0.1em 0.5em;
+  border-radius: 0.2em;
+  font-size: 11px;
+  font-weight: bold;
+  cursor: help;
+}
+.evidence-pill.has  { background: #2a4a3a; color: #adc; }
+.evidence-pill.none { background: #333;    color: #999; }
+
+/* Midpoint warnings — archive thinks there's a function start inside our
+   proposed range.  Loud orange = no supporting evidence (likely Ghidra
+   hallucination).  Yellow = at least one signal backs the split (real
+   alternate entry point — honor archive's view). */
+.midpoint-warning {
+  padding: 0.1em 0.5em;
+  border-radius: 0.2em;
+  font-size: 11px;
+  font-weight: bold;
+  cursor: help;
+}
+.midpoint-warning.suspect   { background: #5a3020; color: #fc9; border-left: 3px solid #f80; }
+.midpoint-warning.supported { background: #4a3a1a; color: #fd9; border-left: 3px solid #fc5; }
+
 .verdict-tag {
   padding: 0.1em 0.5em;
   border-radius: 0.2em;
@@ -224,6 +289,14 @@ svg.arcs .arc.sticky {
 .line.cat-pool .m     { color: #99b; }
 .line.cat-compare .m  { color: #dc9; }
 .line.cat-data .m     { color: #777; font-style: italic; }
+
+/* Unreachable code — bytes decoded as instructions but unreachable from the
+   function entry.  Pool/data zones, padding, or genuine dead code. */
+.line.unreachable                  { background: rgba(0,0,0,0.25); opacity: 0.45; }
+.line.unreachable .m,
+.line.unreachable .a,
+.line.unreachable .b               { color: #555 !important; font-style: italic; font-weight: normal !important; }
+.line.unreachable .tag             { background: #2a2a2a; color: #777; }
 
 /* Conditional rts — also a return, but in middle of function */
 .line.cond-rts                  { background: rgba(180, 80, 140, 0.18); }

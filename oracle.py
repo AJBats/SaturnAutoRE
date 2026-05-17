@@ -193,7 +193,9 @@ def _walk_prologue(binary, vram, start):
       stack              — bytes reserved by `add #-N, r15`, or 0
       flags              — list of yellow flag strings
     """
-    MAX_INTERLEAVE = 2  # consecutive non-prologue allowed (scheduler ops)
+    MAX_INTERLEAVE = 6  # consecutive non-prologue allowed (GCC scheduler can
+                         # interleave several tst/mov-imm/etc. ops between
+                         # register pushes — observed up to 4 in FUN_060295DE)
     HARD_STOPS = ("rts", "rte", "bra", "bsr", "bf", "bt", "jmp", "jsr", "braf", "bsrf")
 
     saved = []
@@ -399,11 +401,71 @@ def _classify_branch_internality(branches, start, end):
     return branches
 
 
-def analyze_candidate(binary, vram, start, hint_end=None):
+def _extend_through_trailing_pools(end, binary, vram, hint_end, pool_priors):
+    """Walk forward from `end + 1` swallowing contiguous pool-prior entries.
+
+    SH-2 PC-relative loads (mov.l/mov.w @(disp,PC),Rn) can only reach forward
+    ~1KB, so GCC scatters small literal pools into .text — most commonly as a
+    trailing zone after the function's last reachable instruction.  Archive
+    convention (and the eval-tool convention we settled on) treats those
+    pools as part of the function: they're only-reachable-from-here, they're
+    PC-bound to this function, and lumping them in matches Ghidra-style
+    boundaries.
+
+    We extend by walking forward from `end + 1`, consuming any address that
+    appears in `pool_priors` (the archive-extracted pool address → size map).
+    Stop at the first byte that's NOT in priors — typically the next
+    function's prologue, since the pool zone ends exactly where the next
+    function begins.
+
+    Returns the new end address (inclusive), or the original `end` if no
+    extension applies.
+    """
+    if not pool_priors:
+        return end
+    binary_end = vram + len(binary) - 1
+    cap = min(hint_end if hint_end is not None else binary_end, binary_end)
+    addr = end + 1
+    while addr <= cap:
+        size = pool_priors.get(addr)
+        if size is None:
+            # No prior at this address.  Pool tables are 4-byte aligned, so
+            # 2 bytes of zero padding between the last code byte and the
+            # first .4byte entry is normal.  Peek ahead through 2- and
+            # 4-byte zero gaps to see if we can bridge to the next prior.
+            bridged = None
+            for pad in (2, 4):
+                check = addr + pad
+                if check > cap or pool_priors.get(check) is None:
+                    continue
+                off = addr - vram
+                if off + pad > len(binary):
+                    continue
+                if all(binary[off + i] == 0 for i in range(pad)):
+                    bridged = check
+                    break
+            if bridged is None:
+                break
+            end = bridged - 1   # the padding bytes are part of this fn
+            addr = bridged
+            continue
+        new_end = addr + size - 1
+        if new_end > cap:
+            break
+        end = new_end
+        addr = new_end + 1
+    return end
+
+
+def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
     """Static analysis for a function starting at `start`.
 
     hint_end caps the control flow walk (avoids running off into the next TU
     if a branch goes there). Pass tu.end or sub.end if known.
+
+    pool_priors (optional): archive-derived {addr: size} map.  When provided,
+    the returned `end` is extended forward through contiguous pool entries
+    (the function's trailing literal-pool zone), matching archive convention.
     """
     binary_max = vram + len(binary) - 1
     hard_limit = hint_end if hint_end is not None else binary_max
@@ -419,13 +481,19 @@ def analyze_candidate(binary, vram, start, hint_end=None):
 
     # The last byte of the function is the last byte of the last reachable instruction.
     # For rts/rte/bra with delay slots, the delay slot's 2nd byte is the end.
-    end = max_reachable + 1  # +1 because reachable contains instruction-start addrs
+    code_end = max_reachable + 1  # +1 because reachable contains instruction-start addrs
 
-    # Walk epilogue backward from end
+    # Walk epilogue backward from the LAST CODE BYTE (not the post-extension
+    # boundary).  Epilogue detection has to see real instructions; pool data
+    # would scramble it.
     epi_start, restored, stack_dealloc, final_rts, delay_slot = _walk_epilogue_backward(
-        binary, vram, end, func_start=start
+        binary, vram, code_end, func_start=start
     )
-    epilogue_range = (epi_start, end) if epi_start is not None else (None, None)
+    epilogue_range = (epi_start, code_end) if epi_start is not None else (None, None)
+
+    # Now extend the boundary through any trailing pool zone (no-op if
+    # pool_priors not provided).
+    end = _extend_through_trailing_pools(code_end, binary, vram, hard_limit, pool_priors)
 
     # Find conditional rts (rts that are NOT the final one)
     conditional_rts = []
@@ -560,12 +628,15 @@ def _scan_for_next_prologue(binary, vram, start_addr, max_addr):
     return None
 
 
-def find_next_forward_sweep_candidate(yaml_cfg, binary):
+def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None):
     """Forward-sweep candidate generation.
 
     Sorts verified code subsegs by start. For each, scans the bytes
     immediately after `end` looking for the next function-start pattern.
     Returns the FIRST such candidate that isn't already a verified subseg.
+
+    pool_priors propagates into analyze_candidate so the returned evidence's
+    `end` already includes the function's trailing pool zone.
 
     Returns (previous_subseg_dict, FunctionEvidence) or None if all caught up.
     """
@@ -591,7 +662,7 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary):
         # Hint analysis bounds to the TU containing the candidate
         tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)
         hint_end = tu["end"] if tu else None
-        ev = analyze_candidate(binary, vram, next_start, hint_end)
+        ev = analyze_candidate(binary, vram, next_start, hint_end, pool_priors=pool_priors)
         return (prev, ev)
 
     return None

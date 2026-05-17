@@ -1,16 +1,79 @@
 // keys.js — single-candidate forward-sweep eval UI.
 
 let LAST_CANDIDATE_START = null;
-let AWAITING_AI = false;
 
 function setStatus(text) {
   document.getElementById('status').textContent = text;
 }
 
+function progressHtml(p) {
+  if (!p) return '';
+  const pct = p.pct.toFixed(2);
+  const v = p.verified_bytes.toLocaleString();
+  const t = p.total_bytes.toLocaleString();
+  // Tiny inline bar — width = pct, RPG-style fill
+  return `
+    <span class="progress" title="${v} / ${t} bytes of race.bin verified">
+      <span class="progress-bar"><span class="progress-fill" style="width:${pct}%"></span></span>
+      <span class="progress-pct">${pct}%</span>
+      <span class="progress-bytes">${v} / ${t} bytes</span>
+    </span>
+  `;
+}
+
+function archiveHtml(a) {
+  if (!a) return '';
+  const tip = escapeHtml(a.tooltip || '');
+  let label;
+  if (a.verdict === 'agrees') {
+    const delta = a.end_delta;
+    label = delta == null ? 'archive: agrees' : `archive: agrees (${delta >= 0 ? '+' : ''}${delta}b)`;
+  } else if (a.verdict === 'disagrees') {
+    label = `archive: disagrees (${a.end_delta >= 0 ? '+' : ''}${a.end_delta}b)`;
+  } else {
+    label = 'archive: silent';
+  }
+  return `<span class="archive archive-${a.verdict}" title="${tip}">${escapeHtml(label)}</span>`;
+}
+
+function evidenceHtml(e) {
+  if (!e) return '';
+  const parts = [];
+
+  const scCls = e.static_callers > 0 ? 'has' : 'none';
+  const rhCls = e.runtime_hits   > 0 ? 'has' : 'none';
+  parts.push(
+    `<span class="evidence-pill ${scCls}" title="static call references found in archive .s files">`
+    + `${e.static_callers} static caller${e.static_callers === 1 ? '' : 's'}</span>`
+  );
+  parts.push(
+    `<span class="evidence-pill ${rhCls}" title="breakpoint hits across all probe runs">`
+    + `${e.runtime_hits} runtime hit${e.runtime_hits === 1 ? '' : 's'}</span>`
+  );
+
+  for (const mp of e.midpoints || []) {
+    const mpSc = mp.static_callers;
+    const mpRh = mp.runtime_hits;
+    // Loud if archive claims a midpoint but evidence is weak.  Quiet
+    // (informational) if both signals back the split.
+    const supported = (mpSc > 0 || mpRh > 0);
+    parts.push(
+      `<span class="midpoint-warning ${supported ? 'supported' : 'suspect'}" `
+      + `title="archive proposes FUN_${mp.addr_hex} as a separate function inside our proposed range">`
+      + `archive midpoint @ FUN_${mp.addr_hex} `
+      + `(${mpSc} static, ${mpRh} runtime)</span>`
+    );
+  }
+  return parts.join('');
+}
+
 function renderHeader(s) {
   const el = document.getElementById('header-content');
   if (s.all_caught_up) {
-    el.innerHTML = `<span class="caught-up">All verified subsegs are caught up. Add a manual anchor in yaml to continue forward-sweep.</span>`;
+    el.innerHTML = `
+      <span class="caught-up">All verified subsegs are caught up. Add a manual anchor in yaml to continue forward-sweep.</span>
+      ${progressHtml(s.progress)}
+    `;
     return;
   }
   const c = s.candidate;
@@ -23,8 +86,11 @@ function renderHeader(s) {
     <span class="addr">0x${c.start_hex} → 0x${c.end_hex}</span>
     <span class="size">${c.size} bytes</span>
     <span class="verdict-tag verdict-${c.verdict}">${c.verdict}</span>
+    ${archiveHtml(c.archive)}
+    ${evidenceHtml(c.evidence)}
     ${p ? `<span class="prev">after ${p.name}</span>` : ''}
     ${flagsHtml}
+    ${progressHtml(s.progress)}
   `;
 }
 
@@ -261,12 +327,6 @@ window.addEventListener('resize', () => {
   RESIZE_TIMER = setTimeout(drawArcs, 80);
 });
 
-function showAwaitingBanner(show) {
-  const b = document.getElementById('awaiting-banner');
-  if (show) b.classList.remove('hidden');
-  else b.classList.add('hidden');
-}
-
 function getFeedback() {
   return document.getElementById('feedback-text').value.trim();
 }
@@ -285,8 +345,6 @@ async function fetchState() {
     if (s.all_caught_up) {
       document.getElementById('listing').innerHTML = '';
       setStatus(`history: ${s.history_count}`);
-      AWAITING_AI = false;
-      showAwaitingBanner(false);
       LAST_CANDIDATE_START = null;
       return;
     }
@@ -297,16 +355,17 @@ async function fetchState() {
     if (changed) {
       renderListing(s.lines);
       LAST_CANDIDATE_START = newStart;
-      // After listing rerenders, jump to the proposed-section header.
       requestAnimationFrame(() => {
         const target = document.querySelector('.section-current-header');
         if (target) target.scrollIntoView({block: 'start', behavior: 'instant'});
       });
     }
 
-    AWAITING_AI = !!s.awaiting_ai;
-    showAwaitingBanner(AWAITING_AI);
-    setStatus(`history: ${s.history_count}`);
+    const pendingCount = (s.pending_messages || []).length;
+    const pendingHtml = pendingCount > 0
+      ? ` — ${pendingCount} pending msg${pendingCount === 1 ? '' : 's'} on this candidate`
+      : '';
+    setStatus(`history: ${s.history_count}${pendingHtml}`);
   } catch (e) {
     setStatus('connection lost — is the server running?');
   }
@@ -329,25 +388,12 @@ async function submitVerdict(verdict) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  document.getElementById('btn-approve').addEventListener('click', () => {
-    if (AWAITING_AI) return;
-    submitVerdict('approved');
-  });
-  document.getElementById('btn-reject').addEventListener('click', () => {
-    if (AWAITING_AI) return;
-    submitVerdict('rejected');
-  });
-  document.getElementById('btn-unsure').addEventListener('click', () => {
-    if (AWAITING_AI) return;
-    submitVerdict('unsure');
-  });
+  document.getElementById('btn-approve').addEventListener('click', () => submitVerdict('approved'));
+  document.getElementById('btn-reject').addEventListener('click',  () => submitVerdict('rejected'));
+  document.getElementById('btn-unsure').addEventListener('click',  () => submitVerdict('unsure'));
 
   document.addEventListener('keydown', (e) => {
-    if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') {
-      // Inside feedback box — keyboard shortcuts disabled (the user is typing).
-      return;
-    }
-    if (AWAITING_AI) return;
+    if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
     if (e.key === '1') { e.preventDefault(); document.getElementById('btn-approve').click(); }
     else if (e.key === '2') { e.preventDefault(); document.getElementById('btn-reject').click(); }
     else if (e.key === '3') { e.preventDefault(); document.getElementById('btn-unsure').click(); }

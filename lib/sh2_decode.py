@@ -48,6 +48,8 @@ def decode_sh2(opcode, pc):
         # bsrf/braf
         if lo == 3 and rm == 0: return f"bsrf r{rn}", None
         if lo == 3 and rm == 2: return f"braf r{rn}", None
+        # movt Rn — copy T flag to Rn (encoding 0000 nnnn 0010 1001)
+        if lo == 9 and rm == 2: return f"movt r{rn}", None
         # pref/ocbi/ocbp/ocbwb
         if lo == 3 and rm == 8: return f"pref @r{rn}", None
         if lo == 3 and rm == 9: return f"ocbi @r{rn}", None

@@ -138,7 +138,70 @@ def analyze_subseg(binary, vram, sub_start, sub_end):
 # Global label map (cross-section references)
 # ---------------------------------------------------------------------------
 
-def build_global_labels(binary, vram, subsegs):
+def load_pool_priors(yaml_path):
+    """Load `<yaml_stem>.pool_priors.txt` next to the yaml if present.
+    Returns dict {addr: 'mov.l' | 'mov.w'} (size 4 → mov.l, size 2 → mov.w).
+    """
+    priors_path = Path(yaml_path).parent / (Path(yaml_path).stem + ".pool_priors.txt")
+    if not priors_path.exists():
+        return {}
+    priors = {}
+    for line in priors_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                addr = int(parts[0], 16)
+                size = int(parts[1])
+                priors[addr] = "mov.l" if size == 4 else ("mov.w" if size == 2 else None)
+            except ValueError:
+                pass
+    # Remove any None entries
+    return {a: k for a, k in priors.items() if k}
+
+
+def collect_global_pool_targets(binary, vram, subsegs):
+    """Across all declared code subsegs, find pool targets (mov.l/w/mova) that
+    fall OUTSIDE the referencing subseg's own range — these are cross-function
+    pool references. The splitter needs to know about them so:
+
+      - The label at the pool address uses `.L_pool_XXXXXXXX:` (pool semantics)
+        instead of the generic `xref_XXXXXXXX:` cross-section label.
+      - The bytes at the pool address are emitted as `.4byte 0xVALUE` (or
+        `.2byte` for mov.w) instead of raw `.byte` pairs.
+
+    Returns dict {addr: kind} where kind is one of 'mov.l', 'mov.w', 'mova'.
+    """
+    cross_pool = {}
+    for sub in subsegs:
+        if sub.get("type") != "code":
+            continue
+        sub_start, sub_end = sub["start"], sub["end"]
+        pool4, pool2, _, _, _ = analyze_subseg(binary, vram, sub_start, sub_end)
+        addr = sub_start
+        while addr <= sub_end:
+            if addr in pool4:
+                addr += 4
+                continue
+            if addr in pool2:
+                addr += 2
+                continue
+            off = addr - vram
+            if off + 1 > len(binary):
+                break
+            opcode = (binary[off] << 8) | binary[off + 1]
+            mnem, pool_target = decode_sh2(opcode, addr)
+            if pool_target is not None and not (sub_start <= pool_target <= sub_end):
+                kind = _pool_kind(mnem)
+                if kind in ("mov.l", "mov.w", "mova"):
+                    cross_pool.setdefault(pool_target, kind)
+            addr += 2
+    return cross_pool
+
+
+def build_global_labels(binary, vram, subsegs, pool_priors=None):
     """Walk all declared code subsegs and build address → label_name map for
     targets that need a globally-visible label (cross-section references).
 
@@ -151,6 +214,15 @@ def build_global_labels(binary, vram, subsegs):
             name = s.get("name") or f"FUN_{s['start']:08X}"
             subseg_name_at[s["start"]] = name
 
+    # Cross-function pool targets: addresses referenced via mov.l/w/mova from
+    # OUTSIDE the subseg that owns them.  We name these `.L_pool_XXXXXXXX`
+    # (pool semantics) instead of generic `xref_XXXXXXXX`.
+    cross_pool = collect_global_pool_targets(binary, vram, subsegs)
+
+    # Merge in archive-derived pool priors (passed in by caller via pool_priors)
+    for addr, kind in (pool_priors or {}).items():
+        cross_pool.setdefault(addr, kind)
+
     global_labels = {}
     for sub in subsegs:
         if sub.get("type") != "code":
@@ -159,6 +231,8 @@ def build_global_labels(binary, vram, subsegs):
         for addr in cross_refs:
             if addr in subseg_name_at:
                 global_labels[addr] = subseg_name_at[addr]
+            elif addr in cross_pool:
+                global_labels[addr] = f".L_pool_{addr:08X}"
             elif addr not in global_labels:
                 global_labels[addr] = f"xref_{addr:08X}"
 
@@ -166,7 +240,7 @@ def build_global_labels(binary, vram, subsegs):
     for addr, name in subseg_name_at.items():
         global_labels.setdefault(addr, name)
 
-    return global_labels
+    return global_labels, cross_pool
 
 
 # ---------------------------------------------------------------------------
@@ -212,8 +286,13 @@ def symbolize(mnem, pool4, pool2, mova_targets, branch_local, global_labels):
 # Emission
 # ---------------------------------------------------------------------------
 
-def emit_subseg_code(binary, vram, sub, global_labels, out):
-    """Emit a declared code subseg: prologue, instructions, pool data, branch labels."""
+def emit_subseg_code(binary, vram, sub, global_labels, cross_pool, out):
+    """Emit a declared code subseg: prologue, instructions, pool data, branch labels.
+
+    Also handles cross-function pool addresses that fall INSIDE this subseg's
+    range — even though this subseg's own instructions don't reference them,
+    another verified subseg does, and the bytes there are pool data.
+    """
     start, end = sub["start"], sub["end"]
     name = sub.get("name") or f"FUN_{start:08X}"
 
@@ -226,26 +305,28 @@ def emit_subseg_code(binary, vram, sub, global_labels, out):
 
     addr = start
     while addr <= end:
-        # 4-byte mov.l pool constant
-        if addr in pool4:
+        # 4-byte mov.l pool constant (intra-fn or cross-fn referenced)
+        is_pool4 = (addr in pool4) or (cross_pool.get(addr) == "mov.l")
+        is_pool2 = (addr in pool2) or (cross_pool.get(addr) == "mov.w")
+        is_mova = (addr in mova_targets) or (cross_pool.get(addr) == "mova")
+
+        if is_pool4:
             off = addr - vram
             value = (binary[off] << 24) | (binary[off + 1] << 16) | (binary[off + 2] << 8) | binary[off + 3]
             out.append(f".L_pool_{addr:08X}:")
             out.append(f"    .4byte 0x{value:08X}")
             addr += 4
             continue
-        # 2-byte mov.w pool constant
-        if addr in pool2:
+        if is_pool2:
             off = addr - vram
             value = (binary[off] << 8) | binary[off + 1]
             out.append(f".L_pool_{addr:08X}:")
             out.append(f"    .2byte 0x{value:04X}")
             addr += 2
             continue
-        # mova target — label only, treat following bytes as instructions/data per linear walk
-        if addr in mova_targets:
+        if is_mova:
             out.append(f".L_pool_{addr:08X}:")
-            # fall through — let the instruction decoder handle bytes from here
+            # fall through — mova doesn't fix the byte count
 
         if addr in branch_local:
             out.append(f".L_{addr:08X}:")
@@ -265,12 +346,39 @@ def emit_subseg_code(binary, vram, sub, global_labels, out):
         addr += 2
 
 
-def emit_undeclared_range(binary, vram, start, end, global_labels, out):
-    """Emit raw .byte pairs for an undeclared address range, with cross-ref labels."""
+def emit_undeclared_range(binary, vram, start, end, global_labels, out, cross_pool=None):
+    """Emit raw bytes for an undeclared address range, with cross-ref labels.
+
+    When `cross_pool` contains an address, emit pool data (`.4byte`/`.2byte`)
+    with a `.L_pool_XXXXXXXX:` label instead of generic .byte pairs.  This
+    surfaces cross-function pool constants properly.
+    """
+    cross_pool = cross_pool or {}
     addr = start
     while addr <= end:
+        # Pool data takes precedence over generic byte emission
+        if addr in cross_pool:
+            kind = cross_pool[addr]
+            off = addr - vram
+            if kind == "mov.l" and addr + 3 <= end and off + 3 < len(binary):
+                value = (binary[off] << 24) | (binary[off+1] << 16) | (binary[off+2] << 8) | binary[off+3]
+                out.append(f".L_pool_{addr:08X}:")
+                out.append(f"    .4byte 0x{value:08X}")
+                addr += 4
+                continue
+            if kind == "mov.w" and addr + 1 <= end and off + 1 < len(binary):
+                value = (binary[off] << 8) | binary[off+1]
+                out.append(f".L_pool_{addr:08X}:")
+                out.append(f"    .2byte 0x{value:04X}")
+                addr += 2
+                continue
+            if kind == "mova":
+                # mova target: label only, no fixed size — fall through to byte emit
+                out.append(f".L_pool_{addr:08X}:")
+
         if addr in global_labels:
             out.append(f"{global_labels[addr]}:")
+
         off = addr - vram
         if off >= len(binary):
             break
@@ -282,7 +390,7 @@ def emit_undeclared_range(binary, vram, start, end, global_labels, out):
             addr += 1
 
 
-def emit_tu(binary, vram, tu, subsegs, global_labels, out):
+def emit_tu(binary, vram, tu, subsegs, global_labels, cross_pool, out):
     """Emit one TU's worth of content into the combined .s output."""
     tu_start, tu_end, tu_name = tu["start"], tu["end"], tu["name"]
     declared = sorted(
@@ -299,21 +407,21 @@ def emit_tu(binary, vram, tu, subsegs, global_labels, out):
         if cursor < sub["start"]:
             out.append("")
             out.append(f"/* undeclared 0x{cursor:08X}-0x{sub['start']-1:08X} */")
-            emit_undeclared_range(binary, vram, cursor, sub["start"] - 1, global_labels, out)
+            emit_undeclared_range(binary, vram, cursor, sub["start"] - 1, global_labels, out, cross_pool)
             cursor = sub["start"]
 
         if sub.get("type") == "code":
-            emit_subseg_code(binary, vram, sub, global_labels, out)
+            emit_subseg_code(binary, vram, sub, global_labels, cross_pool, out)
         elif sub.get("type") == "data":
             out.append("")
             out.append(f"/* declared data 0x{sub['start']:08X}-0x{sub['end']:08X} */")
-            emit_undeclared_range(binary, vram, sub["start"], sub["end"], global_labels, out)
+            emit_undeclared_range(binary, vram, sub["start"], sub["end"], global_labels, out, cross_pool)
         cursor = sub["end"] + 1
 
     if cursor <= tu_end:
         out.append("")
         out.append(f"/* undeclared 0x{cursor:08X}-0x{tu_end:08X} */")
-        emit_undeclared_range(binary, vram, cursor, tu_end, global_labels, out)
+        emit_undeclared_range(binary, vram, cursor, tu_end, global_labels, out, cross_pool)
 
 
 # ---------------------------------------------------------------------------
@@ -376,15 +484,16 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Pass 1: build global label map (cross-section references)
-    global_labels = build_global_labels(binary, vram, subsegs)
+    # Pass 1: build global label map + cross-function pool target dict
+    pool_priors = load_pool_priors(args.yaml_path)
+    global_labels, cross_pool = build_global_labels(binary, vram, subsegs, pool_priors)
 
     # Pass 2: emit combined .s
     out_lines = [
         f"/* {module}.s — generated from {Path(args.yaml_path).name}. Do not edit by hand. */",
     ]
     for tu in tus:
-        emit_tu(binary, vram, tu, subsegs, global_labels, out_lines)
+        emit_tu(binary, vram, tu, subsegs, global_labels, cross_pool, out_lines)
     out_lines.append("")
 
     s_path = Path(args.output_dir) / f"{module}.s"

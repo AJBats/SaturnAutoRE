@@ -53,14 +53,21 @@ LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _empty_session():
-    return {"pending_verdict": None, "history": [], "awaiting_ai": False, "ai_override": None}
+    return {"history": [], "ai_override": None}
 
 
 def load_session():
     p = STATE["session_path"]
     if p and p.exists():
         with open(p) as f:
-            return json.load(f)
+            sess = json.load(f)
+        # Migrate legacy entries: feedback used to be a single string; new
+        # schema is a list (multiple reject/unsure clicks accumulate).
+        for entry in sess.get("history", []):
+            fb = entry.get("feedback")
+            if isinstance(fb, str):
+                entry["feedback"] = [fb] if fb else []
+        return sess
     return _empty_session()
 
 
@@ -129,15 +136,26 @@ def _classify_mnem(mnem):
 
 
 def _pools_and_branches(ev):
-    """Return (pool4, pool2, mova, branch_targets) within ev's range."""
+    """Return (pool4, pool2, mova, branch_targets) within ev's range.
+
+    Pool detection covers BOTH:
+      - Pools referenced by mov.l/w/mova WITHIN ev (function-internal)
+      - Pools referenced from sibling verified subsegs (cross-function pool
+        constants clustered in this candidate's range — common Saturn pattern)
+    """
     pool4 = set()
     pool2 = set()
     mova = set()
     binary = STATE["binary_cache"]
     vram = STATE["vram_cache"]
+
+    # Pool refs FROM ev to ANY target (including cross-function — pools in
+    # sibling subsegs' ranges).  All targets get added so symbolization
+    # converts hardcoded addresses to labels.  Label emission only happens
+    # when the emission loop walks an address that's in this set AND falls
+    # in the current section's range, so out-of-range entries are
+    # symbolization-only (label exists in another section's emission).
     for addr in sorted(ev.reachable):
-        if addr in pool4 or addr in pool2:
-            continue
         off = addr - vram
         if off + 1 >= len(binary):
             continue
@@ -145,12 +163,27 @@ def _pools_and_branches(ev):
         mnem, tgt = decode_sh2(op, addr)
         if tgt is None or mnem is None:
             continue
-        if mnem.startswith("mov.l @(0x") and ev.start <= tgt <= ev.end:
+        if mnem.startswith("mov.l @(0x"):
             pool4.add(tgt)
-        elif mnem.startswith("mov.w @(0x") and ev.start <= tgt <= ev.end:
+        elif mnem.startswith("mov.w @(0x"):
             pool2.add(tgt)
-        elif mnem.startswith("mova @(0x") and ev.start <= tgt <= ev.end:
+        elif mnem.startswith("mova @(0x"):
             mova.add(tgt)
+
+    # Sibling pool refs landing INSIDE ev's range (cross-function refs into ev).
+    sp4, sp2, spm = _sibling_pool_targets(ev.start, ev.end)
+    pool4 |= sp4
+    pool2 |= sp2
+    mova |= spm
+
+    # Archive-derived pool priors (addresses the archive's .s files identified
+    # as pool data) — fills in pools referenced from not-yet-verified functions.
+    for addr, size in STATE.get("pool_priors", {}).items():
+        if ev.start <= addr <= ev.end:
+            if size == 4:
+                pool4.add(addr)
+            elif size == 2:
+                pool2.add(addr)
 
     branch_targets = {}
     for b in ev.branches:
@@ -207,50 +240,272 @@ def _branch_direction(b):
 
 
 def _compute_indent_depths(ev):
-    """Compute nesting depth per address via a push/pop sweep on branch targets.
+    """Compute nesting depth per address via CFG region analysis.
 
-    Rule (matches C reading order):
-      - Conditional-branch target (bf/bt/bf.s/bt.s) → push depth
-        (the label marks the start of a "branched-to body", i.e. the IF arm)
-      - Unconditional-branch target (bra)           → pop depth
-        (the label is a merge point — bra'd to from end-of-arm)
-      - Fall-through code stays at the current depth
-      - Backward branches (loops) are not handled in this version
+    Approach:
+      1. Build basic blocks: split at every branch instruction and every
+         branch target.
+      2. Build edges (successor relationships) between blocks.
+      3. Identify structured regions:
+           - if-then / if-then-else: a block ending in a conditional whose
+             two successors merge at a common postdominator
+           - while / do-while: a backward edge from a block to a dominator
+      4. Build a region tree from the regions; depth = nesting of regions.
 
-    Returns dict {addr: int_depth}.  Addresses not in the dict have depth 0.
+    For unreducible control flow (irregular goto, tail calls), the region
+    decomposition leaves those addresses at depth 0 — better to be flat than
+    misleading.
+
+    Returns dict {addr: int_depth}.
     """
     if not ev.branches:
         return {}
 
-    cond_targets = set()
-    uncond_targets = set()
+    binary = STATE.get("binary_cache")
+    vram = STATE.get("vram_cache")
+    if binary is None or vram is None:
+        return {}
+
+    fn_start, fn_end = ev.start, ev.end
+
+    # ----- 1. Identify block-start addresses
+    block_starts = {fn_start}
+    branches_by_src = {}
     for b in ev.branches:
         if not b.internal or b.target is None:
             continue
-        if b.target <= b.src:
-            continue  # backward — loops, handled in a later pass
-        if b.mnem in {"bf", "bt", "bf/s", "bt/s"}:
-            cond_targets.add(b.target)
-        elif b.mnem in {"bra"}:
-            uncond_targets.add(b.target)
-        # bsr is a call (returns), not a control-structure boundary — skip
+        branches_by_src[b.src] = b
+        block_starts.add(b.target)
+        # The instruction after a branch (or its delay slot) begins a new block.
+        delay = 2 if b.mnem in {"bra", "bsr", "bf/s", "bt/s"} else 0
+        after = b.src + 2 + delay
+        if fn_start <= after <= fn_end:
+            block_starts.add(after)
 
-    if not cond_targets and not uncond_targets:
+    # Also: instruction after rts/jmp/braf (no static target but ends a block)
+    addr = fn_start
+    while addr <= fn_end:
+        off = addr - vram
+        if off + 1 >= len(binary):
+            break
+        op = (binary[off] << 8) | binary[off + 1]
+        mnem, _ = decode_sh2(op, addr)
+        if mnem:
+            head = mnem.split()[0]
+            if head in {"rts", "rte", "jmp", "braf"}:
+                # Includes delay slot
+                after = addr + 4
+                if fn_start <= after <= fn_end:
+                    block_starts.add(after)
+        addr += 2
+
+    block_starts_sorted = sorted(s for s in block_starts if fn_start <= s <= fn_end)
+    if not block_starts_sorted:
         return {}
 
+    # ----- 2. Build blocks (each is [start, end_inclusive])
+    blocks = []
+    for i, s in enumerate(block_starts_sorted):
+        e = (block_starts_sorted[i + 1] - 1) if i + 1 < len(block_starts_sorted) else fn_end
+        blocks.append({"start": s, "end": e, "id": i})
+    addr_to_block = {}
+    for blk in blocks:
+        for a in range(blk["start"], blk["end"] + 1, 2):
+            addr_to_block[a] = blk["id"]
+
+    # ----- 3. Build successor edges per block
+    for blk in blocks:
+        blk["succs"] = []
+    for blk in blocks:
+        last = blk["end"]
+        # Walk back through the block's last instruction (with delay slot accounting)
+        # to find the terminating control-flow.
+        # Simple: scan from last backwards to find last decodable terminator.
+        term_addr = None
+        term_mnem = None
+        a = blk["start"]
+        while a <= blk["end"]:
+            off = a - vram
+            if off + 1 < len(binary):
+                op = (binary[off] << 8) | binary[off + 1]
+                mn, _ = decode_sh2(op, a)
+                if mn:
+                    head = mn.split()[0]
+                    if head in {"rts", "rte", "jmp", "braf", "bra", "bsr", "bf", "bt", "bf/s", "bt/s"}:
+                        term_addr = a
+                        term_mnem = mn
+            a += 2
+
+        if term_mnem is None:
+            # No branch in this block — falls through to next block by address
+            nxt = blk["end"] + 1
+            if nxt in addr_to_block:
+                blk["succs"].append(addr_to_block[nxt])
+            continue
+
+        head = term_mnem.split()[0]
+        # Branch with static target
+        b = branches_by_src.get(term_addr)
+        if head in {"bra"}:
+            if b and b.target in addr_to_block:
+                blk["succs"].append(addr_to_block[b.target])
+        elif head in {"bf", "bt", "bf/s", "bt/s"}:
+            # Conditional: target + fall-through-after-delay
+            if b and b.target in addr_to_block:
+                blk["succs"].append(addr_to_block[b.target])
+            delay = 2 if head in {"bf/s", "bt/s"} else 0
+            after = term_addr + 2 + delay
+            if after in addr_to_block:
+                blk["succs"].append(addr_to_block[after])
+        elif head in {"rts", "rte"}:
+            pass  # no successor (function exit)
+        elif head in {"jmp", "braf"}:
+            pass  # indirect — no static successor we can resolve
+        elif head == "bsr":
+            # Call returns; fall-through after delay slot
+            after = term_addr + 4
+            if after in addr_to_block:
+                blk["succs"].append(addr_to_block[after])
+
+    # ----- 4. Identify structured regions
+    # Strategy: scan blocks for two patterns:
+    #   (a) if/if-else: block ends in conditional, both successors converge
+    #   (b) loop: block has back-edge to an earlier block (potential header)
+    #
+    # For each region found, we store (header_block_id, body_blocks_set,
+    # merge_block_id_or_None).  Then assign depth by region nesting.
+
+    regions = []  # each: {header, body, kind, exit}
+    n_blocks = len(blocks)
+
+    # Find back-edges (loops) — a successor that points to an earlier block.
+    for blk in blocks:
+        for s in blk["succs"]:
+            if s <= blk["id"]:
+                # back-edge: blk is loop tail, target is loop header
+                header_id = s
+                tail_id = blk["id"]
+                # Loop body = blocks reachable from header without going through tail+1
+                body = set()
+                stack = [header_id]
+                while stack:
+                    cur = stack.pop()
+                    if cur in body or cur > tail_id:
+                        continue
+                    body.add(cur)
+                    for nx in blocks[cur]["succs"]:
+                        if nx not in body and nx >= header_id and nx <= tail_id:
+                            stack.append(nx)
+                regions.append({"kind": "loop", "header": header_id,
+                                "body": body, "exit": None})
+
+    # Find if/if-else: block with two successors, both reach a common merge.
+    # We compute "reaches" from each block within the function.
+    def reaches_from(block_id, stop_at=None):
+        visited = set()
+        stack = [block_id]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            if cur == stop_at:
+                continue
+            for nx in blocks[cur]["succs"]:
+                if nx not in visited:
+                    stack.append(nx)
+        return visited
+
+    for blk in blocks:
+        if len(blk["succs"]) != 2:
+            continue
+        # By construction: succs[0] is the conditional's BRANCHED-TO target,
+        # succs[1] is the fall-through.
+        target_succ = blk["succs"][0]
+        fall_succ = blk["succs"][1]
+        if target_succ <= blk["id"] or fall_succ <= blk["id"]:
+            continue  # backward (loop) handled separately
+        reach_target = reaches_from(target_succ)
+        reach_fall = reaches_from(fall_succ)
+        common = reach_target & reach_fall
+        if not common:
+            continue
+        merge = min(common)
+
+        # Two structural patterns:
+        #
+        #   (a) Branched-to has its own body before reaching the merge.
+        #       This is bt-with-body or bf-with-bra-to-merge. The branched-to
+        #       arm is the "interesting" code — indent it.  Fall-through
+        #       (often just bra-to-merge plumbing) stays at outer depth.
+        #
+        #   (b) Branched-to IS the merge (target_succ == merge). This is the
+        #       bf-no-else / skip-the-body pattern: the conditional jumps OVER
+        #       the if-body. The fall-through path IS the if-body — indent it.
+        #
+        # Same C-correct semantics with different ASM expression depending on
+        # which condition polarity the compiler chose.
+        if target_succ == merge:
+            body = reach_fall - {merge}
+        else:
+            body = reach_target - {merge}
+        body = {bid for bid in body if blk["id"] < bid < merge}
+        if not body:
+            continue
+        regions.append({"kind": "if", "header": blk["id"],
+                        "body": body, "exit": merge})
+
+    # Drop "if" regions whose body is empty (degenerate — no real nesting)
+    regions = [r for r in regions if r["body"]]
+
+    # ----- 5. Build region tree by containment; depth = chain length.
+    # A region R1 is "inside" R2 if R1.body ⊆ R2.body and R1.header in R2.body.
+    # Sibling case: if both regions share the same exit (merge point), they
+    # are NOT nested — they're parallel arms of a dispatch.  This is the
+    # difference between a switch (many bts to common end) and a nested
+    # if/else (each branch with its own merge).
+    def region_contains(outer, inner):
+        if outer is inner:
+            return False
+        if inner["header"] not in outer["body"]:
+            return False
+        if not inner["body"].issubset(outer["body"]):
+            return False
+        if (outer.get("exit") is not None
+                and outer.get("exit") == inner.get("exit")
+                and outer["kind"] == "if" and inner["kind"] == "if"):
+            return False
+        return True
+
+    # depth of each region = 1 + max depth of any container.
+    # Process OUTERMOST first so parent depths are known when children compute.
+    region_depth = [0] * len(regions)
+    order = sorted(range(len(regions)), key=lambda i: -len(regions[i]["body"]))
+    for i in order:
+        parent_depth = 0
+        for j in range(len(regions)):
+            if j == i:
+                continue
+            if region_contains(regions[j], regions[i]):
+                if region_depth[j] > parent_depth:
+                    parent_depth = region_depth[j]
+        region_depth[i] = parent_depth + 1
+
+    # ----- 6. Assign per-address depth = depth of innermost containing region
     addr_depths = {}
-    depth = 0
-    addr = ev.start
-    while addr <= ev.end:
-        # Apply events at this address — pop before push (so a label that's
-        # both a merge and a cond-target — rare — ends at the same depth as
-        # its predecessor instead of net-incrementing).
-        if addr in uncond_targets and depth > 0:
-            depth -= 1
-        if addr in cond_targets:
-            depth += 1
-        if depth > 0:
-            addr_depths[addr] = depth
+    addr = fn_start
+    while addr <= fn_end:
+        bid = addr_to_block.get(addr)
+        if bid is None:
+            addr += 2
+            continue
+        best_depth = 0
+        for ri, r in enumerate(regions):
+            if bid in r["body"]:
+                if region_depth[ri] > best_depth:
+                    best_depth = region_depth[ri]
+        if best_depth > 0:
+            addr_depths[addr] = best_depth
         addr += 2
 
     return addr_depths
@@ -343,6 +598,16 @@ def _emit_function_lines(lines, ev, section):
         if addr in ev.conditional_rts:
             line["classes"].append("cond-rts")
 
+        # Unreachable from function entry — mark visually so the eye stops
+        # parsing as flow.  Pool/data addresses are handled above (continue);
+        # what's left here is genuine dead-or-data that decode_sh2 happened
+        # to spell as a valid mnemonic.
+        if addr not in ev.reachable:
+            line["classes"].append("unreachable")
+            line["indent"] = 0
+            if not line.get("tag"):
+                line["tag"] = "unreach"
+
         cat = _classify_mnem(mnem)
         if cat:
             line["classes"].append(cat)
@@ -408,8 +673,14 @@ def _emit_function_lines(lines, ev, section):
 
 
 def _emit_raw_bytes(lines, start, end, section):
+    """Emit raw bytes for intermediate/trailing sections.
+
+    Uses pool_priors to render known pool addresses as `.4byte`/`.2byte` data
+    with `.L_pool_*` labels, instead of bogus instruction decodings.
+    """
     binary = STATE["binary_cache"]
     vram = STATE["vram_cache"]
+    priors = STATE.get("pool_priors", {})
     binary_end = vram + len(binary) - 1
     end = min(end, binary_end)
     addr = start
@@ -417,6 +688,39 @@ def _emit_raw_bytes(lines, start, end, section):
         off = addr - vram
         if off + 1 >= len(binary):
             break
+
+        # Prior pool entry — emit as pool data
+        size = priors.get(addr)
+        if size == 4 and addr + 3 <= end and off + 3 < len(binary):
+            value = (binary[off] << 24) | (binary[off+1] << 16) | (binary[off+2] << 8) | binary[off+3]
+            lines.append({
+                "addr": addr,
+                "addr_str": f"{addr:08X}",
+                "kind": "pool",
+                "label": f".L_pool_{addr:08X}",
+                "bytes": " ".join(f"{binary[off+i]:02X}" for i in range(4)),
+                "mnem": f".4byte 0x{value:08X}",
+                "classes": [f"section-{section}", "pool"],
+                "margin": "",
+            })
+            addr += 4
+            continue
+        if size == 2 and addr + 1 <= end and off + 1 < len(binary):
+            value = (binary[off] << 8) | binary[off+1]
+            lines.append({
+                "addr": addr,
+                "addr_str": f"{addr:08X}",
+                "kind": "pool",
+                "label": f".L_pool_{addr:08X}",
+                "bytes": " ".join(f"{binary[off+i]:02X}" for i in range(2)),
+                "mnem": f".2byte 0x{value:04X}",
+                "classes": [f"section-{section}", "pool"],
+                "margin": "",
+            })
+            addr += 2
+            continue
+
+        # Otherwise decode as instruction (best-effort)
         op = (binary[off] << 8) | binary[off+1]
         mnem, _ = decode_sh2(op, addr)
         if mnem is None:
@@ -446,6 +750,12 @@ def render_listing(ev, prev_subseg):
 
     if prev_subseg:
         prev_ev = analyze_candidate(binary, vram, prev_subseg["start"], hint_end=prev_subseg["end"])
+        # Honor yaml's `end` — that's what the splitter uses to emit race.s.
+        # Oracle's CFG-walk may stop earlier (e.g., at a jmp's delay slot,
+        # before unreachable bytes the compiler emitted as a dead epilogue).
+        # The eval tool's display should reflect what race.s shows, not what
+        # oracle's heuristic thinks is "reachable code only."
+        prev_ev.end = prev_subseg["end"]
         size = prev_subseg["end"] - prev_subseg["start"] + 1
         _emit_section_header(
             lines, "prev",
@@ -495,16 +805,18 @@ def _compute_current():
     binary = STATE["binary_cache"]
     cfg = STATE["cfg_cache"]
 
+    pool_priors = STATE.get("pool_priors") or {}
+
     override = session.get("ai_override")
     if override:
         prev = override.get("previous_subseg")
         start = int(override["candidate_start"], 16) if isinstance(override["candidate_start"], str) else override["candidate_start"]
         tu = next((t for t in cfg.get("tus", []) if t["start"] <= start <= t["end"]), None)
         hint_end = tu["end"] if tu else None
-        ev = analyze_candidate(binary, STATE["vram_cache"], start, hint_end)
+        ev = analyze_candidate(binary, STATE["vram_cache"], start, hint_end, pool_priors=pool_priors)
         return prev, ev
 
-    return find_next_forward_sweep_candidate(cfg, binary)
+    return find_next_forward_sweep_candidate(cfg, binary, pool_priors=pool_priors)
 
 
 def _reload_caches():
@@ -512,6 +824,334 @@ def _reload_caches():
     STATE["cfg_cache"] = cfg
     STATE["binary_cache"] = load_binary(cfg)
     STATE["vram_cache"] = int(cfg["options"]["vram"])
+    # Invalidate sibling-pool cache when yaml changes
+    STATE["sibling_pool_cache"] = {}
+    STATE["pool_priors"] = _load_pool_priors()
+    # Archive starts / static callers / runtime hits are static-ish — load
+    # once and stash. (Runtime hits could be refreshed after a new BP probe;
+    # for now, restart the server to pick up new data.)
+    if "archive_starts" not in STATE:
+        STATE["archive_starts"] = _load_archive_starts()
+    if "static_callers" not in STATE:
+        STATE["static_callers"] = _load_static_callers()
+    if "runtime_hits" not in STATE:
+        STATE["runtime_hits"] = _load_runtime_hits()
+
+
+def _load_archive_starts():
+    """Load archive's view of function start addresses.
+
+    Scans archive_src/src/<module>/*.s for `FUN_<addr>:` labels.  Module
+    is derived from the yaml stem (e.g. race.bin.yaml → race).  These are
+    the addresses the archive thought function bodies began at — usable as
+    an independent confidence check on our own boundaries.
+
+    Returns a SORTED list of int addresses, or [] if the archive dir is
+    missing.
+    """
+    yaml_path = STATE.get("yaml_path")
+    project_root = STATE.get("project_root")
+    if yaml_path is None or project_root is None:
+        return []
+    module = yaml_path.stem.split(".")[0]  # race.bin → race
+    archive_dir = project_root / "archive_src" / "src" / module
+    if not archive_dir.is_dir():
+        return []
+    import re
+    starts = set()
+    fun_re = re.compile(r"^FUN_([0-9A-Fa-f]{8}):\s*$")
+    for s_file in archive_dir.glob("*.s"):
+        for raw in s_file.read_text().splitlines():
+            m = fun_re.match(raw.strip())
+            if m:
+                starts.add(int(m.group(1), 16))
+    return sorted(starts)
+
+
+def _load_static_callers():
+    """Scan archive .s files for static call references to function addresses.
+
+    Counts these as a "call site":
+      - bsr / bsr.s / jsr / jmp / bra / braf / bsrf  to  FUN_<addr>  or  xref_FUN_<addr>
+      - .4byte FUN_<addr> / DAT_<addr> / xref_FUN_<addr>  (function pointer
+        in a pool, intended to be loaded then called via jsr @rN)
+
+    Excludes:
+      - `FUN_<addr> + 0xN` (these point INTO the body, not at the entry)
+      - Comment-only mentions
+
+    Returns {addr: count}.
+    """
+    project_root = STATE.get("project_root")
+    if project_root is None:
+        return {}
+    archive_dir = project_root / "archive_src"
+    if not archive_dir.is_dir():
+        return {}
+    import re
+    callers = {}
+
+    # Direct branches.  "FUN_xxxxxxxx + 0xN" is excluded because the `+`
+    # ends the match before the offset is consumed, but we also explicitly
+    # check the trailing context to be safe.
+    branch_re = re.compile(
+        r"\b(?:bsr|bsr\.s|jsr|jmp|bra|braf|bsrf)\b[^/]*?"
+        r"\b(?:xref_)?FUN_([0-9A-Fa-f]{8})\b(?!\s*\+)"
+    )
+    pool_re = re.compile(
+        r"\.4byte\s+(?:xref_FUN_|FUN_|DAT_)([0-9A-Fa-f]{8})\b(?!\s*\+)"
+    )
+
+    for s_file in archive_dir.glob("**/*.s"):
+        try:
+            text = s_file.read_text(errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            for m in branch_re.finditer(line):
+                addr = int(m.group(1), 16)
+                callers[addr] = callers.get(addr, 0) + 1
+            for m in pool_re.finditer(line):
+                addr = int(m.group(1), 16)
+                callers[addr] = callers.get(addr, 0) + 1
+    return callers
+
+
+def _load_runtime_hits():
+    """Aggregate BP-pass hit counts across probe summaries.
+
+    Looks in build/probes/*.summary.json and build/mcp_ipc/*.summary.json
+    and takes the MAX hit count per address across all summaries.
+
+    Why max (not sum):
+      - Probes typically overwrite the same `breakpoint_hits.txt` file, so
+        summing across summaries that "point to the same file" still ends
+        up summing across distinct probe runs.
+      - Summing is double-prone when summaries are re-snapshots of the same
+        probe (we saw 2x duplication with sweep_rolling_start +
+        sweep_post_rolling_start).
+      - Max is robust: it's the highest count we've observed for this
+        address across any probe.  Never overcounts; may understate if a
+        probe was strictly partial, but that's the safer side to err on.
+
+    Returns {addr: max_hits}.
+    """
+    project_root = STATE.get("project_root")
+    if project_root is None:
+        return {}
+    hits = {}
+    for sub in ("build/probes", "build/mcp_ipc"):
+        d = project_root / sub
+        if not d.is_dir():
+            continue
+        for f in d.glob("*.summary.json"):
+            try:
+                with open(f) as fp:
+                    s = json.load(fp)
+            except Exception:
+                continue
+            ba = s.get("by_address") or {}
+            for hex_addr, count in ba.items():
+                try:
+                    addr = int(hex_addr, 16)
+                    c = int(count)
+                    if c > hits.get(addr, 0):
+                        hits[addr] = c
+                except (ValueError, TypeError):
+                    pass
+    return hits
+
+
+def _compute_candidate_evidence(start, end):
+    """Static + runtime evidence for the candidate, plus midpoint warnings.
+
+    A "midpoint" is an archive FUN_<X> start that falls STRICTLY INSIDE
+    (start, end] — i.e., archive thinks there's a function start within our
+    proposed body.  For each, report its own evidence so the human can judge
+    whether to honor archive's split (real entry point) or override it
+    (Ghidra hallucination).
+    """
+    sc = STATE.get("static_callers") or {}
+    rh = STATE.get("runtime_hits") or {}
+    archive_starts = STATE.get("archive_starts") or []
+
+    midpoints = []
+    for a in archive_starts:
+        if start < a <= end:
+            midpoints.append({
+                "addr": a,
+                "addr_hex": f"{a:08X}",
+                "static_callers": sc.get(a, 0),
+                "runtime_hits": rh.get(a, 0),
+            })
+
+    return {
+        "static_callers": sc.get(start, 0),
+        "runtime_hits": rh.get(start, 0),
+        "midpoints": midpoints,
+    }
+
+
+def _compute_archive_agreement(start, end):
+    """Compare our (start, end) candidate against the archive's view.
+
+    Returns dict:
+      - verdict: "agrees" | "disagrees" | "silent"
+      - start_match: bool                  — archive has FUN_<start>?
+      - archive_next: int|None             — archive's next FUN start > our start
+      - archive_implied_end: int|None      — archive_next - 1 (its view of end)
+      - end_delta: int|None                — our_end - archive_implied_end
+                                              (positive = we're longer than archive)
+      - tooltip: str                       — human-readable summary
+    """
+    archive_starts = STATE.get("archive_starts") or []
+    start_match = start in archive_starts
+
+    archive_next = None
+    for a in archive_starts:
+        if a > start:
+            archive_next = a
+            break
+
+    archive_implied_end = (archive_next - 1) if archive_next is not None else None
+    end_delta = (end - archive_implied_end) if archive_implied_end is not None else None
+
+    # Tolerance: archive boundaries include pool/padding between functions, so
+    # exact end-byte agreement is rare.  Within 16 bytes counts as "agrees".
+    TOL = 16
+
+    if not start_match:
+        verdict = "silent"
+        tooltip = f"archive has no FUN_{start:08X}"
+    elif end_delta is None:
+        verdict = "agrees"
+        tooltip = f"archive start matches; no archive successor (last fn)"
+    elif abs(end_delta) <= TOL:
+        verdict = "agrees"
+        tooltip = (
+            f"archive FUN_{start:08X} → next FUN_{archive_next:08X}; "
+            f"our end {end_delta:+d} bytes vs archive implied end "
+            f"0x{archive_implied_end:08X}"
+        )
+    else:
+        verdict = "disagrees"
+        if end_delta > 0:
+            tooltip = (
+                f"archive thinks function is shorter by {end_delta} bytes "
+                f"(archive next FUN_{archive_next:08X} → implied end "
+                f"0x{archive_implied_end:08X})"
+            )
+        else:
+            tooltip = (
+                f"archive thinks function is longer by {-end_delta} bytes "
+                f"(archive next FUN_{archive_next:08X} → implied end "
+                f"0x{archive_implied_end:08X})"
+            )
+
+    return {
+        "verdict": verdict,
+        "start_match": start_match,
+        "archive_next": archive_next,
+        "archive_implied_end": archive_implied_end,
+        "end_delta": end_delta,
+        "tooltip": tooltip,
+    }
+
+
+def _compute_progress():
+    """Sum verified code subseg bytes vs total binary size.
+
+    Returns dict with verified_bytes, total_bytes, pct (float 0-100).
+    """
+    cfg = STATE["cfg_cache"]
+    binary = STATE["binary_cache"]
+    verified = 0
+    for s in cfg.get("subsegments", []):
+        if s.get("type") == "code":
+            verified += s["end"] - s["start"] + 1
+    total = len(binary)
+    pct = (verified / total * 100.0) if total else 0.0
+    return {"verified_bytes": verified, "total_bytes": total, "pct": pct}
+
+
+def _load_pool_priors():
+    """Load pool address priors from <yaml_stem>.pool_priors.txt if present.
+
+    Returns dict {addr: size_in_bytes} where size is 4 (mov.l) or 2 (mov.w).
+    These are pool addresses identified by the archive — used to augment our
+    own pool detection, so pools referenced from not-yet-verified functions
+    still render as proper pool data instead of bogus decoded instructions.
+    """
+    yaml_path = STATE.get("yaml_path")
+    if yaml_path is None:
+        return {}
+    priors_path = yaml_path.parent / (yaml_path.stem + ".pool_priors.txt")
+    if not priors_path.exists():
+        return {}
+    priors = {}
+    for line in priors_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                priors[int(parts[0], 16)] = int(parts[1])
+            except ValueError:
+                pass
+    return priors
+
+
+def _sibling_pool_targets(candidate_start, candidate_end):
+    """For all verified code subsegs (excluding the candidate itself), find
+    PC-relative load targets that land INSIDE [candidate_start, candidate_end].
+
+    This catches pool entries that physically live in the candidate's address
+    range but are referenced from sibling functions in the same TU — a common
+    Saturn-era compiler/linker pattern where pool constants cluster between
+    functions and any sibling can reference any pool there.
+
+    Returns (pool4, pool2, mova) sets of addresses.
+    Results cached at module level; invalidated when yaml is reloaded.
+    """
+    cfg = STATE["cfg_cache"]
+    binary = STATE["binary_cache"]
+    vram = STATE["vram_cache"]
+
+    p4, p2, pm = set(), set(), set()
+    cache = STATE.setdefault("sibling_pool_cache", {})
+
+    for sub in cfg.get("subsegments", []):
+        if sub.get("type") != "code":
+            continue
+        if sub["start"] == candidate_start:
+            continue  # skip the candidate itself
+
+        key = sub["start"]
+        if key not in cache:
+            # Compute reachable set for this sibling (expensive, do once)
+            sib_ev = analyze_candidate(binary, vram, sub["start"], hint_end=sub["end"])
+            cache[key] = sib_ev.reachable
+
+        sib_reachable = cache[key]
+        for addr in sib_reachable:
+            off = addr - vram
+            if off + 1 >= len(binary):
+                continue
+            op = (binary[off] << 8) | binary[off + 1]
+            mnem, tgt = decode_sh2(op, addr)
+            if tgt is None or mnem is None:
+                continue
+            if not (candidate_start <= tgt <= candidate_end):
+                continue
+            if mnem.startswith("mov.l @(0x"):
+                p4.add(tgt)
+            elif mnem.startswith("mov.w @(0x"):
+                p2.add(tgt)
+            elif mnem.startswith("mova @(0x"):
+                pm.add(tgt)
+
+    return p4, p2, pm
 
 
 # ---------------------------------------------------------------------------
@@ -531,15 +1171,29 @@ def state():
         session = load_session()
         nxt = _compute_current()
 
+        progress = _compute_progress()
+        history = session.get("history", [])
+
         if nxt is None:
             return jsonify({
                 "all_caught_up": True,
-                "history_count": len(session.get("history", [])),
-                "awaiting_ai": False,
+                "history_count": len(history),
+                "progress": progress,
             })
 
         prev, ev = nxt
         lines = render_listing(ev, prev)
+        archive = _compute_archive_agreement(ev.start, ev.end)
+        evidence = _compute_candidate_evidence(ev.start, ev.end)
+
+        # If the latest history entry is for THIS candidate and not yet
+        # approved, the count is how many feedback messages have stacked up.
+        pending_msgs = []
+        if history:
+            last = history[-1]
+            if (last.get("candidate_start") == ev.start
+                    and last.get("verdict") != "approved"):
+                pending_msgs = last.get("feedback") or []
 
         return jsonify({
             "all_caught_up": False,
@@ -552,14 +1206,16 @@ def state():
                 "verdict": ev.verdict,
                 "yellow_flags": ev.yellow_flags,
                 "name": f"FUN_{ev.start:08X}",
+                "archive": archive,
+                "evidence": evidence,
             },
             "previous": {
                 "start_hex": f"{prev['start']:08X}",
                 "name": f"FUN_{prev['start']:08X}",
             } if prev else None,
-            "awaiting_ai": session.get("awaiting_ai", False),
-            "pending_verdict": session.get("pending_verdict"),
-            "history_count": len(session.get("history", [])),
+            "pending_messages": pending_msgs,
+            "history_count": len(history),
+            "progress": progress,
             "lines": lines,
         })
 
@@ -580,35 +1236,44 @@ def verdict():
             return jsonify({"ok": False, "error": "no candidate"}), 400
         prev, ev = nxt
 
-        record = {
-            "verdict": v,
-            "candidate_start_hex": f"{ev.start:08X}",
-            "candidate_start": ev.start,
-            "candidate_end": ev.end,
-            "feedback": feedback,
-            "ts": time.time(),
-        }
-
         session = load_session()
-        # Always clear ai_override since this verdict is for the currently-shown candidate.
         session["ai_override"] = None
 
+        # One record PER CANDIDATE.  Each reject/unsure click appends to the
+        # record's `feedback` list.  An approve closes out the record by
+        # setting verdict="approved".  Misclicks are recoverable — just click
+        # the right button next; the verdict field gets overwritten.
+        history = session.setdefault("history", [])
+        last = history[-1] if history else None
+        same_candidate = (
+            last is not None
+            and last.get("candidate_start") == ev.start
+            and last.get("verdict") != "approved"
+        )
+
+        if same_candidate:
+            last["verdict"] = v
+            last["candidate_end"] = ev.end
+            last["ts"] = time.time()
+            if feedback:
+                last.setdefault("feedback", []).append(feedback)
+        else:
+            history.append({
+                "verdict": v,
+                "candidate_start_hex": f"{ev.start:08X}",
+                "candidate_start": ev.start,
+                "candidate_end": ev.end,
+                "feedback": [feedback] if feedback else [],
+                "ts": time.time(),
+            })
+
         if v == "approved":
-            # Find TU for the "file:" field
             tu = next((t for t in STATE["cfg_cache"]["tus"] if t["start"] <= ev.start <= t["end"]), None)
             file_name = tu["name"] if tu else f"tu_{ev.start:08X}"
             _append_subseg_to_yaml(ev.start, ev.end, file_name)
-            session["history"].append(record)
-            session["pending_verdict"] = None
-            session["awaiting_ai"] = False
-            save_session(session)
-            return jsonify({"ok": True, "auto_advanced": True})
 
-        # Reject or Unsure: pause and wait for AI handling.
-        session["pending_verdict"] = record
-        session["awaiting_ai"] = True
         save_session(session)
-        return jsonify({"ok": True, "awaiting_ai": True})
+        return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------------
