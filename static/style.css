@@ -1,0 +1,299 @@
+/* eval_server styles — dark theme, dense monospace listing, forward-sweep loop */
+
+body {
+  font-family: ui-monospace, "Cascadia Mono", Menlo, monospace;
+  font-size: 13px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+  margin: 0;
+  padding: 0;
+}
+
+header#header {
+  padding: 0.4em 1em;
+  background: #252526;
+  border-bottom: 1px solid #333;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 1em;
+}
+header#header > #header-content {
+  display: flex; align-items: center; gap: 1em; flex-wrap: wrap;
+}
+.fn-name { color: #ffd86b; font-weight: bold; font-size: 14px; }
+.addr { color: #888; }
+.size { color: #888; }
+.prev { color: #888; font-size: 11px; }
+.flags .flag {
+  background: #4a3f2a;
+  color: #fc9;
+  padding: 0.1em 0.5em;
+  margin-left: 0.4em;
+  border-radius: 0.2em;
+  font-size: 11px;
+}
+.caught-up { color: #9d9; font-weight: bold; }
+
+.verdict-tag {
+  padding: 0.1em 0.5em;
+  border-radius: 0.2em;
+  font-weight: bold;
+  font-size: 11px;
+}
+.verdict-HIGH    { background: #2a4a2a; color: #9d9; }
+.verdict-MEDIUM  { background: #4a432a; color: #dc9; }
+.verdict-LOW     { background: #4a2a2a; color: #d99; }
+.verdict-UNKNOWN { background: #333; color: #999; }
+
+/* Awaiting AI banner */
+.awaiting-banner {
+  background: #4a3a1f;
+  color: #fc9;
+  padding: 0.6em 1em;
+  border-bottom: 1px solid #6a5a3f;
+  display: flex; gap: 0.6em; align-items: center;
+}
+.awaiting-banner.hidden { display: none; }
+
+/* Listing — wrapped in a container so the SVG arc overlay can sit on top of
+   the left edge of the listing (overlapping the address column).  This is
+   fine because flow is what matters, not unobstructed line numbers. */
+.listing-wrap {
+  position: relative;
+  padding-bottom: 6em;
+}
+.listing {
+  font-family: inherit;
+  line-height: 1.35;
+  padding: 0 1em 0 1em;
+  margin: 0;
+  white-space: pre;
+}
+/* SVG covers the entire listing area; arcs draw over the address column. */
+svg.arcs {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  overflow: visible;
+}
+svg.arcs .arc,
+svg.arcs .arc-dot,
+svg.arcs .arc-head {
+  pointer-events: auto;   /* …but DO catch on the shapes themselves */
+  cursor: pointer;
+}
+
+/* Default: dimmed so the listing stays readable */
+svg.arcs .arc {
+  fill: none;
+  stroke-width: 1.5;
+  stroke-opacity: 0.28;
+  transition: stroke-opacity 0.08s, stroke-width 0.08s;
+}
+svg.arcs .arc-dot,
+svg.arcs .arc-head {
+  fill-opacity: 0.28;
+  transition: fill-opacity 0.08s;
+}
+
+/* Hover / sticky bring an arc to full brightness */
+svg.arcs .arc.hovered,
+svg.arcs .arc.sticky {
+  stroke-opacity: 1;
+  stroke-width: 2.5;
+}
+svg.arcs .arc-dot.hovered,
+svg.arcs .arc-dot.sticky,
+svg.arcs .arc-head.hovered,
+svg.arcs .arc-head.sticky {
+  fill-opacity: 1;
+}
+
+/* Color by type */
+svg.arcs .arc.arc-cond     { stroke: #6cf; }
+svg.arcs .arc.arc-uncond   { stroke: #d9c; }
+svg.arcs .arc-dot.arc-cond     { fill: #6cf; }
+svg.arcs .arc-dot.arc-uncond   { fill: #d9c; }
+svg.arcs .arc-head.arc-cond    { fill: #6cf; }
+svg.arcs .arc-head.arc-uncond  { fill: #d9c; }
+
+/* Backward branches: dashed */
+svg.arcs .arc.arc-backward { stroke-dasharray: 4 3; }
+
+/* Sticky gets a slight glow */
+svg.arcs .arc.sticky {
+  filter: drop-shadow(0 0 4px currentColor);
+}
+
+.line { display: block; padding-left: 0.2em; }
+.line .margin { display: inline-block; width: 1.2em; color: #d9c; text-align: center; }
+.line .indent {
+  display: inline-block;
+  height: 1em;
+  border-left: 1px solid rgba(150, 200, 255, 0.18);
+  margin-right: 0.4em;
+  vertical-align: middle;
+}
+.line .a { color: #555; margin-right: 1em; }
+.line .b { color: #8a8; margin-right: 1em; }
+.line .m { color: #ddd; }
+.line .lbl { color: #9cf; }
+
+/* Section headers — distinct banner per section */
+.line.section-prev-header,
+.line.section-intermediate-header,
+.line.section-current-header,
+.line.section-trailing-header {
+  display: block;
+  text-align: left;
+  padding: 0.6em 0.6em;
+  margin: 0.8em 0 0.2em 0;
+  font-weight: bold;
+  border-radius: 0.2em;
+}
+.line.section-prev-header        { background: rgba(80, 120, 80, 0.20); color: #cfd; border-left: 4px solid #6a6; }
+.line.section-intermediate-header { background: rgba(80, 80, 80, 0.20);  color: #aaa; border-left: 4px solid #777; }
+.line.section-current-header     { background: rgba(60, 100, 180, 0.25); color: #cdf; border-left: 4px solid #69c; font-size: 14px; }
+.line.section-trailing-header    { background: rgba(80, 80, 80, 0.20);  color: #aaa; border-left: 4px solid #777; }
+
+/* Section content dimming */
+.line.section-prev,
+.line.section-prev .a,
+.line.section-prev .b,
+.line.section-prev .m,
+.line.section-prev .lbl     { opacity: 0.65; }
+.line.section-intermediate  { opacity: 0.45; }
+.line.section-trailing      { opacity: 0.55; }
+
+/* Section "current" is fully bright — default opacity */
+
+/* prologue/epilogue tinting (only meaningful in current section visually) */
+.line.prologue   { background: rgba(60, 100, 60, 0.10); }
+.line.epilogue   { background: rgba(120, 100, 40, 0.10); }
+
+/* Category highlighting.
+   Loud-red ("PC control permanently lost from this function") is reserved for:
+     - cat-return (rts/rte)
+     - uncond-indirect (jmp @rN / braf rN — assume external)
+     - tail-call (bra/jmp to outside the proposed function)
+     - final-rts
+   Internal bra/cond branches stay visible but NOT red — they're structural
+   control flow within the function (if/else closers, loops, etc.).
+*/
+.line.cat-return,
+.line.uncond-indirect {
+  background: rgba(200, 60, 60, 0.30);
+}
+.line.cat-return .m,
+.line.uncond-indirect .m {
+  color: #fdd;
+  font-weight: bold;
+}
+
+/* Internal unconditional jumps (bra .L_X where target is inside fn).
+   Visible but quiet — they're skipping over the else-branch, not exiting. */
+.line.cat-uncond .m {
+  color: #d9c;
+  font-weight: bold;
+}
+
+/* Tail-call: same red, but extra-loud warning border + brighter tag */
+.line.tail-call {
+  background: rgba(200, 60, 60, 0.40);
+  border-left: 3px solid #f55;
+  padding-left: calc(0.2em - 3px);
+}
+.line.tail-call .m {
+  color: #fdd;
+  font-weight: bold;
+}
+
+/* Conditional branches — visible but not "PC lost" loud */
+.line.cat-cond .m     { color: #6cf; font-weight: bold; }
+
+/* Calls — subtle (returns normally) */
+.line.cat-call .m     { color: #fb9; }
+
+/* Other categories */
+.line.cat-pool .m     { color: #99b; }
+.line.cat-compare .m  { color: #dc9; }
+.line.cat-data .m     { color: #777; font-style: italic; }
+
+/* Conditional rts — also a return, but in middle of function */
+.line.cond-rts                  { background: rgba(180, 80, 140, 0.18); }
+.line.cond-rts .m               { color: #fac; font-weight: bold; }
+.line.final-rts                 { background: rgba(200, 60, 60, 0.40); }
+.line.final-rts .m              { color: #fdd; font-weight: bold; }
+
+.line.label .lbl                { color: #9cf; font-weight: bold; }
+.line.pool .m                   { color: #aac; }
+.line.pool .lbl                 { color: #88a; }
+
+/* Inline tags — appear after the mnemonic */
+.line .tag {
+  display: inline-block;
+  margin-left: 0.8em;
+  padding: 0.05em 0.4em;
+  border-radius: 0.2em;
+  font-size: 11px;
+  font-weight: bold;
+  vertical-align: 1px;
+}
+.line.cat-call .tag        { background: #3a3a3a; color: #9c9; }   /* ↩ ret */
+.line.cat-return .tag      { background: #5a2a2a; color: #fdd; }   /* ⇒ EXIT */
+.line.cat-uncond .tag      { background: #5a2a2a; color: #fdd; }   /* ⇒ */
+.line.uncond-indirect .tag { background: #5a2a2a; color: #fdd; }   /* ⇒ exits */
+.line.tail-call .tag       { background: #f55; color: #fff; }      /* ⇒ TAIL? — loudest */
+
+/* Footer — feedback box always visible above the verdict buttons */
+footer#footer {
+  position: fixed;
+  bottom: 0; left: 0; right: 0;
+  background: #252526;
+  border-top: 1px solid #333;
+  padding: 0.5em 1em;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5em;
+  z-index: 10;
+}
+.feedback-row {
+  display: flex;
+}
+.feedback-row textarea {
+  flex: 1;
+  min-height: 2.5em;
+  max-height: 8em;
+  background: #1a1a1a;
+  color: #eee;
+  border: 1px solid #555;
+  padding: 0.3em 0.5em;
+  font-family: inherit;
+  font-size: 13px;
+  resize: vertical;
+}
+.verdict-row {
+  display: flex; gap: 0.6em; align-items: center;
+}
+footer button {
+  background: #3c3c3c;
+  color: #eee;
+  border: 1px solid #555;
+  padding: 0.4em 1em;
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  border-radius: 0.2em;
+}
+footer button:hover { background: #4a4a4a; }
+#btn-approve:hover { border-color: #6c6; }
+#btn-reject:hover  { border-color: #c66; }
+#btn-unsure:hover  { border-color: #cc6; }
+
+.status { color: #888; font-size: 11px; margin-left: auto; }

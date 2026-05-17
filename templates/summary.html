@@ -1,0 +1,48 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>session summary</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <span class="tu-name">Session summary &mdash; {{ total }} candidates</span>
+    <span class="counts">
+      approved: {{ counts.approved }} &nbsp;
+      rejected: {{ counts.rejected }} &nbsp;
+      unsure: {{ counts.unsure }} &nbsp;
+      unset: {{ counts.unset }}
+    </span>
+  </header>
+
+  <table class="summary">
+    <thead>
+      <tr>
+        <th>#</th>
+        <th>TU</th>
+        <th>start &rarr; end</th>
+        <th>oracle</th>
+        <th>decision</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in rows %}
+      <tr class="dec-{{ row.decision }}">
+        <td>{{ row.cid + 1 }}</td>
+        <td>{{ row.tu_name }}</td>
+        <td>0x{{ '%08X' % row.start }} &rarr; 0x{{ '%08X' % row.end }}</td>
+        <td><span class="verdict-tag verdict-{{ row.verdict_text }}">{{ row.verdict_text }}</span></td>
+        <td><span class="decided decided-{{ row.decision }}">{{ row.decision }}</span></td>
+        <td><a href="{{ url_for('candidate', cid=row.cid) }}">view</a></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <footer>
+    <span class="hint">Apply approved to yaml &mdash; run <code>python eval_apply.py &lt;yaml&gt;</code> on the command line.</span>
+  </footer>
+</body>
+</html>

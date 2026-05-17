@@ -1,0 +1,39 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>funcfinder eval</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+  <header id="header">
+    <span id="header-content">loading…</span>
+  </header>
+
+  <div id="awaiting-banner" class="awaiting-banner hidden">
+    <strong>Awaiting AI:</strong>
+    <span>your reject/unsure feedback is recorded — tab to chat and ping the AI to continue.</span>
+  </div>
+
+  <div class="listing-wrap" id="listing-wrap">
+    <pre class="listing" id="listing"></pre>
+    <svg class="arcs" id="arcs"></svg>
+  </div>
+
+  <footer id="footer">
+    <div id="feedback-row" class="feedback-row">
+      <textarea id="feedback-text" placeholder="(Optional) notes / why reject / what's unclear — typed text is attached to your next verdict."></textarea>
+    </div>
+
+    <div class="verdict-row">
+      <button id="btn-approve" data-verdict="approved">1 approve</button>
+      <button id="btn-reject"  data-verdict="rejected">2 reject</button>
+      <button id="btn-unsure"  data-verdict="unsure">3 unsure</button>
+      <span id="status" class="status">history: 0</span>
+    </div>
+  </footer>
+
+  <script src="{{ url_for('static', filename='keys.js') }}"></script>
+</body>
+</html>
