@@ -221,8 +221,12 @@ def _pools_and_branches(ev):
 
     # Reference-derived pool priors (addresses the reference's .s files identified
     # as pool data) — fills in pools referenced from not-yet-verified functions.
+    # Skip addresses oracle's CFG walk reached as code: a reference auto-
+    # disassembler will sometimes wrap a real branch in a `.4byte 0xXXXXXXXX`
+    # literal (e.g. 0x8FF8... bf/s pattern looks data-shaped), but oracle's
+    # in-binary decoding is the ground truth — trust it over the prior.
     for addr, size in STATE.get("pool_priors", {}).items():
-        if ev.start <= addr <= ev.end:
+        if ev.start <= addr <= ev.end and addr not in ev.reachable:
             if size == 4:
                 pool4.add(addr)
             elif size == 2:
