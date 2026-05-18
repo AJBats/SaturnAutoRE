@@ -323,10 +323,16 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
         return None, [], 0, None, None
 
     # Delay slot is conceptually the FIRST step of our backward walk.
-    # If it's a pop (r0-r14, pr, or macl) and matches expected[0], consume
-    # it.  GCC commonly schedules the LAST epilogue pop into the delay
-    # slot of rts — including `lds.l @r15+, macl` for the macl restore
-    # (e.g. tiny math helpers like mini-fn 0x0602C020).
+    # GCC schedules ONE useful instruction into the rts delay slot for
+    # cycle efficiency.  Two patterns matter:
+    #   (a) A pop matching expected[0] (the last epilogue restore).
+    #       e.g. `lds.l @r15+, macl` for macl restore in tiny helpers.
+    #   (b) A stack dealloc `add #+N, r15` that balances the prologue
+    #       alloc.  Saturn compilers very commonly do this for
+    #       functions with no register saves but a small frame
+    #       allocation — the alloc gets dealloc'd in the delay slot
+    #       for free.  Without recognizing this, the alloc/dealloc
+    #       checker would see "alloc N but 0 freed" → phantom flag.
     op_ds = _read_opcode(binary, vram, delay_slot)
     mnem_ds, _ = decode_sh2(op_ds, delay_slot) if op_ds is not None else (None, None)
     ds_pop_reg = None
@@ -334,19 +340,29 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
         ds_pop_reg = (_pop_register(mnem_ds)
                       or ("pr" if _is_pr_pop(mnem_ds) else None)
                       or ("macl" if _is_macl_pop(mnem_ds) else None))
+    ds_dealloc = _is_stack_dealloc(mnem_ds) if mnem_ds else None
     delay_slot_consumed = False
+    matched_stack = 0
+    matched_stack_addr = None
     if ds_pop_reg and expected and ds_pop_reg == expected[0]:
         delay_slot_consumed = True
         expected_idx = 1
+    elif ds_dealloc is not None:
+        # Delay-slot stack dealloc — capture as the function's dealloc.
+        # Don't set delay_slot_consumed (that flag means "we captured a
+        # POP from the delay slot to append to `restored`") and don't
+        # advance expected_idx (the dealloc isn't a register restore).
+        matched_stack = ds_dealloc
+        matched_stack_addr = delay_slot
+        expected_idx = 0
     else:
-        # Either not a pop, or doesn't match expected[0] — leave it out
-        # so the match check downstream doesn't get a phantom mismatch.
+        # Either not a pop/dealloc, or doesn't match expected[0] — leave
+        # it out so the match check downstream doesn't get a phantom
+        # mismatch.
         expected_idx = 0
 
     MAX_INTERLEAVE = 6
     matches = []                      # pops captured in walk order
-    matched_stack = 0
-    matched_stack_addr = None
     epilogue_start = rts_addr
     addr = rts_addr - 2
     lower_bound = func_start if func_start is not None else 0
