@@ -365,6 +365,19 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
         if head in _EPI_HARD_STOPS:
             break
 
+        # Hard stop on a stack PUSH (mov.l rN, @-r15 / sts.l pr/macl,
+        # @-r15).  Pushes are unambiguously body code — they decrement
+        # r15 to save a value mid-function (commonly to free up an arg
+        # register before a jsr).  An epilogue never pushes.  Stopping
+        # here prevents the walker from sliding past the body boundary
+        # and picking up mid-body deallocs as if they were epilogue
+        # deallocs (the false-alarm case that fires the
+        # stack-alloc/dealloc-mismatch flag).
+        if (_push_register(mnem) is not None
+                or mnem == "sts.l pr, @-r15"
+                or mnem == "sts.l macl, @-r15"):
+            break
+
         # Pop / pr-pop / macl-pop: must match expected sequence.
         reg = _pop_register(mnem)
         is_pr = _is_pr_pop(mnem)
@@ -382,6 +395,16 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
                 # Pop without a matching slot in `saved` → body code, stop.
                 break
         elif dealloc is not None:
+            # Capture only the FIRST dealloc encountered walking backward
+            # (= LAST in forward execution = the epilogue's own dealloc,
+            # which sits immediately before the pops).  Any subsequent
+            # dealloc found walking backward is body code (e.g. a bulk
+            # `add #+0xC, r15` that cleans up mid-life pushes used as
+            # scratch around an internal jsr).  Without this guard the
+            # walker overwrites matched_stack with the body dealloc and
+            # the verdict fires a phantom alloc/dealloc mismatch.
+            if matched_stack_addr is not None:
+                break
             matched_stack = dealloc
             matched_stack_addr = addr
             epilogue_start = addr
@@ -716,6 +739,35 @@ def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
     )
     epilogue_range = (epi_start, code_end) if epi_start is not None else (None, None)
 
+    # Augment `restored` with PR / MACL pops anywhere in the function's
+    # reachable set.  GCC will cycle-schedule the restore early (with
+    # several unrelated instructions between it and the rts/jmp), placing
+    # it OUTSIDE the contiguous-epilogue window the backward walker
+    # tracks.  Without this scan the critical-pr/macl-not-restored flag
+    # fires on otherwise-fine cycle-optimized functions (e.g. early
+    # `lds.l @r15+, macl` followed by shll2 / shll / add then a tail-
+    # call jmp).  pr and macl have unambiguous restore instructions
+    # (only one register targeted), so existence anywhere in the
+    # function's CFG is a trustworthy signal.
+    if "pr" in saved and "pr" not in restored:
+        for a in reachable:
+            op = _read_opcode(binary, vram, a)
+            if op is None:
+                continue
+            mnem, _ = decode_sh2(op, a)
+            if mnem and _is_pr_pop(mnem):
+                restored.append("pr")
+                break
+    if "macl" in saved and "macl" not in restored:
+        for a in reachable:
+            op = _read_opcode(binary, vram, a)
+            if op is None:
+                continue
+            mnem, _ = decode_sh2(op, a)
+            if mnem and _is_macl_pop(mnem):
+                restored.append("macl")
+                break
+
     # Now extend the boundary through any trailing pool zone (no-op if
     # pool_priors not provided).
     end = _extend_through_trailing_pools(code_end, binary, vram, hard_limit, pool_priors)
@@ -783,7 +835,14 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
     else:
         score += 1
 
-    if stack_alloc != stack_dealloc:
+    # Only flag mismatch when the prologue ACTUALLY allocated stack
+    # (stack_alloc > 0).  If prologue_stack is 0, any dealloc the walker
+    # captured is almost certainly a mid-body cleanup `add #+N, r15`
+    # immediately following the pops backward (e.g. cleaning up a
+    # `mov.l rX, @-r15` argument push that preceded a jsr).  Compilers
+    # don't dealloc what they didn't alloc, so dealloc-without-alloc is
+    # never a real bug — it's a walker false positive.
+    if stack_alloc > 0 and stack_alloc != stack_dealloc:
         flags.append(f"stack alloc/dealloc mismatch: {stack_alloc} vs {stack_dealloc}")
     else:
         score += 1
