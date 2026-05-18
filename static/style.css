@@ -263,6 +263,28 @@ header#header > #header-content {
 .line.midpoint {
   background: rgba(140, 80, 255, 0.05);
 }
+
+/* Reference end-of-function marker — single row at the address where
+   reference would have started its NEXT function (= where reference
+   would have ended ours).  Uses the same red palette as the
+   `reference: disagrees` banner pill so the two cues are obviously
+   related: the banner says "reference disagrees", and this row shows
+   exactly where the disagreement boundary lies. */
+.line.ref-end .a {
+  outline: 1.5px solid #d99;
+  border-radius: 0.15em;
+  padding: 0 0.15em;
+}
+.line.ref-end .ref-end-tail {
+  color: #e8a;
+  font-weight: bold;
+}
+.line.ref-end {
+  background: rgba(200, 80, 80, 0.06);
+}
+.tag.tag-ref-end {
+  color: #e8a;
+}
 .listing-pane .listing {
   /* prevent overflow from leaking out — each pane scrolls independently */
 }

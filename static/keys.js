@@ -219,7 +219,12 @@ function alignLines(leftLines, rightLines) {
 // highlight so the human can spot at a glance where reference would
 // have split the function.  AI attn takes priority when both fire on
 // the same row.
-function renderListing(lines, target, isPrimary, attnSet, midpointSet) {
+// `refEndSet` is a Set of addresses where reference would have ENDED
+// the function (in practice we store reference's NEXT-function start,
+// which is row-aligned).  Red highlight + "ref: next FUN" tag — same
+// red palette as the `reference: disagrees` banner pill so the two
+// cues are visually linked.
+function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet) {
   if (!lines || !lines.length) {
     target.textContent = '';
     if (isPrimary) CURRENT_BRANCHES = [];
@@ -232,11 +237,13 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet) {
       // no visible content (color is transparent via CSS).
       return `<span class="line blank">&nbsp;</span>`;
     }
-    const isAttn = !!(attnSet && line.addr != null && attnSet.has(line.addr));
-    const isMid  = !isAttn && !!(midpointSet && line.addr != null && midpointSet.has(line.addr));
+    const isAttn   = !!(attnSet && line.addr != null && attnSet.has(line.addr));
+    const isMid    = !isAttn && !!(midpointSet && line.addr != null && midpointSet.has(line.addr));
+    const isRefEnd = !isAttn && !isMid && !!(refEndSet && line.addr != null && refEndSet.has(line.addr));
     let cls = (line.classes || []).join(' ');
-    if (isAttn) cls += ' attn';
-    if (isMid)  cls += ' midpoint';
+    if (isAttn)   cls += ' attn';
+    if (isMid)    cls += ' midpoint';
+    if (isRefEnd) cls += ' ref-end';
     if (line.kind === 'section') {
       return `<span class="line ${cls}">${escapeHtml(line.label || '')}</span>`;
     }
@@ -257,6 +264,10 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet) {
       const head = addrStr.slice(0, -4);
       const tail = addrStr.slice(-4);
       addrHtml = escapeHtml(head) + `<span class="midpoint-tail">${escapeHtml(tail)}</span>`;
+    } else if (isRefEnd && addrStr.length >= 4) {
+      const head = addrStr.slice(0, -4);
+      const tail = addrStr.slice(-4);
+      addrHtml = escapeHtml(head) + `<span class="ref-end-tail">${escapeHtml(tail)}</span>`;
     } else {
       addrHtml = escapeHtml(addrStr);
     }
@@ -267,8 +278,15 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet) {
     const labelPart = line.label
       ? `<span class="lbl">${escapeHtml(line.label)}</span> `
       : '';
-    const tagPart = line.tag
-      ? `<span class="tag">${escapeHtml(line.tag)}</span>`
+    // Compose tag column: existing line.tag (from server) + optional
+    // "ref: next FUN" suffix when this row is where reference would
+    // have started the next function (= where our function would have
+    // ended in reference's view).
+    let tagText = line.tag || '';
+    if (isRefEnd) tagText = tagText ? `${tagText}  ref: next FUN` : 'ref: next FUN';
+    const tagClass = isRefEnd ? 'tag tag-ref-end' : 'tag';
+    const tagPart = tagText
+      ? `<span class="${tagClass}">${escapeHtml(tagText)}</span>`
       : '';
     if (isPrimary && line.branch) {
       CURRENT_BRANCHES.push({
@@ -542,6 +560,21 @@ async function fetchState() {
     const natMidSet  = overrideActive
       ? new Set(((s.natural_view.candidate.evidence && s.natural_view.candidate.evidence.midpoints) || []).map(m => m.addr))
       : primMidSet;
+    // Per-pane reference-boundary marker — address where reference's
+    // NEXT function begins.  Using reference_next (not implied_end)
+    // because reference_next is always row-aligned (it's a real
+    // `FUN_<addr>:` label start).  The highlighted row visually
+    // answers "where would reference have ended my function?" — the
+    // row is where reference's NEXT function starts, so everything
+    // immediately above is what reference considers part of our
+    // function.
+    function refEndSet(c) {
+      const ref = c && c.reference;
+      const a = ref && ref.reference_next;
+      return new Set(a != null ? [a] : []);
+    }
+    const primRefEndSet = refEndSet(s.candidate);
+    const natRefEndSet  = overrideActive ? refEndSet(s.natural_view.candidate) : primRefEndSet;
     if (primChanged || natChanged || attnChanged) {
       if (overrideActive) {
         // Diff-align so rows for the same VRAM anchor address sit at the
@@ -550,10 +583,10 @@ async function fetchState() {
         // row goes on the missing side.  Works whether the override
         // tightens OR expands scope.
         const aligned = alignLines(s.lines, s.natural_view.lines);
-        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet);
-        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet);
+        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet, primRefEndSet);
+        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet,  natRefEndSet);
       } else {
-        renderListing(s.lines, primaryListing, true, attnSet, primMidSet);
+        renderListing(s.lines, primaryListing, true, attnSet, primMidSet, primRefEndSet);
       }
       requestAnimationFrame(() => {
         // Scroll the current candidate's section header into view, but
