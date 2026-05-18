@@ -305,7 +305,16 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
 
     op_rts = _read_opcode(binary, vram, rts_addr)
     mnem_rts, _ = decode_sh2(op_rts, rts_addr) if op_rts is not None else (None, None)
-    if mnem_rts != "rts":
+    # Accept three legitimate exit forms (all have a delay slot):
+    #   - rts            : standard return (pops PC from PR)
+    #   - jmp @Rn        : tail call — control transfers to Rn and that
+    #                       function's rts returns to OUR caller (we've
+    #                       already restored PR to caller's value).
+    #   - braf Rn        : same as jmp but PC-relative; also a tail call.
+    # All three are followed by a delay slot which GCC commonly schedules
+    # the last epilogue pop into.
+    exit_head = mnem_rts.split()[0] if mnem_rts else ""
+    if exit_head not in ("rts", "jmp", "braf"):
         return None, [], 0, None, None
 
     # Delay slot is conceptually the FIRST step of our backward walk.
@@ -751,7 +760,7 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
     max_score = 4
 
     if final_rts is None:
-        flags.append("no clean rts at expected position")
+        flags.append("no clean function exit at expected position (rts/jmp/braf)")
         return "LOW", flags
     score += 1
 
