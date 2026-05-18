@@ -896,14 +896,25 @@ def _compute_current(ignore_override=False):
         prev = override.get("previous_subseg")
         start = _coerce_addr(override["candidate_start"])
         tu = next((t for t in cfg.get("tus", []) if t["start"] <= start <= t["end"]), None)
-        hint_end = tu["end"] if tu else None
-        ev = analyze_candidate(binary, STATE["vram_cache"], start, hint_end, pool_priors=pool_priors)
         # AI may also pin the END explicitly (one-off boundary correction
-        # the oracle's heuristics can't reach).  Apply after analyze_candidate
-        # so pool/CFG/epilogue analysis still runs against the natural code
-        # end; only the displayed/written boundary is moved.
+        # the oracle's heuristics can't reach).  When pinned, use it as
+        # hint_end so the ENTIRE analysis (CFG walk, epilogue search,
+        # prologue/epilogue mirror, verdict) runs against the override
+        # boundary — not against TU end with a post-hoc end mutation,
+        # which leaves the verdict reflecting whichever epilogue
+        # oracle's natural walk happened to land on (often a different
+        # function's rts past the real end).
         end_override = override.get("candidate_end")
         if end_override is not None:
+            hint_end = _coerce_addr(end_override)
+        else:
+            hint_end = tu["end"] if tu else None
+        ev = analyze_candidate(binary, STATE["vram_cache"], start, hint_end, pool_priors=pool_priors)
+        if end_override is not None:
+            # analyze_candidate may have chosen an end < hint_end (oracle
+            # found a clean exit before reaching the cap).  Force the
+            # displayed/written boundary to match the AI's pin regardless,
+            # so the listing reflects what's been requested.
             ev.end = _coerce_addr(end_override)
         return prev, ev
 
@@ -1467,7 +1478,13 @@ def state():
             nat = _compute_current(ignore_override=True)
             if nat:
                 nat_prev, nat_ev = nat
-                if nat_ev.start != ev.start:
+                # Show split when EITHER boundary differs.  With v2's
+                # accurate caller detection, oracle often agrees on the
+                # start but disagrees on the end (it swallows trailing
+                # mini-functions / trailing pool into the parent body).
+                # That end-disagreement is exactly the case the override
+                # is meant to fix, so the split-view must surface it.
+                if nat_ev.start != ev.start or nat_ev.end != ev.end:
                     natural_view = _build_candidate_payload(nat_prev, nat_ev)
 
         # Optional `attn` list inside ai_override — addresses the AI wants
