@@ -305,16 +305,21 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
 
     op_rts = _read_opcode(binary, vram, rts_addr)
     mnem_rts, _ = decode_sh2(op_rts, rts_addr) if op_rts is not None else (None, None)
-    # Accept three legitimate exit forms (all have a delay slot):
+    # Accept four legitimate exit forms (all have a delay slot):
     #   - rts            : standard return (pops PC from PR)
-    #   - jmp @Rn        : tail call — control transfers to Rn and that
-    #                       function's rts returns to OUR caller (we've
-    #                       already restored PR to caller's value).
-    #   - braf Rn        : same as jmp but PC-relative; also a tail call.
-    # All three are followed by a delay slot which GCC commonly schedules
+    #   - jmp @Rn        : indirect tail call — control transfers to Rn
+    #                       and that function's rts returns to OUR caller
+    #                       (we've already restored PR to caller's value).
+    #   - braf Rn        : PC-relative indirect tail call.
+    #   - bra disp       : direct PC-relative tail call (target encoded
+    #                       in the opcode, ±4KB range).  GCC emits this
+    #                       when the tail-call target is statically known
+    #                       and nearby; functionally identical to jmp @Rn
+    #                       for the caller's accounting.
+    # All four are followed by a delay slot which GCC commonly schedules
     # the last epilogue pop into.
     exit_head = mnem_rts.split()[0] if mnem_rts else ""
-    if exit_head not in ("rts", "jmp", "braf"):
+    if exit_head not in ("rts", "jmp", "braf", "bra"):
         return None, [], 0, None, None
 
     # Delay slot is conceptually the FIRST step of our backward walk.
@@ -523,10 +528,19 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
                 branches.append(b)
                 # bsr is a CALL (control returns) — don't follow target, fall through after delay slot
                 is_call = head == "bsr"
+                # Don't follow branches whose target lands OUTSIDE this
+                # function's range — those are tail-calls / external
+                # exits.  Walking into them pulls in branches from
+                # OTHER functions' bodies, which then get counted as
+                # "this function's external bras" and inflate the
+                # bras_external flag count (and pollute the rendered
+                # branches list with unreachable source addresses).
+                in_range = (tgt is not None
+                            and start <= tgt <= hard_limit_addr)
                 # delay-slot branches: bra, bsr, bf/s, bt/s
                 if head in {"bf/s", "bt/s", "bra", "bsr"}:
                     reachable.add(pc + 2)
-                    if tgt is not None and tgt not in reachable and not is_call:
+                    if in_range and tgt not in reachable and not is_call:
                         worklist.append(tgt)
                     if head == "bra":
                         # unconditional jump — control does NOT fall through past delay slot
@@ -536,7 +550,7 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
                     continue
                 else:
                     # bf, bt: no delay slot; fall through to pc+2
-                    if tgt is not None and tgt not in reachable:
+                    if in_range and tgt not in reachable:
                         worklist.append(tgt)
                     pc += 2
                     continue
