@@ -84,8 +84,15 @@ def _push_register(mnem):
 
 
 def _pop_register(mnem):
-    """If mnem is `mov.l @r15+, rN` for callee-saved rN (r8-r14), return rN.
-    Pops of r0-r7 are argument cleanup, NOT epilogue restoration — skip those.
+    """If mnem is `mov.l @r15+, rN` for any rN in r0-r14, return rN.
+
+    Originally only r8-r14 (callee-saved) counted as epilogue restoration on
+    the theory that r0-r7 pops were argument cleanup mid-function.  But tiny
+    helper functions that only push r0-r7 in their prologue also need their
+    pops recognized as the epilogue, or the walker bails immediately.  Mid-
+    function scratch pop/push pairs are safely far from the rts — the
+    epilogue walker's MAX_INTERLEAVE tolerance prevents the walker from
+    reaching them.
     """
     if not mnem.startswith("mov.l @r15+, r"):
         return None
@@ -93,7 +100,7 @@ def _pop_register(mnem):
     if len(parts) != 3:
         return None
     reg = parts[2]
-    if reg in {f"r{i}" for i in range(8, 15)}:
+    if reg in {f"r{i}" for i in range(0, 15)}:
         return reg
     return None
 
@@ -218,7 +225,13 @@ def _walk_prologue(binary, vram, start):
             break
 
         reg = _push_register(mnem)
-        if reg and reg in {f"r{i}" for i in range(8, 15)}:
+        if reg and reg in {f"r{i}" for i in range(0, 15)}:
+            # Track scratch (r0-r7) AND callee-saved (r8-r14) pushes the
+            # same way.  Tiny helper functions (memclr/memcpy-style loops)
+            # only save scratch regs and were otherwise getting a false
+            # "no prologue register pushes detected" yellow flag.  Mid-fn
+            # save-around-jsr pairs are well past the prologue boundary,
+            # protected by consecutive_non_prologue tolerance.
             saved.append(reg)
             last_prologue = addr
             consecutive_non_prologue = 0
@@ -273,10 +286,19 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None):
 
     # Walk backward from rts_addr - 2 collecting register pops, pr/macl pops, stack dealloc.
     # Bound by func_start so we don't scan past the function's prologue into prior bytes.
+    #
+    # GCC's scheduler can interleave a few non-epilogue ops (return-value
+    # computation, condition setup, etc.) between the restores — most
+    # commonly an `extu.b r0, r0` or similar value-shape fixup between the
+    # macl pop and the pr pop.  Mirror _walk_prologue's MAX_INTERLEAVE
+    # tolerance so we don't bail before finding stack-dealloc / macl-pop
+    # that sit ahead of an interleaved instruction.
+    MAX_INTERLEAVE = 6
     epilogue_start = rts_addr
     addr = rts_addr - 2
     stack = 0
     lower_bound = func_start if func_start is not None else 0
+    consecutive_non_epi = 0
     while addr >= lower_bound:
         op = _read_opcode(binary, vram, addr)
         if op is None:
@@ -288,17 +310,23 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None):
         if reg:
             restored.insert(0, reg)
             epilogue_start = addr
+            consecutive_non_epi = 0
         elif _is_pr_pop(mnem):
             restored.insert(0, "pr")
             epilogue_start = addr
+            consecutive_non_epi = 0
         elif _is_macl_pop(mnem):
             restored.insert(0, "macl")
             epilogue_start = addr
+            consecutive_non_epi = 0
         elif _is_stack_dealloc(mnem) is not None:
             stack = _is_stack_dealloc(mnem)
             epilogue_start = addr
+            consecutive_non_epi = 0
         else:
-            break  # not epilogue-ish, stop scanning back
+            consecutive_non_epi += 1
+            if consecutive_non_epi > MAX_INTERLEAVE:
+                break
         addr -= 2
 
     # Append delay-slot pop last (if it is a pop)
@@ -308,7 +336,88 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None):
     return epilogue_start, restored, stack, rts_addr, delay_slot
 
 
-def _control_flow_walk(binary, vram, start, hard_limit_addr):
+def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
+                                 func_start=None, hard_limit=None):
+    """Recognize the GCC SH-2 switch-dispatch idiom around `braf_pc`.
+
+    Idiom (within ~12 bytes before braf):
+
+        mova @(disp,PC), r0    ; loads jump-table base into r0
+        mov.w @(r0,rN), r0     ; loads .short offset for case rN
+        braf r0                 ; jumps to (PC+4) + sign-extended offset
+        <delay slot>
+
+    The jump table is a contiguous run of `.short` entries; each entry's
+    value is `target - (braf_pc + 4)` (i.e. relative to the braf's
+    delay-slot base, NOT the table's own base — this is a quirk of GCC's
+    SH-2 switch lowering).  We walk the table while pool_priors marks
+    consecutive 2-byte slots and stop at the first non-prior address.
+
+    Returns list[int] of target addresses (possibly empty).
+    """
+    if not pool_priors:
+        return []
+
+    # Confirm: braf r0 specifically (GCC default).  Other registers possible
+    # but rare; handle later if a real case crops up.
+    braf_op = _read_opcode(binary, vram, braf_pc)
+    if braf_op is None or (braf_op & 0xF0FF) != 0x0023:
+        return []
+    braf_reg = (braf_op >> 8) & 0xF
+    if braf_reg != 0:
+        return []
+
+    # Scan back up to 12 bytes for the mova + mov.w pair.  The compiler may
+    # schedule an unrelated instruction or two between them, so we don't
+    # require strict adjacency.
+    movw_seen = False
+    table_base = None
+    for back in range(2, 14, 2):
+        addr = braf_pc - back
+        if addr < vram:
+            break
+        op = _read_opcode(binary, vram, addr)
+        if op is None:
+            continue
+        # mov.w @(r0, rM), r0  encoding 0000 0000 mmmm 1101  (dest r0)
+        if (op & 0xF00F) == 0x000D and ((op >> 8) & 0xF) == 0:
+            movw_seen = True
+            continue
+        # mova @(disp, PC), r0  encoding 11000111 dddddddd
+        if (op & 0xFF00) == 0xC700:
+            disp = (op & 0xFF) * 4
+            # SH-2 mova: r0 = (PC & ~3) + 4 + disp, where PC == addr of mova
+            table_base = ((addr + 4) & ~3) + disp
+            break
+
+    if not movw_seen or table_base is None:
+        return []
+
+    # Read .short entries while pool_priors marks consecutive 2-byte slots.
+    # Each computed target must land inside the function's range; the
+    # .short is signed-extended so a stray high-bit value can produce a
+    # huge negative offset that'd otherwise seed _control_flow_walk with
+    # garbage addresses and inflate ev.end.
+    lo = func_start if func_start is not None else vram
+    hi = hard_limit if hard_limit is not None else (vram + len(binary) - 1)
+    targets = []
+    t = table_base
+    while pool_priors.get(t) == 2:
+        off = t - vram
+        if off + 1 >= len(binary):
+            break
+        raw = (binary[off] << 8) | binary[off + 1]
+        # Sign-extend 16-bit (mov.w sign-extends on load).
+        sval = raw - 0x10000 if raw & 0x8000 else raw
+        target = braf_pc + 4 + sval
+        if lo <= target <= hi:
+            targets.append(target)
+        t += 2
+
+    return targets
+
+
+def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
     """Walk reachable addresses from `start` via control flow.
 
     Stops at:
@@ -375,7 +484,21 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr):
                 # Delay slot is reached
                 reachable.add(pc + 2)
                 if head in {"jmp", "braf"}:
-                    # unconditional — terminates
+                    # braf: try the SH-2 switch-dispatch idiom — seed case
+                    # bodies as reachable so they don't render "unreach".
+                    if head == "braf":
+                        case_targets = _detect_braf_switch_targets(
+                            binary, vram, pc, pool_priors,
+                            func_start=start, hard_limit=hard_limit_addr,
+                        )
+                        for tgt in case_targets:
+                            branches.append(BranchInfo(
+                                src=pc, target=tgt, mnem="braf", internal=False
+                            ))
+                            if tgt not in reachable:
+                                worklist.append(tgt)
+                    # unconditional — terminates THIS linear walk; targets
+                    # (if any) continue via worklist
                     break
                 # jsr/bsrf — call returns, fall through
                 pc += 4
@@ -498,9 +621,10 @@ def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
     prologue_end, saved, stack_alloc, flags = _walk_prologue(binary, vram, start)
     prologue_range = (start, prologue_end)
 
-    # Walk forward to find reachable extent
+    # Walk forward to find reachable extent.  pool_priors lets the walker
+    # trace switch-dispatch jump tables (`braf r0` over a `.short` table).
     reachable, max_reachable, branches, indirect = _control_flow_walk(
-        binary, vram, start, hard_limit
+        binary, vram, start, hard_limit, pool_priors=pool_priors
     )
 
     # The last byte of the function is the last byte of the last reachable instruction.
@@ -618,10 +742,20 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
 # Function-start signals — patterns that strongly suggest "a function begins
 # at this address." Used to scan past pool/data zones between functions.
 _FN_START_PREFIXES = (
+    # Callee-saved pushes — the strong signal that a real function starts here.
     "mov.l r8, @-r15", "mov.l r9, @-r15", "mov.l r10, @-r15",
     "mov.l r11, @-r15", "mov.l r12, @-r15", "mov.l r13, @-r15",
     "mov.l r14, @-r15",
+    # PR / MACL push — typical pre-prologue save.
     "sts.l pr, @-r15", "sts.l macl, @-r15",
+    # Scratch-register pushes — tiny helper functions (memclr/memcpy-style
+    # loops, jsr trampolines) often save only r0-r7 because they don't call
+    # out and only need a couple of temporaries.  Without these, forward
+    # sweep skips real functions like the FUN_0602AA84 anon mini-fn called
+    # twice from race code with 600+ runtime hits.
+    "mov.l r0, @-r15", "mov.l r1, @-r15", "mov.l r2, @-r15",
+    "mov.l r3, @-r15", "mov.l r4, @-r15", "mov.l r5, @-r15",
+    "mov.l r6, @-r15", "mov.l r7, @-r15",
 )
 
 
@@ -634,13 +768,31 @@ def _looks_like_fn_start(mnem):
     return False
 
 
-def _scan_for_next_prologue(binary, vram, start_addr, max_addr):
-    """Walk forward from start_addr looking for a likely function start.
-    Returns the first matching address, or None if nothing plausible found
-    before max_addr.
+def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
+                            archive_starts=None, static_callers=None):
+    """Walk forward from start_addr looking for the next function entry.
+
+    Three signals, checked in priority order per address:
+      1. static_callers[addr] > 0  — somebody bsr/jsrs to this address;
+         definitively a function entry regardless of what its first
+         instruction looks like.
+      2. addr in archive_starts    — archive labeled it FUN_<addr>; less
+         decisive (archive has Ghidra hallucinations) but a real signal.
+      3. _looks_like_fn_start(...) — first instruction matches a register-
+         push pattern.  Weakest signal — misses non-ABI helper functions
+         that have no prologue (e.g. FUN_0602A818, which starts with
+         `mov.l @r6, r6` and is called 4× via bsr).
+
+    Returns the EARLIEST matching address, or None if nothing matches.
     """
-    addr = (start_addr + 1) & ~1  # round up to 2-byte alignment
+    archive_starts = archive_starts or set()
+    static_callers = static_callers or {}
+    addr = (start_addr + 1) & ~1
     while addr <= max_addr:
+        if static_callers.get(addr, 0) > 0:
+            return addr
+        if addr in archive_starts:
+            return addr
         off = addr - vram
         if off + 1 >= len(binary):
             return None
@@ -652,7 +804,8 @@ def _scan_for_next_prologue(binary, vram, start_addr, max_addr):
     return None
 
 
-def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None):
+def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
+                                       archive_starts=None, static_callers=None):
     """Forward-sweep candidate generation.
 
     Sorts verified code subsegs by start. For each, scans the bytes
@@ -675,8 +828,26 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None):
 
     binary_end = vram + len(binary) - 1
 
+    # Head-of-binary case: if the binary's first address isn't covered by
+    # any declared subseg, look for a function there first.  This handles
+    # both the bootstrap case (no anchors yet) and re-review of the very
+    # first function after an /unstamp at the binary head.
+    if not declared_code or declared_code[0]["start"] > vram:
+        next_start = _scan_for_next_prologue(
+            binary, vram, vram, binary_end,
+            archive_starts=archive_starts, static_callers=static_callers,
+        )
+        if next_start is not None and next_start not in declared_starts:
+            tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)
+            hint_end = tu["end"] if tu else None
+            ev = analyze_candidate(binary, vram, next_start, hint_end, pool_priors=pool_priors)
+            return (None, ev)
+
     for prev in declared_code:
-        next_start = _scan_for_next_prologue(binary, vram, prev["end"] + 1, binary_end)
+        next_start = _scan_for_next_prologue(
+            binary, vram, prev["end"] + 1, binary_end,
+            archive_starts=archive_starts, static_callers=static_callers,
+        )
         if next_start is None:
             continue
         if next_start in declared_starts:

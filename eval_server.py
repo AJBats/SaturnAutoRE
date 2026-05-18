@@ -92,6 +92,44 @@ def load_binary(cfg):
 # Yaml mutation: append approved candidate as a code subseg
 # ---------------------------------------------------------------------------
 
+def _remove_subseg_from_yaml(start_addr):
+    """Remove the subseg with the given start address from the yaml.
+
+    Re-review mechanism: when a subseg was approved under an older oracle
+    (e.g. before pool-extension existed) and its boundary needs to be
+    reconsidered with current logic, remove it from yaml.  Forward-sweep
+    will then re-propose it on the next /state poll, and the human can
+    stamp the corrected boundary.
+
+    Returns True if a matching subseg was found and removed, False otherwise.
+    """
+    text = open(STATE["yaml_path"]).read()
+    lines = text.splitlines(keepends=True)
+    target = f"  - start: 0x{start_addr:08X}"
+    out = []
+    i = 0
+    removed = False
+    while i < len(lines):
+        if lines[i].rstrip("\r\n") == target:
+            # Skip the 4-line block: start / type / file / end.  Continue past
+            # any continuation lines (indented with 4+ spaces) until the next
+            # `- start:` line or a blank/dedented line.
+            i += 1
+            while i < len(lines):
+                stripped = lines[i].rstrip("\r\n")
+                if stripped.startswith("  - ") or (stripped and not stripped.startswith("    ")):
+                    break
+                i += 1
+            removed = True
+            continue
+        out.append(lines[i])
+        i += 1
+    if removed:
+        with open(STATE["yaml_path"], "w") as f:
+            f.writelines(out)
+    return removed
+
+
 def _append_subseg_to_yaml(start_addr, end_addr, file_name):
     text = open(STATE["yaml_path"]).read()
     if not text.endswith("\n"):
@@ -835,7 +873,12 @@ def _compute_current():
             ev.end = _coerce_addr(end_override)
         return prev, ev
 
-    return find_next_forward_sweep_candidate(cfg, binary, pool_priors=pool_priors)
+    return find_next_forward_sweep_candidate(
+        cfg, binary,
+        pool_priors=pool_priors,
+        archive_starts=set(STATE.get("archive_starts") or []),
+        static_callers=STATE.get("static_callers") or {},
+    )
 
 
 def _coerce_addr(v):
@@ -924,9 +967,20 @@ def _load_static_callers():
         r"\b(?:bsr|bsr\.s|jsr|jmp|bra|braf|bsrf)\b[^/]*?"
         r"\b(?:xref_)?FUN_([0-9A-Fa-f]{8})\b(?!\s*\+)"
     )
-    pool_re = re.compile(
-        r"\.4byte\s+(?:xref_FUN_|FUN_|DAT_)([0-9A-Fa-f]{8})\b(?!\s*\+)"
+    # .4byte FUN_ / xref_FUN_ always counts.  .4byte DAT_ is ambiguous —
+    # it can be a real function pointer (Ghidra mis-labeled the target as
+    # data) or a genuine data pointer (e.g. into another function's pool
+    # zone).  Cross-reference: count DAT_<addr> only when <addr> is itself
+    # a known function start in archive_starts.  This catches archives
+    # like `.4byte DAT_06029810 /* = FUN_06029810 */` while still
+    # rejecting `.4byte DAT_06029958 /* = FUN_06029810 + 0x148 */`.
+    pool_re_fun = re.compile(
+        r"\.4byte\s+(?:xref_FUN_|FUN_)([0-9A-Fa-f]{8})\b(?!\s*\+)"
     )
+    pool_re_dat = re.compile(
+        r"\.4byte\s+DAT_([0-9A-Fa-f]{8})\b(?!\s*\+)"
+    )
+    archive_starts = set(STATE.get("archive_starts") or _load_archive_starts())
 
     for s_file in archive_dir.glob("**/*.s"):
         try:
@@ -937,9 +991,16 @@ def _load_static_callers():
             for m in branch_re.finditer(line):
                 addr = int(m.group(1), 16)
                 callers[addr] = callers.get(addr, 0) + 1
-            for m in pool_re.finditer(line):
+            for m in pool_re_fun.finditer(line):
                 addr = int(m.group(1), 16)
                 callers[addr] = callers.get(addr, 0) + 1
+            for m in pool_re_dat.finditer(line):
+                addr = int(m.group(1), 16)
+                # Only credit DAT_<addr> when addr is itself an archive
+                # function start.  Filters out pool refs pointing at
+                # interior data.
+                if addr in archive_starts:
+                    callers[addr] = callers.get(addr, 0) + 1
     return callers
 
 
@@ -1244,6 +1305,39 @@ def state():
             "progress": progress,
             "lines": lines,
         })
+
+
+@app.route("/unstamp", methods=["POST"])
+def unstamp():
+    """Re-dirty a previously verified subseg so forward-sweep proposes it again.
+
+    Body JSON: {"start": "0x06028DCA"}  (hex string or int)
+
+    Use when an oracle improvement (pool-zone extension, new prologue
+    recognition, etc.) means a previously-approved function's boundary
+    deserves another look.  The history record from the original approve
+    stays intact; the next /state poll will show the function as the
+    current candidate again, and a fresh approve appends a new history
+    record + writes the new yaml entry.
+    """
+    data = request.get_json(force=True)
+    raw = data.get("start")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'start'"}), 400
+    try:
+        addr = _coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    with LOCK:
+        removed = _remove_subseg_from_yaml(addr)
+        if removed:
+            # Invalidate cfg_cache so a same-LOCK follow-up endpoint
+            # (e.g. /verdict) sees the post-unstamp yaml, not the stale
+            # cached subseg list.
+            _reload_caches()
+    if not removed:
+        return jsonify({"ok": False, "error": f"no subseg found with start 0x{addr:08X}"}), 404
+    return jsonify({"ok": True, "unstamped": f"0x{addr:08X}"})
 
 
 @app.route("/verdict", methods=["POST"])
