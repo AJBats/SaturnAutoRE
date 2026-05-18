@@ -905,7 +905,19 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
         [s for s in subsegs if s.get("type") == "code"],
         key=lambda s: s["start"],
     )
-    declared_starts = {s["start"] for s in declared_code}
+    def _covered_by_existing(addr):
+        """True if addr falls inside any verified subseg's [start, end]
+        range — not just at a start.  Catches the case where forward-sweep
+        latches on a prologue inside a function that was ai_overridden to
+        start a few bytes earlier (e.g. pre-prologue setup like
+        `mov r4, r1; mov.l @(pc), r3; sts.l pr, @-r15` — the override
+        moves the subseg start to the `mov`, but sweep would otherwise
+        find the `sts.l pr` inside the new range and propose an
+        overlapping subseg)."""
+        for s in declared_code:
+            if s["start"] <= addr <= s["end"]:
+                return True
+        return False
 
     binary_end = vram + len(binary) - 1
 
@@ -918,7 +930,7 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
             binary, vram, vram, binary_end,
             reference_starts=reference_starts, static_callers=static_callers,
         )
-        if next_start is not None and next_start not in declared_starts:
+        if next_start is not None and not _covered_by_existing(next_start):
             tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)
             hint_end = tu["end"] if tu else None
             ev = analyze_candidate(binary, vram, next_start, hint_end, pool_priors=pool_priors)
@@ -931,9 +943,8 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
         )
         if next_start is None:
             continue
-        if next_start in declared_starts:
-            # The function right after `prev` is already verified — move on
-            # to look after the next verified subseg.
+        if _covered_by_existing(next_start):
+            # Already inside an existing verified subseg — keep iterating.
             continue
         # Hint analysis bounds to the TU containing the candidate
         tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)

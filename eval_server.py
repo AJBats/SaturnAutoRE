@@ -262,9 +262,10 @@ def _symbolize(mnem, pool4, pool2, mova, branch_targets):
     return mnem
 
 
-def _emit_section_header(lines, section, label):
+def _emit_section_header(lines, section, label, anchor_addr=None):
     lines.append({
         "kind": "section",
+        "anchor_addr": anchor_addr,
         "addr_str": "",
         "label": label,
         "bytes": "",
@@ -813,21 +814,24 @@ def render_listing(ev, prev_subseg):
         size = prev_subseg["end"] - prev_subseg["start"] + 1
         _emit_section_header(
             lines, "prev",
-            f"VERIFIED  FUN_{prev_subseg['start']:08X}  0x{prev_subseg['start']:08X} → 0x{prev_subseg['end']:08X}  ({size} bytes)"
+            f"VERIFIED  FUN_{prev_subseg['start']:08X}  0x{prev_subseg['start']:08X} → 0x{prev_subseg['end']:08X}  ({size} bytes)",
+            anchor_addr=prev_subseg['start'],
         )
         _emit_function_lines(lines, prev_ev, "prev")
 
         if prev_subseg["end"] + 1 < ev.start:
             _emit_section_header(
                 lines, "intermediate",
-                f"INTERMEDIATE  0x{prev_subseg['end']+1:08X} → 0x{ev.start-1:08X}  ({ev.start - prev_subseg['end'] - 1} bytes, likely pool/padding)"
+                f"INTERMEDIATE  0x{prev_subseg['end']+1:08X} → 0x{ev.start-1:08X}  ({ev.start - prev_subseg['end'] - 1} bytes, likely pool/padding)",
+                anchor_addr=prev_subseg['end'] + 1,
             )
             _emit_raw_bytes(lines, prev_subseg["end"] + 1, ev.start - 1, "intermediate")
 
     size = ev.end - ev.start + 1
     _emit_section_header(
         lines, "current",
-        f"PROPOSED  FUN_{ev.start:08X}  0x{ev.start:08X} → 0x{ev.end:08X}  ({size} bytes)  verdict: {ev.verdict}"
+        f"PROPOSED  FUN_{ev.start:08X}  0x{ev.start:08X} → 0x{ev.end:08X}  ({size} bytes)  verdict: {ev.verdict}",
+        anchor_addr=ev.start,
     )
     _emit_function_lines(lines, ev, "current")
 
@@ -838,7 +842,8 @@ def render_listing(ev, prev_subseg):
         actual_end = min(trailing_end, binary_end)
         _emit_section_header(
             lines, "trailing",
-            f"TRAILING  0x{trailing_start:08X} → 0x{actual_end:08X}  ({actual_end - trailing_start + 1} bytes after candidate)"
+            f"TRAILING  0x{trailing_start:08X} → 0x{actual_end:08X}  ({actual_end - trailing_start + 1} bytes after candidate)",
+            anchor_addr=trailing_start,
         )
         _emit_raw_bytes(lines, trailing_start, actual_end, "trailing")
 
@@ -849,10 +854,12 @@ def render_listing(ev, prev_subseg):
 # Current-candidate computation (with AI override)
 # ---------------------------------------------------------------------------
 
-def _compute_current():
+def _compute_current(ignore_override=False):
     """Return (prev_subseg, evidence) or None.
 
-    If session.json has an `ai_override`, prefer that.
+    If session.json has an `ai_override`, prefer that (unless
+    `ignore_override=True`, used to compute the "natural" view shown in
+    the diff pane).
     Otherwise run forward-sweep from the latest verified subseg.
     """
     session = load_session()
@@ -861,7 +868,7 @@ def _compute_current():
 
     pool_priors = STATE.get("pool_priors") or {}
 
-    override = session.get("ai_override")
+    override = session.get("ai_override") if not ignore_override else None
     if override:
         prev = override.get("previous_subseg")
         start = _coerce_addr(override["candidate_start"])
@@ -1365,33 +1372,73 @@ def state():
         # the gap between latest-stamped and proposal (forward-sweep skipped
         # a real function in that zone) before the user creates it.
         internal_gaps = _detect_internal_gaps(proposed_start=ev.start)
-        lines = render_listing(ev, prev)
-        reference = _compute_reference_agreement(ev.start, ev.end)
-        evidence = _compute_candidate_evidence(ev.start, ev.end)
+
+        primary_payload = _build_candidate_payload(prev, ev)
+
+        # When ai_override is active, ALSO compute what oracle would
+        # naturally propose without the override.  Shown in a split-pane
+        # diff view so the human can compare "what AI redirected to" vs
+        # "what oracle's heuristics produced" side by side.
+        natural_view = None
+        if session.get("ai_override"):
+            nat = _compute_current(ignore_override=True)
+            if nat:
+                nat_prev, nat_ev = nat
+                if nat_ev.start != ev.start:
+                    natural_view = _build_candidate_payload(nat_prev, nat_ev)
+
+        # Optional `attn` list inside ai_override — addresses the AI wants
+        # to draw the human's eye to.  Rendered as a highlighted box around
+        # the address + bold-orange last-4-hex-digit in the listing.
+        override = session.get("ai_override") or {}
+        attn_raw = override.get("attn") or []
+        attn_addrs = []
+        for a in attn_raw:
+            try:
+                attn_addrs.append(_coerce_addr(a))
+            except (ValueError, TypeError):
+                pass
 
         return jsonify({
             "all_caught_up": False,
-            "candidate": {
-                "start_hex": f"{ev.start:08X}",
-                "start": ev.start,
-                "end_hex": f"{ev.end:08X}",
-                "end": ev.end,
-                "size": ev.end - ev.start + 1,
-                "verdict": ev.verdict,
-                "yellow_flags": ev.yellow_flags,
-                "name": f"FUN_{ev.start:08X}",
-                "reference": reference,
-                "evidence": evidence,
-            },
-            "previous": {
-                "start_hex": f"{prev['start']:08X}",
-                "name": f"FUN_{prev['start']:08X}",
-            } if prev else None,
+            "candidate": primary_payload["candidate"],
+            "previous":  primary_payload["previous"],
+            "lines":     primary_payload["lines"],
+            "natural_view": natural_view,
+            "override_active": bool(session.get("ai_override")),
+            "attn": attn_addrs,
             "history_count": len(history),
             "progress": progress,
             "internal_gaps": internal_gaps,
-            "lines": lines,
         })
+
+
+def _build_candidate_payload(prev, ev):
+    """Package a candidate's full metadata (banner content + listing) for
+    one pane of the split view.  Both panes use the same payload shape so
+    the frontend renderer can be agnostic to which side it's drawing."""
+    reference = _compute_reference_agreement(ev.start, ev.end)
+    evidence = _compute_candidate_evidence(ev.start, ev.end)
+    lines = render_listing(ev, prev)
+    return {
+        "candidate": {
+            "start_hex": f"{ev.start:08X}",
+            "start": ev.start,
+            "end_hex": f"{ev.end:08X}",
+            "end": ev.end,
+            "size": ev.end - ev.start + 1,
+            "verdict": ev.verdict,
+            "yellow_flags": ev.yellow_flags,
+            "name": f"FUN_{ev.start:08X}",
+            "reference": reference,
+            "evidence": evidence,
+        },
+        "previous": {
+            "start_hex": f"{prev['start']:08X}",
+            "name": f"FUN_{prev['start']:08X}",
+        } if prev else None,
+        "lines": lines,
+    }
 
 
 @app.route("/unstamp", methods=["POST"])

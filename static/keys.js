@@ -1,6 +1,8 @@
 // keys.js — single-candidate forward-sweep eval UI.
 
 let LAST_CANDIDATE_START = null;
+let LAST_NATURAL_START = null;
+let LAST_ATTN_KEY = '';
 
 function setStatus(text) {
   document.getElementById('status').textContent = text;
@@ -98,42 +100,123 @@ function renderGapAlert(gaps) {
   `;
 }
 
-function renderHeader(s) {
-  const el = document.getElementById('header-content');
+// Global header: project-level info only (progress + caught-up message).
+// Per-candidate metadata moved to .pane-banner inside each listing pane.
+function renderProgress(s) {
+  const el = document.getElementById('progress-content');
   if (s.all_caught_up) {
     el.innerHTML = `
       <span class="caught-up">All verified subsegs are caught up. Add a manual anchor in yaml to continue forward-sweep.</span>
       ${progressHtml(s.progress)}
     `;
+  } else {
+    el.innerHTML = progressHtml(s.progress);
+  }
+}
+
+// Per-pane banner: full candidate metadata for one side of the diff.
+// `paneLabel` is "AI OVERRIDE" or "ORACLE NATURAL" (or empty when no
+// override is active and only the primary pane is shown).
+function renderCandidateBanner(target, candidate, prev, paneLabel) {
+  if (!candidate) {
+    target.innerHTML = '';
     return;
   }
-  const c = s.candidate;
-  const p = s.previous;
+  const c = candidate;
   const flagsHtml = (c.yellow_flags && c.yellow_flags.length)
     ? `<span class="flags">${c.yellow_flags.map(f => `<span class="flag">${escapeHtml(f)}</span>`).join('')}</span>`
     : '';
-  el.innerHTML = `
+  const label = paneLabel ? `<span class="pane-label">${escapeHtml(paneLabel)}</span>` : '';
+  target.innerHTML = `
+    ${label}
     <span class="fn-name">${c.name}</span>
     <span class="addr">0x${c.start_hex} → 0x${c.end_hex}</span>
     <span class="size">${c.size} bytes</span>
     <span class="verdict-tag verdict-${c.verdict}">${c.verdict}</span>
     ${referenceHtml(c.reference)}
     ${evidenceHtml(c.evidence)}
-    ${p ? `<span class="prev">after ${p.name}</span>` : ''}
+    ${prev ? `<span class="prev">after ${prev.name}</span>` : ''}
     ${flagsHtml}
-    ${progressHtml(s.progress)}
   `;
 }
 
 // Cache of branches to draw — refreshed each render.
 let CURRENT_BRANCHES = [];
 
-function renderListing(lines) {
-  const el = document.getElementById('listing');
-  if (!lines || !lines.length) { el.textContent = ''; CURRENT_BRANCHES = []; return; }
-  CURRENT_BRANCHES = [];
+// Diff-style alignment: take two arrays of line objects and return two
+// equal-length arrays where rows for the same VRAM anchor address sit at
+// the same index.  When one side has a line at an address the other
+// doesn't, a `{kind:'blank'}` placeholder gets inserted on the missing
+// side.  At the same address, the conventional ordering is
+// section-header → label → instruction/pool/raw, so a side missing the
+// section-header still aligns its instruction with the other side's
+// instruction at the same address.
+function alignLines(leftLines, rightLines) {
+  const L = leftLines || [];
+  const R = rightLines || [];
+  const BLANK = { kind: 'blank' };
+
+  function anchor(line) {
+    if (!line) return null;
+    if (line.kind === 'section') return line.anchor_addr != null ? line.anchor_addr : null;
+    if (line.addr != null && line.addr !== 0) return line.addr;
+    return null;
+  }
+  function kindRank(line) {
+    if (line.kind === 'section') return 0;
+    if (line.kind === 'label')   return 1;
+    return 2;  // instr / pool / raw
+  }
+
+  const outL = [], outR = [];
+  let li = 0, ri = 0;
+  while (li < L.length || ri < R.length) {
+    const l = li < L.length ? L[li] : null;
+    const r = ri < R.length ? R[ri] : null;
+    if (l === null) { outL.push(BLANK); outR.push(r); ri++; continue; }
+    if (r === null) { outL.push(l); outR.push(BLANK); li++; continue; }
+    const la = anchor(l), ra = anchor(r);
+    // Lines without anchor addresses (rare — shouldn't happen now that
+    // section headers carry anchor_addr) just pass through unaligned.
+    if (la == null && ra == null) {
+      outL.push(l); outR.push(r); li++; ri++; continue;
+    }
+    if (la == null) { outL.push(l); outR.push(BLANK); li++; continue; }
+    if (ra == null) { outL.push(BLANK); outR.push(r); ri++; continue; }
+    if (la === ra) {
+      const lk = kindRank(l), rk = kindRank(r);
+      if (lk === rk)      { outL.push(l); outR.push(r); li++; ri++; }
+      else if (lk < rk)   { outL.push(l); outR.push(BLANK); li++; }
+      else                { outL.push(BLANK); outR.push(r); ri++; }
+    } else if (la < ra)   { outL.push(l); outR.push(BLANK); li++; }
+    else                  { outL.push(BLANK); outR.push(r); ri++; }
+  }
+  return { left: outL, right: outR };
+}
+
+// Render a disassembly listing into the given target element.
+// When `isPrimary` is true, also collects branch info into CURRENT_BRANCHES
+// for SVG arc drawing.  Natural-pane renders pass isPrimary=false so the
+// arcs only ever attach to the primary listing.
+// `attnSet` is a Set of addresses the AI wants to draw the human's eye to
+// — those rows get an attn highlight (orange box around addr + bold-orange
+// last-4-hex tail).
+function renderListing(lines, target, isPrimary, attnSet) {
+  if (!lines || !lines.length) {
+    target.textContent = '';
+    if (isPrimary) CURRENT_BRANCHES = [];
+    return;
+  }
+  if (isPrimary) CURRENT_BRANCHES = [];
   const html = lines.map(line => {
-    const cls = (line.classes || []).join(' ');
+    if (line.kind === 'blank') {
+      // Diff-alignment placeholder — same row height as a real line,
+      // no visible content (color is transparent via CSS).
+      return `<span class="line blank">&nbsp;</span>`;
+    }
+    const isAttn = !!(attnSet && line.addr != null && attnSet.has(line.addr));
+    let cls = (line.classes || []).join(' ');
+    if (isAttn) cls += ' attn';
     if (line.kind === 'section') {
       return `<span class="line ${cls}">${escapeHtml(line.label || '')}</span>`;
     }
@@ -141,6 +224,18 @@ function renderListing(lines) {
     const indentSpan = indent > 0
       ? `<span class="indent" style="width:${indent * 1.4}em"></span>`
       : '';
+    // Address column: when the row is attn-flagged, split the addr_str
+    // so the last 4 hex chars get their own span (.attn-tail) for the
+    // bold-orange treatment.
+    const addrStr = line.addr_str || '';
+    let addrHtml;
+    if (isAttn && addrStr.length >= 4) {
+      const head = addrStr.slice(0, -4);
+      const tail = addrStr.slice(-4);
+      addrHtml = escapeHtml(head) + `<span class="attn-tail">${escapeHtml(tail)}</span>`;
+    } else {
+      addrHtml = escapeHtml(addrStr);
+    }
     if (line.kind === 'label') {
       return `<span class="line ${cls}" data-addr="${line.addr || ''}"><span class="margin"> </span>${indentSpan}<span class="lbl">${escapeHtml(line.label)}</span></span>`;
     }
@@ -151,7 +246,7 @@ function renderListing(lines) {
     const tagPart = line.tag
       ? `<span class="tag">${escapeHtml(line.tag)}</span>`
       : '';
-    if (line.branch) {
+    if (isPrimary && line.branch) {
       CURRENT_BRANCHES.push({
         src: line.addr,
         target: line.branch.target,
@@ -159,11 +254,13 @@ function renderListing(lines) {
         direction: line.branch.direction,
       });
     }
-    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-indent="${indent}"><span class="margin">${escapeHtml(margin)}</span><span class="a">${escapeHtml(line.addr_str || '')}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
+    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-indent="${indent}"><span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
   }).join('\n');
-  el.innerHTML = html;
-  // Defer arc drawing until layout settles
-  requestAnimationFrame(drawArcs);
+  target.innerHTML = html;
+  if (isPrimary) {
+    // Defer arc drawing until layout settles
+    requestAnimationFrame(drawArcs);
+  }
 }
 
 // Arc state — keeps interaction state across renders
@@ -255,6 +352,7 @@ function drawArcs() {
     });
   });
 
+
   // Rail assignment (greedy, by y-span)
   arcs.sort((a, b) => Math.min(a.srcY, a.tgtY) - Math.min(b.srcY, b.tgtY));
   const railEnds = [];
@@ -274,8 +372,13 @@ function drawArcs() {
   ARC_LIST = arcs;
   STICKY_ARC_ID = null;
 
-  // SVG covers the listing area; we use real per-line tick X coords.
-  const svgW = wrap.clientWidth;
+  // SVG covers the listing area within the primary pane only.
+  // (Previously used `wrap.clientWidth` which after the split-pane
+  // refactor spans BOTH panes — that would make the SVG's internal
+  // coordinate system twice as wide as its display, halving every X
+  // coord visually.  Use the SVG's actual parent `.listing-area` width.)
+  const area = listing.parentElement;
+  const svgW = area.clientWidth;
   const svgH = listing.scrollHeight;
   svg.setAttribute('width', svgW);
   svg.setAttribute('height', svgH);
@@ -363,28 +466,76 @@ async function fetchState() {
     const r = await fetch('/state');
     const s = await r.json();
 
-    renderHeader(s);
+    renderProgress(s);
     renderGapAlert(s.internal_gaps);
 
+    const primaryListing = document.getElementById('listing');
+    const primaryBanner  = document.getElementById('banner-primary');
+    const naturalPane    = document.getElementById('pane-natural');
+    const naturalListing = document.getElementById('listing-natural');
+    const naturalBanner  = document.getElementById('banner-natural');
+
     if (s.all_caught_up) {
-      document.getElementById('listing').innerHTML = '';
+      primaryListing.innerHTML = '';
+      primaryBanner.innerHTML = '';
+      naturalPane.classList.add('hidden');
       setStatus(`history: ${s.history_count}`);
       LAST_CANDIDATE_START = null;
+      LAST_NATURAL_START = null;
       return;
     }
 
-    // If the candidate changed, scroll to the "PROPOSED" header.
-    const newStart = s.candidate.start;
-    const changed = (newStart !== LAST_CANDIDATE_START);
-    if (changed) {
-      renderListing(s.lines);
-      LAST_CANDIDATE_START = newStart;
+    const overrideActive = !!s.override_active && !!s.natural_view;
+    const primStart = s.candidate.start;
+    const natStart  = overrideActive ? s.natural_view.candidate.start : null;
+    const primChanged = (primStart !== LAST_CANDIDATE_START);
+    const natChanged  = (natStart  !== LAST_NATURAL_START);
+
+    // Banners are cheap to rebuild — refresh every poll so banner pills
+    // stay current even when listings haven't been re-rendered.
+    renderCandidateBanner(primaryBanner, s.candidate, s.previous,
+                          overrideActive ? 'AI OVERRIDE' : '');
+    if (overrideActive) {
+      renderCandidateBanner(naturalBanner, s.natural_view.candidate,
+                            s.natural_view.previous, 'ORACLE NATURAL');
+    }
+
+    // Listings: only re-render when primary or natural candidate changed,
+    // OR when the attn list changed (re-rendering destroys + redraws
+    // SVG arcs so we avoid it on every poll).
+    const attnSet = new Set(s.attn || []);
+    const attnKey = Array.from(attnSet).sort().join(',');
+    const attnChanged = (attnKey !== LAST_ATTN_KEY);
+    LAST_ATTN_KEY = attnKey;
+    if (primChanged || natChanged || attnChanged) {
+      if (overrideActive) {
+        // Diff-align so rows for the same VRAM anchor address sit at the
+        // same Y position across panes.  When a side has a header /
+        // label / instruction the other lacks at that address, a blank
+        // row goes on the missing side.  Works whether the override
+        // tightens OR expands scope.
+        const aligned = alignLines(s.lines, s.natural_view.lines);
+        renderListing(aligned.left,  primaryListing, true,  attnSet);
+        renderListing(aligned.right, naturalListing, false, attnSet);
+      } else {
+        renderListing(s.lines, primaryListing, true, attnSet);
+      }
       requestAnimationFrame(() => {
-        const target = document.querySelector('.section-current-header');
+        const target = primaryListing.querySelector('.section-current-header');
         if (target) target.scrollIntoView({block: 'start', behavior: 'instant'});
       });
     }
 
+    if (overrideActive) {
+      naturalPane.classList.remove('hidden');
+    } else {
+      naturalPane.classList.add('hidden');
+      naturalBanner.innerHTML = '';
+      naturalListing.innerHTML = '';
+    }
+
+    LAST_CANDIDATE_START = primStart;
+    LAST_NATURAL_START   = natStart;
     setStatus(`history: ${s.history_count}`);
   } catch (e) {
     setStatus('connection lost — is the server running?');

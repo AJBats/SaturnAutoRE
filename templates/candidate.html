@@ -10,13 +10,24 @@
   <div id="sticky-top">
     <div id="gap-alert" class="gap-alert hidden"></div>
     <header id="header">
-      <span id="header-content">loading…</span>
+      <span id="progress-content">loading…</span>
     </header>
   </div>
 
   <div class="listing-wrap" id="listing-wrap">
-    <pre class="listing" id="listing"></pre>
-    <svg class="arcs" id="arcs"></svg>
+    <div class="listing-pane primary" id="pane-primary">
+      <div class="pane-banner primary-banner" id="banner-primary"></div>
+      <div class="listing-area">
+        <pre class="listing" id="listing"></pre>
+        <svg class="arcs" id="arcs"></svg>
+      </div>
+    </div>
+    <div class="listing-pane natural hidden" id="pane-natural">
+      <div class="pane-banner natural-banner" id="banner-natural"></div>
+      <div class="listing-area">
+        <pre class="listing" id="listing-natural"></pre>
+      </div>
+    </div>
   </div>
 
   <footer id="footer">

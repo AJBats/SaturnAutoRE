@@ -122,7 +122,14 @@ flow:
   forward-sweep can't find the function naturally, or when oracle's
   proposed boundary is off:
   `{"candidate_start": "0x...", "previous_subseg": {...}}` (optionally
-  `candidate_end`).
+  `candidate_end`). When an override is active the listing splits into
+  two panes: your pinned candidate on the left, oracle's natural
+  proposal on the right.
+- **`attn` in ai_override** — optional list of addresses to draw the
+  human's eye to (e.g. the exact instruction that proves the boundary):
+  `"attn": ["0x0602CC84", "0x0602CD60"]`. Each listed address gets an
+  orange box around the address column and an orange-bold tail on the
+  last 4 hex digits.
 
 ## Rules
 

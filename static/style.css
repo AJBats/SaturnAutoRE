@@ -183,13 +183,91 @@ header#header > #header-content {
 }
 .awaiting-banner.hidden { display: none; }
 
-/* Listing — wrapped in a container so the SVG arc overlay can sit on top of
-   the left edge of the listing (overlapping the address column).  This is
-   fine because flow is what matters, not unobstructed line numbers. */
+/* Listing area — split into two panes when ai_override is active.  The
+   `.primary` pane (left) shows the override candidate; the `.natural`
+   pane (right) shows what oracle would naturally propose without the
+   override, so the human can compare both candidates' banner signals +
+   disassembly byte-for-byte before stamping. */
 .listing-wrap {
-  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
   padding-bottom: 6em;
 }
+.listing-pane {
+  flex: 1;
+  min-width: 0;
+  position: relative;
+  overflow: auto;
+}
+.listing-pane.hidden { display: none; }
+.listing-pane.natural { border-left: 2px solid #555; }
+
+/* Sub-container that holds the listing + the arcs SVG.  Positioning
+   anchor for the absolute-positioned SVG so arcs draw relative to the
+   listing-area (NOT to the pane, which also includes the sticky
+   banner above — that offset would shift arc Y coords by the banner
+   height). */
+.listing-area {
+  position: relative;
+}
+
+/* Diff-style blank row — inserted on the side missing a section
+   header / label / instruction row at a given VRAM anchor address.
+   Same height as a real line; no visible content.  Explicit
+   line-height + nbsp content guarantees the row occupies exactly one
+   line worth of vertical space (matters for diff-alignment math). */
+.line.blank {
+  color: transparent;
+  line-height: 1.35;
+}
+
+/* AI attention highlight — addresses flagged via `ai_override.attn`.
+   Orange box around the address column + bold-orange last-4-hex tail
+   (humans tend to recall addresses by their tail bytes only). */
+.line.attn .a {
+  outline: 1.5px solid #f80;
+  border-radius: 0.15em;
+  padding: 0 0.15em;
+}
+.line.attn .attn-tail {
+  color: #fa6;
+  font-weight: bold;
+}
+.line.attn {
+  background: rgba(255, 140, 0, 0.05);
+}
+.listing-pane .listing {
+  /* prevent overflow from leaking out — each pane scrolls independently */
+}
+
+/* Per-pane banner — full candidate metadata (verdict, reference,
+   evidence, midpoints, flags) for ONE side of the diff. */
+.pane-banner {
+  padding: 0.5em 1em;
+  border-bottom: 1px solid #333;
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 0.8em;
+  flex-wrap: wrap;
+  font-size: 12px;
+}
+.pane-banner.primary-banner { background: #1e251e; }
+.pane-banner.natural-banner { background: #25201e; }
+.pane-banner .pane-label {
+  font-weight: bold;
+  text-transform: uppercase;
+  font-size: 10px;
+  letter-spacing: 0.05em;
+  padding: 0.15em 0.5em;
+  border-radius: 0.2em;
+  color: #fff;
+}
+.pane-banner.primary-banner .pane-label { background: #4a6a4a; }
+.pane-banner.natural-banner .pane-label { background: #6a5a4a; }
 .listing {
   font-family: inherit;
   line-height: 1.35;
@@ -277,14 +355,17 @@ svg.arcs .arc.sticky {
 .line.section-trailing-header {
   display: block;
   text-align: left;
-  padding: 0.6em 0.6em;
-  margin: 0.8em 0 0.2em 0;
+  /* No vertical padding/margin — section headers must occupy exactly
+     one line-height so they align with a single blank row on the other
+     pane when in split-mode diff view.  Visual emphasis comes from
+     background-color + bold + left-border below. */
+  padding: 0 0.6em;
+  margin: 0;
   font-weight: bold;
-  border-radius: 0.2em;
 }
 .line.section-prev-header        { background: rgba(80, 120, 80, 0.20); color: #cfd; border-left: 4px solid #6a6; }
 .line.section-intermediate-header { background: rgba(80, 80, 80, 0.20);  color: #aaa; border-left: 4px solid #777; }
-.line.section-current-header     { background: rgba(60, 100, 180, 0.25); color: #cdf; border-left: 4px solid #69c; font-size: 14px; }
+.line.section-current-header     { background: rgba(60, 100, 180, 0.25); color: #cdf; border-left: 4px solid #69c; }
 .line.section-trailing-header    { background: rgba(80, 80, 80, 0.20);  color: #aaa; border-left: 4px solid #777; }
 
 /* Section content dimming */
