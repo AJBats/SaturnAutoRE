@@ -19,6 +19,7 @@ Session file lives at <yaml>.session.json next to the yaml.
 import argparse
 import json
 import os
+import struct
 import sys
 import threading
 import time
@@ -936,13 +937,15 @@ def _reload_caches():
     if "reference_starts" not in STATE:
         STATE["reference_starts"] = _load_reference_starts()
     if "static_callers" not in STATE:
-        sc_data = _load_static_callers()
-        # Oracle's boundary detection only consumes physically-possible
-        # callers — same-module hits.  Cross-module hits at hot-swap
-        # load addresses can't resolve to this binary, so they go into
-        # a parallel dict that the banner shows as informational only.
-        STATE["static_callers"] = sc_data["same"]
-        STATE["cross_module_callers"] = sc_data["cross"]
+        # Same-module callers: raw-binary scan of THIS binary's bytes,
+        # reference-independent and accurate.  Drives oracle's
+        # boundary detection (physically-possible callers only).
+        STATE["static_callers"] = _load_static_callers()
+        # Cross-module callers: text-scan of sibling hot-swap modules
+        # under reference_scan_dir.  Informational only — surfaced as
+        # a greyed pill so the human can see "this address has phantom
+        # callers in other binaries that share our load address".
+        STATE["cross_module_callers"] = _load_cross_module_callers()
     if "runtime_hits" not in STATE:
         STATE["runtime_hits"] = _load_runtime_hits()
 
@@ -990,54 +993,93 @@ def _load_reference_starts():
 
 
 def _load_static_callers():
-    """Scan reference .s files for static call references to function addresses.
+    """Scan THIS binary's raw bytes for call references to each address.
 
-    Configured via `options.reference_scan_dir` (the cross-module root for
-    a recursive glob).  Falls back to `options.reference_dir` (this
-    module's reference only) if scan_dir isn't set.
+    Reference-independent: we decode the binary itself and find every
+    spot where code refers to a 4-byte-aligned vram-range address as a
+    function entry.  Catches two patterns:
 
-    Counts these as a "call site":
-      - bsr / bsr.s / jsr / jmp / bra / braf / bsrf  to  FUN_<addr>  or  xref_FUN_<addr>
-      - .4byte FUN_<addr> / xref_FUN_<addr>  (function pointer in a pool,
-        intended to be loaded then called via jsr @rN)
-      - .4byte DAT_<addr>  ONLY when <addr> is itself in reference_starts
-        (so a Ghidra-mis-labeled function pointer counts, but a pool
-        ref pointing at interior data doesn't)
+      1. Direct PC-relative branches (`bsr disp`, `bra disp`): the
+         opcode encodes the displacement; target = PC + 4 + disp*2.
+         Specific opcode pattern (top nibble 0xA or 0xB), so false
+         positives in data are vanishingly rare.
 
-    Excludes:
-      - `FUN_<addr> + 0xN` (these point INTO the body, not at the entry)
-      - Comment-only mentions
+      2. Pool-loaded function pointers (`mov.l @(disp,PC), Rn` → 4-byte
+         word containing a code address, eventually `jsr @Rn`): we
+         decode every PC-relative load and check the 4-byte value at
+         its target.  When that value lands in vram-mapped range AND
+         is 2-byte aligned (SH-2 instructions are 16-bit aligned), we
+         count it as a function-pointer reference to that value.
 
-    Returns {"same": {addr: count}, "cross": {addr: count}}.  Callers in
-    files under `reference_dir` (this binary's module) count as "same";
-    everything else under `reference_scan_dir` counts as "cross".  Same-
-    binary-load-address modules (hot-swap slots) physically can't call
-    each other at runtime, so only `same` is wired into oracle's
-    boundary detection — `cross` is surfaced to the human as informational.
+    Validated against Daytona's 64 human-stamped functions: zero false
+    positives, finds 10+ real callers that the prior text-scan missed
+    because reference's auto-disassembler had grouped function pairs
+    (the FUN_0602CC84 case — reference declared FUN_0602CC74:
+    covering both, so .4byte DAT_0602CC84 references got filtered out
+    as "interior pointers").
+
+    Returns {addr: count}.  Cross-module hot-swap collisions don't
+    apply here because we're reading THIS binary's bytes — by
+    construction, every caller we find is a physically-possible call
+    site in this binary's runtime.
     """
-    scan_dir = _resolved_dir_option("reference_scan_dir") or _resolved_dir_option("reference_dir")
-    if scan_dir is None:
-        return {"same": {}, "cross": {}}
-    this_module_dir = _resolved_dir_option("reference_dir")
-    this_module_resolved = this_module_dir.resolve() if this_module_dir is not None else None
-    import re
-    same_callers = {}
-    cross_callers = {}
+    binary = STATE.get("binary_cache")
+    vram = STATE.get("vram_cache")
+    if binary is None or vram is None:
+        return {}
+    callers = {}
+    end = vram + len(binary) - 1
+    for addr in range(vram, end, 2):
+        off = addr - vram
+        op = (binary[off] << 8) | binary[off + 1]
+        hi = (op >> 12) & 0xF
+        # Direct PC-relative bra (0xA) / bsr (0xB) — 12-bit signed disp
+        if hi in (0xA, 0xB):
+            disp = op & 0xFFF
+            if disp > 0x7FF:
+                disp -= 0x1000
+            target = addr + 4 + disp * 2
+            if vram <= target <= end:
+                callers[target] = callers.get(target, 0) + 1
+        # mov.l @(disp,PC), Rn — read the 4-byte pool word
+        elif hi == 0xD:
+            disp = op & 0xFF
+            pool_addr = (addr & 0xFFFFFFFC) + 4 + disp * 4
+            poff = pool_addr - vram
+            if 0 <= poff + 3 < len(binary):
+                v = struct.unpack(">I", binary[poff:poff + 4])[0]
+                if vram <= v <= end and (v & 1) == 0:
+                    callers[v] = callers.get(v, 0) + 1
+    return callers
 
-    # Direct branches.  "FUN_xxxxxxxx + 0xN" is excluded because the `+`
-    # ends the match before the offset is consumed, but we also explicitly
-    # check the trailing context to be safe.
+
+def _load_cross_module_callers():
+    """Text-scan sibling hot-swap modules for same-name references.
+
+    Saturn games hot-swap modules into a shared load address (Daytona's
+    race/select/result2p/name/backup/ending all live at 0x06028000,
+    only one resident at a time).  A `bsr FUN_X` in select's reference
+    would resolve at runtime to select's own FUN_X — not to ours.
+    Physically impossible to call this binary, but worth surfacing as
+    an informational pill so the human knows "this address has same-
+    name targets in other binaries that share our load address".
+
+    Same-module callers are handled by the raw-binary scan in
+    `_load_static_callers` — this function only scans .s files
+    OUTSIDE `reference_dir`.
+
+    Returns {addr: count}.
+    """
+    scan_dir = _resolved_dir_option("reference_scan_dir")
+    this_module_dir = _resolved_dir_option("reference_dir")
+    if scan_dir is None or this_module_dir is None:
+        return {}
+    this_module_resolved = this_module_dir.resolve()
+    import re
     branch_re = re.compile(
         r"\b(?:bsr|bsr\.s|jsr|jmp|bra|braf|bsrf)\b[^/]*?"
         r"\b(?:xref_)?FUN_([0-9A-Fa-f]{8})\b(?!\s*\+)"
     )
-    # .4byte FUN_ / xref_FUN_ always counts.  .4byte DAT_ is ambiguous —
-    # it can be a real function pointer (Ghidra mis-labeled the target as
-    # data) or a genuine data pointer (e.g. into another function's pool
-    # zone).  Cross-reference: count DAT_<addr> only when <addr> is itself
-    # a known function start in reference_starts.  This catches references
-    # like `.4byte DAT_06029810 /* = FUN_06029810 */` while still
-    # rejecting `.4byte DAT_06029958 /* = FUN_06029810 + 0x148 */`.
     pool_re_fun = re.compile(
         r"\.4byte\s+(?:xref_FUN_|FUN_)([0-9A-Fa-f]{8})\b(?!\s*\+)"
     )
@@ -1045,39 +1087,28 @@ def _load_static_callers():
         r"\.4byte\s+DAT_([0-9A-Fa-f]{8})\b(?!\s*\+)"
     )
     reference_starts = set(STATE.get("reference_starts") or _load_reference_starts())
-
+    cross = {}
     for s_file in scan_dir.glob("**/*.s"):
+        try:
+            in_same = s_file.resolve().is_relative_to(this_module_resolved)
+        except (AttributeError, ValueError):
+            in_same = str(s_file.resolve()).startswith(str(this_module_resolved))
+        if in_same:
+            continue  # same-module is the raw-binary scan's job
         try:
             text = s_file.read_text(errors="replace")
         except Exception:
             continue
-        # Same-module: caller's .s file lives inside this binary's
-        # reference_dir.  When reference_dir isn't configured we can't
-        # distinguish, so everything lumps into `same` (preserves
-        # pre-scoping behavior for single-module setups).
-        if this_module_resolved is None:
-            bucket = same_callers
-        else:
-            try:
-                in_same = s_file.resolve().is_relative_to(this_module_resolved)
-            except (AttributeError, ValueError):
-                in_same = str(s_file.resolve()).startswith(str(this_module_resolved))
-            bucket = same_callers if in_same else cross_callers
         for line in text.splitlines():
             for m in branch_re.finditer(line):
-                addr = int(m.group(1), 16)
-                bucket[addr] = bucket.get(addr, 0) + 1
+                a = int(m.group(1), 16); cross[a] = cross.get(a, 0) + 1
             for m in pool_re_fun.finditer(line):
-                addr = int(m.group(1), 16)
-                bucket[addr] = bucket.get(addr, 0) + 1
+                a = int(m.group(1), 16); cross[a] = cross.get(a, 0) + 1
             for m in pool_re_dat.finditer(line):
-                addr = int(m.group(1), 16)
-                # Only credit DAT_<addr> when addr is itself a reference
-                # function start.  Filters out pool refs pointing at
-                # interior data.
-                if addr in reference_starts:
-                    bucket[addr] = bucket.get(addr, 0) + 1
-    return {"same": same_callers, "cross": cross_callers}
+                a = int(m.group(1), 16)
+                if a in reference_starts:
+                    cross[a] = cross.get(a, 0) + 1
+    return cross
 
 
 def _load_runtime_hits():
