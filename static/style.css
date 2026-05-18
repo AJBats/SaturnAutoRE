@@ -285,6 +285,53 @@ header#header > #header-content {
 .tag.tag-ref-end {
   color: #e8a;
 }
+
+/* Pin-zone: small `+` button in the leftmost margin of each addressed
+   row.  Hidden by default, fades in on row hover.  Click → POST
+   /pin-end with the row's address so the server sets the current
+   candidate's `candidate_end` to `addr - 1` (= "the next function
+   starts here, end this one at the byte before").  Reserves a fixed
+   1.2em slot so addresses don't shift sideways when the button
+   appears. */
+.pin-zone {
+  display: inline-block;
+  width: 1.2em;
+  text-align: center;
+  color: #6c6;
+  cursor: pointer;
+  opacity: 0;
+  user-select: none;
+  font-weight: bold;
+  transition: opacity 0.08s, background 0.08s;
+}
+.line:hover .pin-zone { opacity: 0.5; }
+.pin-zone:hover {
+  opacity: 1 !important;
+  background: rgba(108, 195, 108, 0.25);
+  border-radius: 0.15em;
+}
+
+/* Unpin button inside the trailing-zone section header on the primary
+   pane.  Only rendered when an ai_override is active.  Reusing the
+   pin-zone's green palette so the pair (+ to pin, [ unpin ] to clear)
+   is visually linked.  Button isn't subtle — a click here is a real
+   action that reverts to oracle's natural take. */
+.unpin-btn {
+  margin-right: 0.8em;
+  background: transparent;
+  color: #c66;
+  border: 1px solid #844;
+  padding: 0 0.5em;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  border-radius: 0.2em;
+}
+.unpin-btn:hover {
+  background: #5a2020;
+  border-color: #c88;
+  color: #fee;
+}
 .listing-pane .listing {
   /* prevent overflow from leaking out — each pane scrolls independently */
 }

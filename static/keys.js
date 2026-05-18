@@ -224,7 +224,7 @@ function alignLines(leftLines, rightLines) {
 // which is row-aligned).  Red highlight + "ref: next FUN" tag — same
 // red palette as the `reference: disagrees` banner pill so the two
 // cues are visually linked.
-function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet) {
+function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet, showUnpin) {
   if (!lines || !lines.length) {
     target.textContent = '';
     if (isPrimary) CURRENT_BRANCHES = [];
@@ -245,7 +245,16 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
     if (isMid)    cls += ' midpoint';
     if (isRefEnd) cls += ' ref-end';
     if (line.kind === 'section') {
-      return `<span class="line ${cls}">${escapeHtml(line.label || '')}</span>`;
+      // On the primary pane's trailing-zone section header, surface an
+      // [ unpin ] button when an ai_override is active.  Renders to the
+      // LEFT of the section label so it stays visible even when the
+      // pane is narrower than the label text (horizontal scroll would
+      // otherwise hide a right-anchored button).
+      const isTrailingHeader = cls.indexOf('section-trailing-header') !== -1;
+      const unpinBtn = (showUnpin && isTrailingHeader)
+        ? `<button class="unpin-btn" title="clear the active ai_override (revert to oracle's natural candidate)">[ unpin ]</button>`
+        : '';
+      return `<span class="line ${cls}">${unpinBtn}${escapeHtml(line.label || '')}</span>`;
     }
     const indent = (line.indent || 0);
     const indentSpan = indent > 0
@@ -272,7 +281,10 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
       addrHtml = escapeHtml(addrStr);
     }
     if (line.kind === 'label') {
-      return `<span class="line ${cls}" data-addr="${line.addr || ''}"><span class="margin"> </span>${indentSpan}<span class="lbl">${escapeHtml(line.label)}</span></span>`;
+      const labelPinPart = line.addr
+        ? `<span class="pin-zone" title="pin current candidate's end at the byte before this address">+</span>`
+        : `<span class="pin-zone"></span>`;
+      return `<span class="line ${cls}" data-addr="${line.addr || ''}">${labelPinPart}<span class="margin"> </span>${indentSpan}<span class="lbl">${escapeHtml(line.label)}</span></span>`;
     }
     const margin = line.margin || ' ';
     const labelPart = line.label
@@ -296,7 +308,14 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
         direction: line.branch.direction,
       });
     }
-    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-indent="${indent}"><span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
+    // Pin-zone: small `+` that appears in the leftmost margin on row
+    // hover.  Click → POST /pin-end with this row's addr, telling the
+    // server "the next function starts here" → current candidate's
+    // end pins to `addr - 1`.  Only on rows with a real addr.
+    const pinPart = line.addr
+      ? `<span class="pin-zone" title="pin current candidate's end at the byte before this address">+</span>`
+      : `<span class="pin-zone"></span>`;
+    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
   }).join('\n');
   target.innerHTML = html;
   if (isPrimary) {
@@ -583,10 +602,10 @@ async function fetchState() {
         // row goes on the missing side.  Works whether the override
         // tightens OR expands scope.
         const aligned = alignLines(s.lines, s.natural_view.lines);
-        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet, primRefEndSet);
-        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet,  natRefEndSet);
+        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet, primRefEndSet, overrideActive);
+        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet,  natRefEndSet, false);
       } else {
-        renderListing(s.lines, primaryListing, true, attnSet, primMidSet, primRefEndSet);
+        renderListing(s.lines, primaryListing, true, attnSet, primMidSet, primRefEndSet, overrideActive);
       }
       requestAnimationFrame(() => {
         // Scroll the current candidate's section header into view, but
@@ -652,6 +671,45 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-approve').addEventListener('click', () => submitVerdict('approved'));
   document.getElementById('btn-reject').addEventListener('click',  () => submitVerdict('rejected'));
   document.getElementById('btn-unsure').addEventListener('click',  () => submitVerdict('unsure'));
+
+  // Pin-zone clicks: + button in any line's leftmost margin → POST
+  // /pin-end with that row's addr.  Server sets the current
+  // candidate's `candidate_end` to addr-1 (= "the next function
+  // starts here, so we end at the byte before").
+  // Unpin clicks: [ unpin ] button in the primary pane's trailing-zone
+  // header → POST /unpin-end to clear the active ai_override entirely.
+  // Both handlers delegate from the same listing-wrap listener.
+  document.getElementById('listing-wrap').addEventListener('click', async (e) => {
+    const unpin = e.target.closest('.unpin-btn');
+    if (unpin) {
+      const r = await fetch('/unpin-end', {method: 'POST'});
+      const data = await r.json();
+      if (!data.ok) {
+        setStatus('unpin failed: ' + (data.error || 'unknown'));
+        return;
+      }
+      fetchState();
+      return;
+    }
+    const btn = e.target.closest('.pin-zone');
+    if (!btn) return;
+    const line = btn.closest('.line[data-addr]');
+    if (!line) return;
+    const addr = parseInt(line.dataset.addr, 10);
+    if (Number.isNaN(addr) || addr <= 0) return;
+    const hex = '0x' + addr.toString(16).toUpperCase().padStart(8, '0');
+    const r = await fetch('/pin-end', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({next_start: hex}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setStatus('pin-end failed: ' + (data.error || 'unknown'));
+      return;
+    }
+    fetchState();
+  });
 
   // "review FUN_X" button inside the gap alert → POST /unstamp for the
   // preceding subseg so the human can re-review it with current oracle

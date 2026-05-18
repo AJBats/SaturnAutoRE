@@ -1751,6 +1751,87 @@ def _build_candidate_payload(prev, ev):
     }
 
 
+@app.route("/pin-end", methods=["POST"])
+def pin_end():
+    """Pin the current candidate's end to the byte BEFORE the given
+    next-function-start address.
+
+    Body JSON: {"next_start": "0x0602F072"}
+
+    Semantically: the human spotted that the next function starts at
+    `next_start`, which means the current candidate must end at
+    `next_start - 1`.  Updates (or creates) the active ai_override with
+    `candidate_end = next_start - 1`, preserving the current
+    candidate's start, previous_subseg, and any existing attn list.
+
+    Click `+` button in the listing margin posts this — turns a
+    boundary fix into a single click.
+    """
+    data = request.get_json(force=True)
+    raw = data.get("next_start")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'next_start'"}), 400
+    try:
+        next_start = _coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+
+    with LOCK:
+        _reload_caches()
+        nxt = _compute_current()
+        if nxt is None:
+            return jsonify({"ok": False, "error": "no current candidate"}), 400
+        prev, ev = nxt
+
+        new_end = next_start - 1
+        if new_end <= ev.start:
+            return jsonify({
+                "ok": False,
+                "error": f"next_start 0x{next_start:08X} must be after candidate start 0x{ev.start:08X}",
+            }), 400
+        # Reject if next_start lands inside an already-verified subseg.
+        cfg = STATE["cfg_cache"]
+        for s in (cfg.get("subsegments") or []):
+            if s.get("type") != "code":
+                continue
+            if s["start"] <= next_start <= s["end"]:
+                return jsonify({
+                    "ok": False,
+                    "error": f"next_start 0x{next_start:08X} is inside verified subseg FUN_{s['start']:08X}",
+                }), 400
+
+        session = load_session()
+        override = dict(session.get("ai_override") or {})
+        override["candidate_start"] = f"0x{ev.start:08X}"
+        override["candidate_end"] = f"0x{new_end:08X}"
+        if "previous_subseg" not in override and prev:
+            override["previous_subseg"] = prev
+        session["ai_override"] = override
+        save_session(session)
+    return jsonify({"ok": True, "candidate_end": f"0x{new_end:08X}"})
+
+
+@app.route("/unpin-end", methods=["POST"])
+def unpin_end():
+    """Clear the active ai_override entirely — counterpart to /pin-end.
+
+    Removes session.ai_override.  Next /state poll will show oracle's
+    natural candidate.  Triggered by the `[ unpin ]` button in the
+    primary pane's trailing-zone header.
+
+    Clears the WHOLE override (not just candidate_end) because the
+    pin-end workflow always sets candidate_start to the current
+    ev.start — so removing candidate_end while leaving candidate_start
+    pinned would be a no-op anyway.
+    """
+    with LOCK:
+        session = load_session()
+        had_override = bool(session.get("ai_override"))
+        session["ai_override"] = None
+        save_session(session)
+    return jsonify({"ok": True, "had_override": had_override})
+
+
 @app.route("/unstamp", methods=["POST"])
 def unstamp():
     """Re-dirty a previously verified subseg so forward-sweep proposes it again.
