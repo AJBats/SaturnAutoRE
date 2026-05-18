@@ -567,6 +567,77 @@ def _compute_indent_depths(ev):
     return addr_depths
 
 
+def _resolve_indirect_target(addr, mnem, ev):
+    """For jmp/jsr/bsrf/braf @rN, find the most recent `mov.l @(disp,PC),
+    rN` that loaded that register, and read the 4-byte pool word it
+    targets — that's the actual runtime branch target.
+
+    GCC almost always emits the load 1–4 instructions before the
+    indirect branch (load pool, jump-to-Rn pattern).  We walk backward
+    in the function's reachable set, stopping at the first instruction
+    that either:
+      - loads the target register from a PC-relative pool (success), OR
+      - writes the target register some other way (gives up — we
+        can't determine the value statically).
+
+    Returns the resolved target address, or None if not resolvable.
+    """
+    parts = mnem.split()
+    if len(parts) < 2:
+        return None
+    operand = parts[1].lstrip("@").rstrip(",")
+    if not operand.startswith("r") or not operand[1:].isdigit():
+        return None
+    reg = operand
+    binary = STATE["binary_cache"]
+    vram = STATE["vram_cache"]
+    reachable = ev.reachable
+    cur = addr - 2
+    # Walk backward up to 16 instructions — well past GCC's typical
+    # 1–4 instruction gap between load and indirect branch.
+    for _ in range(16):
+        if cur < ev.start or cur not in reachable:
+            break
+        off = cur - vram
+        if off + 1 >= len(binary):
+            break
+        op = (binary[off] << 8) | binary[off + 1]
+        m, tgt = decode_sh2(op, cur)
+        if m is None:
+            cur -= 2
+            continue
+        # Word-boundary match for `..., rN` as the destination — bare
+        # substring would treat `r1` as a prefix of `r15`, etc.
+        def _ends_with_reg(s, r):
+            tail = f", {r}"
+            idx = s.rfind(tail)
+            if idx < 0:
+                return False
+            nxt = s[idx + len(tail) : idx + len(tail) + 1]
+            return nxt == "" or not nxt.isdigit()
+
+        # mov.l @(0x..., PC), rN — the load we're looking for
+        if m.startswith("mov.l @(0x") and _ends_with_reg(m, reg) and tgt is not None:
+            poff = tgt - vram
+            if 0 <= poff + 3 < len(binary):
+                v = (binary[poff] << 24) | (binary[poff+1] << 16) | (binary[poff+2] << 8) | binary[poff+3]
+                return v
+            return None
+        # Any other write to rN — stop, value unknowable statically
+        # (covers: mov.l @rX, rN ; mov rX, rN ; mov #imm, rN ; etc.)
+        # Store-to-mem forms (`mov.l rN, @...`) have rN as source, not
+        # destination — skip those.  Cmp/tst don't modify their second
+        # operand either.
+        if (_ends_with_reg(m, reg)
+                and not m.startswith(("cmp", "tst",
+                                      f"mov.l {reg},",
+                                      f"mov.w {reg},",
+                                      f"mov.b {reg},"))):
+            return None
+        cur -= 2
+    return None
+
+
 def _branch_meta(b):
     """Build the per-line branch payload the front-end uses to draw arcs.
     Returns None when there's no internal-with-target branch at this address.
@@ -731,6 +802,27 @@ def _emit_function_lines(lines, ev, section):
             line["classes"].append("uncond-indirect")
             if not line.get("tag"):
                 line["tag"] = "⇒ exits"
+
+        # Resolve indirect-branch targets via the preceding pool load.
+        # GCC's load-then-jump pattern means we can usually determine
+        # statically what address `jmp @rN` / `jsr @rN` jumps to.
+        # Surface that resolution inline (FUN_<addr> when target is a
+        # verified subseg start, else raw 0x<addr>) as a confidence
+        # booster — confirms the indirect branch isn't doing anything
+        # surprising.
+        if head in ("jmp", "braf", "jsr", "bsrf"):
+            resolved = _resolve_indirect_target(addr, mnem, ev)
+            if resolved is not None:
+                cfg = STATE.get("cfg_cache") or {}
+                verified_starts = {s["start"] for s in (cfg.get("subsegments") or [])
+                                   if s.get("type") == "code"}
+                if resolved in verified_starts:
+                    sym = f"FUN_{resolved:08X}"
+                else:
+                    sym = f"0x{resolved:08X}"
+                # Append to mnem so it renders inline with the
+                # instruction (no separate column).
+                line["mnem"] = f"{mnem}   ⇒ {sym}"
 
         # Direct unconditional jumps with INTERNAL target — also "control gone"
         # but staying in the function. Quieter tag.
