@@ -562,6 +562,23 @@ def _compute_indent_depths(ev):
     return addr_depths
 
 
+def _branch_meta(b):
+    """Build the per-line branch payload the front-end uses to draw arcs.
+    Returns None when there's no internal-with-target branch at this address.
+    Shared by instruction emit AND pool emit — when the reference encodes a
+    real branch as `.4byte 0xXXXXXXXX` (auto-disassembler mistake), oracle's
+    decoder still recognizes the branch and we still want the arc drawn.
+    """
+    if b is None or b.target is None or not b.internal:
+        return None
+    arc_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
+    return {
+        "target": b.target,
+        "type": arc_type,
+        "direction": "forward" if b.target > b.src else "backward",
+    }
+
+
 def _emit_function_lines(lines, ev, section):
     """Emit a full function listing with symbolized labels.
     `section` is one of 'prev', 'current', and controls highlighting prominence.
@@ -599,6 +616,9 @@ def _emit_function_lines(lines, ev, section):
             line["mnem"] = f".4byte 0x{v:08X}"
             line["classes"].append("pool")
             line["indent"] = 0   # pool data doesn't participate in control-flow indentation
+            meta = _branch_meta(branches_at.get(addr))
+            if meta:
+                line["branch"] = meta
             lines.append(line)
             addr += 4
             continue
@@ -611,6 +631,9 @@ def _emit_function_lines(lines, ev, section):
             line["mnem"] = f".2byte 0x{v:04X}"
             line["classes"].append("pool")
             line["indent"] = 0
+            meta = _branch_meta(branches_at.get(addr))
+            if meta:
+                line["branch"] = meta
             lines.append(line)
             addr += 2
             continue
@@ -670,14 +693,9 @@ def _emit_function_lines(lines, ev, section):
         head = mnem.split()[0] if mnem else ""
         b = branches_at.get(addr)
 
-        # Expose internal branch info so the front-end can draw arcs.
-        if b is not None and b.target is not None and b.internal:
-            arc_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
-            line["branch"] = {
-                "target": b.target,
-                "type": arc_type,
-                "direction": "forward" if b.target > b.src else "backward",
-            }
+        meta = _branch_meta(b)
+        if meta:
+            line["branch"] = meta
 
         # Direct-target branches: arrow shows direction in margin.
         if b is not None and b.target is not None:
