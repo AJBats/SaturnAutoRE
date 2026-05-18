@@ -18,6 +18,7 @@ Session file lives at <yaml>.session.json next to the yaml.
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -821,13 +822,27 @@ def _compute_current():
     override = session.get("ai_override")
     if override:
         prev = override.get("previous_subseg")
-        start = int(override["candidate_start"], 16) if isinstance(override["candidate_start"], str) else override["candidate_start"]
+        start = _coerce_addr(override["candidate_start"])
         tu = next((t for t in cfg.get("tus", []) if t["start"] <= start <= t["end"]), None)
         hint_end = tu["end"] if tu else None
         ev = analyze_candidate(binary, STATE["vram_cache"], start, hint_end, pool_priors=pool_priors)
+        # AI may also pin the END explicitly (one-off boundary correction
+        # the oracle's heuristics can't reach).  Apply after analyze_candidate
+        # so pool/CFG/epilogue analysis still runs against the natural code
+        # end; only the displayed/written boundary is moved.
+        end_override = override.get("candidate_end")
+        if end_override is not None:
+            ev.end = _coerce_addr(end_override)
         return prev, ev
 
     return find_next_forward_sweep_candidate(cfg, binary, pool_priors=pool_priors)
+
+
+def _coerce_addr(v):
+    """Accept either '0x06029E8F' / '06029E8F' (hex string) or 100833423 (int)."""
+    if isinstance(v, str):
+        return int(v, 16)
+    return int(v)
 
 
 def _reload_caches():
@@ -1309,18 +1324,29 @@ def main():
     _reload_caches()
 
     url = f"http://localhost:{args.port}"
-    print()
-    print(f"  Yaml:         {yaml_path}")
-    print(f"  Project root: {project_root}")
-    print(f"  Session:      {STATE['session_path']}")
-    print(f"  Opening {url} in your browser …")
-    print(f"  Press Ctrl+C in this terminal to stop the server.")
-    print()
 
-    threading.Timer(0.8, lambda: webbrowser.open(url)).start()
+    # When use_reloader=True, Flask spawns a child process where the actual
+    # app runs.  WERKZEUG_RUN_MAIN is set in the child.  We only want to:
+    #   - print the banner & open the browser tab ONCE, on the parent's
+    #     initial launch (NOT on every code-reload restart)
+    #   - load caches in the child (so they survive across reloads)
+    is_reloader_child = bool(os.environ.get("WERKZEUG_RUN_MAIN"))
+
+    if not is_reloader_child:
+        print()
+        print(f"  Yaml:         {yaml_path}")
+        print(f"  Project root: {project_root}")
+        print(f"  Session:      {STATE['session_path']}")
+        print(f"  Opening {url} in your browser …")
+        print(f"  Auto-reload enabled — saved .py changes will restart the")
+        print(f"  server in place; the browser tab will pick up the new")
+        print(f"  code on its next /state poll (~1s).")
+        print(f"  Press Ctrl+C in this terminal to stop the server.")
+        print()
+        threading.Timer(0.8, lambda: webbrowser.open(url)).start()
 
     try:
-        app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=False)
+        app.run(host="127.0.0.1", port=args.port, debug=False, use_reloader=True)
     except OSError as e:
         if "address" in str(e).lower() or "10048" in str(e) or "98" in str(e):
             print(f"\n  ERROR: port {args.port} already in use.")

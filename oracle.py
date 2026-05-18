@@ -426,34 +426,58 @@ def _extend_through_trailing_pools(end, binary, vram, hint_end, pool_priors):
     binary_end = vram + len(binary) - 1
     cap = min(hint_end if hint_end is not None else binary_end, binary_end)
     addr = end + 1
+
+    def _is_padding_pair(off):
+        """A 2-byte slot that's clearly compiler-emitted alignment fill:
+        either zero (0x0000) or an SH-2 nop opcode (0x0009)."""
+        if off + 1 >= len(binary):
+            return False
+        b0, b1 = binary[off], binary[off + 1]
+        return (b0, b1) == (0x00, 0x00) or (b0, b1) == (0x00, 0x09)
+
     while addr <= cap:
         size = pool_priors.get(addr)
-        if size is None:
-            # No prior at this address.  Pool tables are 4-byte aligned, so
-            # 2 bytes of zero padding between the last code byte and the
-            # first .4byte entry is normal.  Peek ahead through 2- and
-            # 4-byte zero gaps to see if we can bridge to the next prior.
-            bridged = None
-            for pad in (2, 4):
-                check = addr + pad
-                if check > cap or pool_priors.get(check) is None:
-                    continue
-                off = addr - vram
-                if off + pad > len(binary):
-                    continue
-                if all(binary[off + i] == 0 for i in range(pad)):
-                    bridged = check
-                    break
-            if bridged is None:
+        if size is not None:
+            new_end = addr + size - 1
+            if new_end > cap:
                 break
-            end = bridged - 1   # the padding bytes are part of this fn
+            end = new_end
+            addr = new_end + 1
+            continue
+
+        # Not in priors. Two extension cases:
+        #
+        # (a) Pool-bridge: 2 or 4 bytes of zero alignment immediately before
+        #     the next pool entry.  Pool tables are 4-byte aligned so this
+        #     gap is common when the code zone ends at a 2-byte boundary.
+        #
+        # (b) Trailing alignment padding: 2 bytes of zero (0x00 0x00) or
+        #     SH-2 nop (0x00 0x09) emitted before the next function starts
+        #     at a 4-byte boundary.  GCC uses this whenever the function's
+        #     last code byte lands on an odd 4-byte boundary.
+        bridged = None
+        for pad in (2, 4):
+            check = addr + pad
+            if check > cap or pool_priors.get(check) is None:
+                continue
+            off = addr - vram
+            if off + pad > len(binary):
+                continue
+            if all(binary[off + i] == 0 for i in range(pad)):
+                bridged = check
+                break
+        if bridged is not None:
+            end = bridged - 1
             addr = bridged
             continue
-        new_end = addr + size - 1
-        if new_end > cap:
-            break
-        end = new_end
-        addr = new_end + 1
+
+        off = addr - vram
+        if _is_padding_pair(off):
+            end = addr + 1
+            addr += 2
+            continue
+
+        break
     return end
 
 
