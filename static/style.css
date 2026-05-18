@@ -147,6 +147,15 @@ header#header > #header-content {
 }
 .evidence-pill.has  { background: #2a4a3a; color: #adc; }
 .evidence-pill.none { background: #333;    color: #999; }
+/* Cross-module: physically impossible callers from hot-swap siblings —
+   surfaced for context (worth knowing they exist), greyed so the eye
+   doesn't read them as supporting evidence. */
+.evidence-pill.cross-module {
+  background: #2a2a2a;
+  color: #888;
+  border: 1px dashed #555;
+  font-style: italic;
+}
 
 /* Midpoint warnings — reference thinks there's a function start inside our
    proposed range.  Loud orange = no supporting evidence (likely Ghidra

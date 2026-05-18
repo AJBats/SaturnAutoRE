@@ -45,9 +45,20 @@ function evidenceHtml(e) {
   const scCls = e.static_callers > 0 ? 'has' : 'none';
   const rhCls = e.runtime_hits   > 0 ? 'has' : 'none';
   parts.push(
-    `<span class="evidence-pill ${scCls}" title="static call references found in reference .s files">`
+    `<span class="evidence-pill ${scCls}" title="static call references found in this binary's reference (physically-possible callers)">`
     + `${e.static_callers} static caller${e.static_callers === 1 ? '' : 's'}</span>`
   );
+  // Cross-module callers: same-name bsr/jsr/etc. from sibling modules
+  // that share this binary's load address (hot-swap slots).  They're
+  // physically impossible at runtime — surfaced but greyed out so the
+  // eye sees them without weighting the boundary call.
+  if (e.cross_module_callers > 0) {
+    parts.push(
+      `<span class="evidence-pill cross-module" `
+      + `title="same-name references in sibling hot-swap modules — cannot resolve to this binary at runtime">`
+      + `${e.cross_module_callers} cross-module</span>`
+    );
+  }
   parts.push(
     `<span class="evidence-pill ${rhCls}" title="breakpoint hits across all probe runs">`
     + `${e.runtime_hits} runtime hit${e.runtime_hits === 1 ? '' : 's'}</span>`
@@ -56,14 +67,16 @@ function evidenceHtml(e) {
   for (const mp of e.midpoints || []) {
     const mpSc = mp.static_callers;
     const mpRh = mp.runtime_hits;
+    const mpCm = mp.cross_module_callers || 0;
     // Loud if reference claims a midpoint but evidence is weak.  Quiet
     // (informational) if both signals back the split.
     const supported = (mpSc > 0 || mpRh > 0);
+    const cmTail = mpCm > 0 ? `, ${mpCm} cross-module` : '';
     parts.push(
       `<span class="midpoint-warning ${supported ? 'supported' : 'suspect'}" `
       + `title="reference proposes FUN_${mp.addr_hex} as a separate function inside our proposed range">`
       + `reference midpoint @ FUN_${mp.addr_hex} `
-      + `(${mpSc} static, ${mpRh} runtime)</span>`
+      + `(${mpSc} static, ${mpRh} runtime${cmTail})</span>`
     );
   }
   return parts.join('');

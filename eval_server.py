@@ -931,7 +931,13 @@ def _reload_caches():
     if "reference_starts" not in STATE:
         STATE["reference_starts"] = _load_reference_starts()
     if "static_callers" not in STATE:
-        STATE["static_callers"] = _load_static_callers()
+        sc_data = _load_static_callers()
+        # Oracle's boundary detection only consumes physically-possible
+        # callers — same-module hits.  Cross-module hits at hot-swap
+        # load addresses can't resolve to this binary, so they go into
+        # a parallel dict that the banner shows as informational only.
+        STATE["static_callers"] = sc_data["same"]
+        STATE["cross_module_callers"] = sc_data["cross"]
     if "runtime_hits" not in STATE:
         STATE["runtime_hits"] = _load_runtime_hits()
 
@@ -997,13 +1003,21 @@ def _load_static_callers():
       - `FUN_<addr> + 0xN` (these point INTO the body, not at the entry)
       - Comment-only mentions
 
-    Returns {addr: count}.  Empty when neither option is configured.
+    Returns {"same": {addr: count}, "cross": {addr: count}}.  Callers in
+    files under `reference_dir` (this binary's module) count as "same";
+    everything else under `reference_scan_dir` counts as "cross".  Same-
+    binary-load-address modules (hot-swap slots) physically can't call
+    each other at runtime, so only `same` is wired into oracle's
+    boundary detection — `cross` is surfaced to the human as informational.
     """
-    reference_dir = _resolved_dir_option("reference_scan_dir") or _resolved_dir_option("reference_dir")
-    if reference_dir is None:
-        return {}
+    scan_dir = _resolved_dir_option("reference_scan_dir") or _resolved_dir_option("reference_dir")
+    if scan_dir is None:
+        return {"same": {}, "cross": {}}
+    this_module_dir = _resolved_dir_option("reference_dir")
+    this_module_resolved = this_module_dir.resolve() if this_module_dir is not None else None
     import re
-    callers = {}
+    same_callers = {}
+    cross_callers = {}
 
     # Direct branches.  "FUN_xxxxxxxx + 0xN" is excluded because the `+`
     # ends the match before the offset is consumed, but we also explicitly
@@ -1027,26 +1041,38 @@ def _load_static_callers():
     )
     reference_starts = set(STATE.get("reference_starts") or _load_reference_starts())
 
-    for s_file in reference_dir.glob("**/*.s"):
+    for s_file in scan_dir.glob("**/*.s"):
         try:
             text = s_file.read_text(errors="replace")
         except Exception:
             continue
+        # Same-module: caller's .s file lives inside this binary's
+        # reference_dir.  When reference_dir isn't configured we can't
+        # distinguish, so everything lumps into `same` (preserves
+        # pre-scoping behavior for single-module setups).
+        if this_module_resolved is None:
+            bucket = same_callers
+        else:
+            try:
+                in_same = s_file.resolve().is_relative_to(this_module_resolved)
+            except (AttributeError, ValueError):
+                in_same = str(s_file.resolve()).startswith(str(this_module_resolved))
+            bucket = same_callers if in_same else cross_callers
         for line in text.splitlines():
             for m in branch_re.finditer(line):
                 addr = int(m.group(1), 16)
-                callers[addr] = callers.get(addr, 0) + 1
+                bucket[addr] = bucket.get(addr, 0) + 1
             for m in pool_re_fun.finditer(line):
                 addr = int(m.group(1), 16)
-                callers[addr] = callers.get(addr, 0) + 1
+                bucket[addr] = bucket.get(addr, 0) + 1
             for m in pool_re_dat.finditer(line):
                 addr = int(m.group(1), 16)
-                # Only credit DAT_<addr> when addr is itself an reference
+                # Only credit DAT_<addr> when addr is itself a reference
                 # function start.  Filters out pool refs pointing at
                 # interior data.
                 if addr in reference_starts:
-                    callers[addr] = callers.get(addr, 0) + 1
-    return callers
+                    bucket[addr] = bucket.get(addr, 0) + 1
+    return {"same": same_callers, "cross": cross_callers}
 
 
 def _load_runtime_hits():
@@ -1109,6 +1135,7 @@ def _compute_candidate_evidence(start, end):
     (Ghidra hallucination).
     """
     sc = STATE.get("static_callers") or {}
+    cm = STATE.get("cross_module_callers") or {}
     rh = STATE.get("runtime_hits") or {}
     reference_starts = STATE.get("reference_starts") or []
 
@@ -1119,11 +1146,13 @@ def _compute_candidate_evidence(start, end):
                 "addr": a,
                 "addr_hex": f"{a:08X}",
                 "static_callers": sc.get(a, 0),
+                "cross_module_callers": cm.get(a, 0),
                 "runtime_hits": rh.get(a, 0),
             })
 
     return {
         "static_callers": sc.get(start, 0),
+        "cross_module_callers": cm.get(start, 0),
         "runtime_hits": rh.get(start, 0),
         "midpoints": midpoints,
     }
