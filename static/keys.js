@@ -214,7 +214,12 @@ function alignLines(leftLines, rightLines) {
 // `attnSet` is a Set of addresses the AI wants to draw the human's eye to
 // — those rows get an attn highlight (orange box around addr + bold-orange
 // last-4-hex tail).
-function renderListing(lines, target, isPrimary, attnSet) {
+// `midpointSet` is a Set of addresses where reference declares a function
+// start INSIDE this pane's candidate range — those rows get a violet
+// highlight so the human can spot at a glance where reference would
+// have split the function.  AI attn takes priority when both fire on
+// the same row.
+function renderListing(lines, target, isPrimary, attnSet, midpointSet) {
   if (!lines || !lines.length) {
     target.textContent = '';
     if (isPrimary) CURRENT_BRANCHES = [];
@@ -228,8 +233,10 @@ function renderListing(lines, target, isPrimary, attnSet) {
       return `<span class="line blank">&nbsp;</span>`;
     }
     const isAttn = !!(attnSet && line.addr != null && attnSet.has(line.addr));
+    const isMid  = !isAttn && !!(midpointSet && line.addr != null && midpointSet.has(line.addr));
     let cls = (line.classes || []).join(' ');
     if (isAttn) cls += ' attn';
+    if (isMid)  cls += ' midpoint';
     if (line.kind === 'section') {
       return `<span class="line ${cls}">${escapeHtml(line.label || '')}</span>`;
     }
@@ -237,15 +244,19 @@ function renderListing(lines, target, isPrimary, attnSet) {
     const indentSpan = indent > 0
       ? `<span class="indent" style="width:${indent * 1.4}em"></span>`
       : '';
-    // Address column: when the row is attn-flagged, split the addr_str
-    // so the last 4 hex chars get their own span (.attn-tail) for the
-    // bold-orange treatment.
+    // Address column: when the row is attn/midpoint-flagged, split the
+    // addr_str so the last 4 hex chars get their own span (.attn-tail
+    // / .midpoint-tail) for the bold-colored treatment.
     const addrStr = line.addr_str || '';
     let addrHtml;
     if (isAttn && addrStr.length >= 4) {
       const head = addrStr.slice(0, -4);
       const tail = addrStr.slice(-4);
       addrHtml = escapeHtml(head) + `<span class="attn-tail">${escapeHtml(tail)}</span>`;
+    } else if (isMid && addrStr.length >= 4) {
+      const head = addrStr.slice(0, -4);
+      const tail = addrStr.slice(-4);
+      addrHtml = escapeHtml(head) + `<span class="midpoint-tail">${escapeHtml(tail)}</span>`;
     } else {
       addrHtml = escapeHtml(addrStr);
     }
@@ -493,6 +504,8 @@ async function fetchState() {
       primaryBanner.innerHTML = '';
       naturalPane.classList.add('hidden');
       naturalBanner.classList.add('hidden');
+      document.getElementById('btn-reject').classList.remove('pressed');
+      document.getElementById('btn-unsure').classList.remove('pressed');
       setStatus(`history: ${s.history_count}`);
       LAST_CANDIDATE_START = null;
       LAST_NATURAL_START = null;
@@ -521,6 +534,14 @@ async function fetchState() {
     const attnKey = Array.from(attnSet).sort().join(',');
     const attnChanged = (attnKey !== LAST_ATTN_KEY);
     LAST_ATTN_KEY = attnKey;
+    // Per-pane midpoint sets — reference's view of where function starts
+    // fall INSIDE each pane's candidate range.  Each pane uses its own
+    // range so the natural pane (often wider) can highlight midpoints
+    // the override pane doesn't surface.
+    const primMidSet = new Set(((s.candidate.evidence && s.candidate.evidence.midpoints) || []).map(m => m.addr));
+    const natMidSet  = overrideActive
+      ? new Set(((s.natural_view.candidate.evidence && s.natural_view.candidate.evidence.midpoints) || []).map(m => m.addr))
+      : primMidSet;
     if (primChanged || natChanged || attnChanged) {
       if (overrideActive) {
         // Diff-align so rows for the same VRAM anchor address sit at the
@@ -529,14 +550,23 @@ async function fetchState() {
         // row goes on the missing side.  Works whether the override
         // tightens OR expands scope.
         const aligned = alignLines(s.lines, s.natural_view.lines);
-        renderListing(aligned.left,  primaryListing, true,  attnSet);
-        renderListing(aligned.right, naturalListing, false, attnSet);
+        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet);
+        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet);
       } else {
-        renderListing(s.lines, primaryListing, true, attnSet);
+        renderListing(s.lines, primaryListing, true, attnSet, primMidSet);
       }
       requestAnimationFrame(() => {
+        // Scroll the current candidate's section header into view, but
+        // offset by the sticky-top wrapper's height so the function's
+        // first instruction isn't hidden underneath it after an approve
+        // advances to a new candidate.  Sticky-top height varies with
+        // gap-alert visibility and banner content, so query it live.
         const target = primaryListing.querySelector('.section-current-header');
-        if (target) target.scrollIntoView({block: 'start', behavior: 'instant'});
+        if (!target) return;
+        const stickyTop = document.getElementById('sticky-top');
+        const stickyHeight = stickyTop ? stickyTop.offsetHeight : 0;
+        const targetRect = target.getBoundingClientRect();
+        window.scrollBy({ top: targetRect.top - stickyHeight, behavior: 'instant' });
       });
     }
 
@@ -553,6 +583,16 @@ async function fetchState() {
     LAST_CANDIDATE_START = primStart;
     LAST_NATURAL_START   = natStart;
     setStatus(`history: ${s.history_count}`);
+
+    // Reflect "what verdict did I last press on this candidate" so the
+    // human can see at a glance what state they left it in before
+    // talking to the AI (no textbox UI — the verdict click IS the
+    // record).  Cleared on candidate advance because the new candidate
+    // has no prior verdict yet.
+    const btnReject = document.getElementById('btn-reject');
+    const btnUnsure = document.getElementById('btn-unsure');
+    btnReject.classList.toggle('pressed', s.current_verdict === 'rejected');
+    btnUnsure.classList.toggle('pressed', s.current_verdict === 'unsure');
   } catch (e) {
     setStatus('connection lost — is the server running?');
   }

@@ -1499,6 +1499,18 @@ def state():
             except (ValueError, TypeError):
                 pass
 
+        # If the human already pressed reject/unsure on the currently
+        # displayed candidate (but hasn't approved yet — those advance
+        # the cursor), surface that state so the UI can highlight the
+        # corresponding button.  Lets the human see "what did I leave
+        # this in" after talking to the AI before they stamp approve.
+        current_verdict = None
+        last = history[-1] if history else None
+        if (last is not None
+            and last.get("candidate_start") == ev.start
+            and last.get("verdict") in ("rejected", "unsure")):
+            current_verdict = last["verdict"]
+
         return jsonify({
             "all_caught_up": False,
             "candidate": primary_payload["candidate"],
@@ -1507,6 +1519,7 @@ def state():
             "natural_view": natural_view,
             "override_active": bool(session.get("ai_override")),
             "attn": attn_addrs,
+            "current_verdict": current_verdict,
             "history_count": len(history),
             "progress": progress,
             "internal_gaps": internal_gaps,

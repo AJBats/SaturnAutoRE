@@ -246,6 +246,23 @@ header#header > #header-content {
 .line.attn {
   background: rgba(255, 140, 0, 0.05);
 }
+
+/* Reference midpoint highlight — addresses where reference declares a
+   function start INSIDE this candidate's range.  Violet to distinguish
+   from the orange attn highlight.  Same shape (boxed addr column +
+   bold-colored last-4-hex tail) so the visual language is consistent. */
+.line.midpoint .a {
+  outline: 1.5px solid #a35bff;
+  border-radius: 0.15em;
+  padding: 0 0.15em;
+}
+.line.midpoint .midpoint-tail {
+  color: #c89bff;
+  font-weight: bold;
+}
+.line.midpoint {
+  background: rgba(140, 80, 255, 0.05);
+}
 .listing-pane .listing {
   /* prevent overflow from leaking out — each pane scrolls independently */
 }
@@ -515,5 +532,22 @@ footer button:hover { background: #4a4a4a; }
 #btn-approve:hover { border-color: #6c6; }
 #btn-reject:hover  { border-color: #c66; }
 #btn-unsure:hover  { border-color: #cc6; }
+
+/* Persistent "current verdict" indicator — when reject/unsure was the
+   last verdict on the displayed candidate (and no approve yet), keep
+   that button lit so the human can see at a glance what state they
+   left it in before they switched tabs to talk to the AI. */
+#btn-reject.pressed {
+  background: #5a2020;
+  border-color: #d77;
+  color: #ffd;
+  box-shadow: inset 0 0 0 1px #c55;
+}
+#btn-unsure.pressed {
+  background: #5a4f1a;
+  border-color: #dd7;
+  color: #ffd;
+  box-shadow: inset 0 0 0 1px #cc5;
+}
 
 .status { color: #888; font-size: 11px; margin-left: auto; }
