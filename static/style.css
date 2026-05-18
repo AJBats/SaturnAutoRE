@@ -125,17 +125,17 @@ header#header > #header-content {
 .progress-pct { color: #cfc; font-weight: bold; }
 .progress-bytes { color: #777; }
 
-/* Archive agreement tag — green/red/gray by verdict */
-.archive {
+/* Reference agreement tag — green/red/gray by verdict */
+.reference {
   padding: 0.1em 0.5em;
   border-radius: 0.2em;
   font-size: 11px;
   font-weight: bold;
   cursor: help;
 }
-.archive-agrees    { background: #2a4a2a; color: #9d9; }
-.archive-disagrees { background: #4a2a2a; color: #d99; }
-.archive-silent    { background: #333;   color: #999; }
+.reference-agrees    { background: #2a4a2a; color: #9d9; }
+.reference-disagrees { background: #4a2a2a; color: #d99; }
+.reference-silent    { background: #333;   color: #999; }
 
 /* Static + runtime caller evidence */
 .evidence-pill {
@@ -148,10 +148,10 @@ header#header > #header-content {
 .evidence-pill.has  { background: #2a4a3a; color: #adc; }
 .evidence-pill.none { background: #333;    color: #999; }
 
-/* Midpoint warnings — archive thinks there's a function start inside our
+/* Midpoint warnings — reference thinks there's a function start inside our
    proposed range.  Loud orange = no supporting evidence (likely Ghidra
    hallucination).  Yellow = at least one signal backs the split (real
-   alternate entry point — honor archive's view). */
+   alternate entry point — honor reference's view). */
 .midpoint-warning {
   padding: 0.1em 0.5em;
   border-radius: 0.2em;
@@ -395,21 +395,6 @@ footer#footer {
   flex-direction: column;
   gap: 0.5em;
   z-index: 10;
-}
-.feedback-row {
-  display: flex;
-}
-.feedback-row textarea {
-  flex: 1;
-  min-height: 2.5em;
-  max-height: 8em;
-  background: #1a1a1a;
-  color: #eee;
-  border: 1px solid #555;
-  padding: 0.3em 0.5em;
-  font-family: inherit;
-  font-size: 13px;
-  resize: vertical;
 }
 .verdict-row {
   display: flex; gap: 0.6em; align-items: center;

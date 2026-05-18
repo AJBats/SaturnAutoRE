@@ -21,19 +21,19 @@ function progressHtml(p) {
   `;
 }
 
-function archiveHtml(a) {
+function referenceHtml(a) {
   if (!a) return '';
   const tip = escapeHtml(a.tooltip || '');
   let label;
   if (a.verdict === 'agrees') {
     const delta = a.end_delta;
-    label = delta == null ? 'archive: agrees' : `archive: agrees (${delta >= 0 ? '+' : ''}${delta}b)`;
+    label = delta == null ? 'reference: agrees' : `reference: agrees (${delta >= 0 ? '+' : ''}${delta}b)`;
   } else if (a.verdict === 'disagrees') {
-    label = `archive: disagrees (${a.end_delta >= 0 ? '+' : ''}${a.end_delta}b)`;
+    label = `reference: disagrees (${a.end_delta >= 0 ? '+' : ''}${a.end_delta}b)`;
   } else {
-    label = 'archive: silent';
+    label = 'reference: silent';
   }
-  return `<span class="archive archive-${a.verdict}" title="${tip}">${escapeHtml(label)}</span>`;
+  return `<span class="reference reference-${a.verdict}" title="${tip}">${escapeHtml(label)}</span>`;
 }
 
 function evidenceHtml(e) {
@@ -43,7 +43,7 @@ function evidenceHtml(e) {
   const scCls = e.static_callers > 0 ? 'has' : 'none';
   const rhCls = e.runtime_hits   > 0 ? 'has' : 'none';
   parts.push(
-    `<span class="evidence-pill ${scCls}" title="static call references found in archive .s files">`
+    `<span class="evidence-pill ${scCls}" title="static call references found in reference .s files">`
     + `${e.static_callers} static caller${e.static_callers === 1 ? '' : 's'}</span>`
   );
   parts.push(
@@ -54,13 +54,13 @@ function evidenceHtml(e) {
   for (const mp of e.midpoints || []) {
     const mpSc = mp.static_callers;
     const mpRh = mp.runtime_hits;
-    // Loud if archive claims a midpoint but evidence is weak.  Quiet
+    // Loud if reference claims a midpoint but evidence is weak.  Quiet
     // (informational) if both signals back the split.
     const supported = (mpSc > 0 || mpRh > 0);
     parts.push(
       `<span class="midpoint-warning ${supported ? 'supported' : 'suspect'}" `
-      + `title="archive proposes FUN_${mp.addr_hex} as a separate function inside our proposed range">`
-      + `archive midpoint @ FUN_${mp.addr_hex} `
+      + `title="reference proposes FUN_${mp.addr_hex} as a separate function inside our proposed range">`
+      + `reference midpoint @ FUN_${mp.addr_hex} `
       + `(${mpSc} static, ${mpRh} runtime)</span>`
     );
   }
@@ -117,7 +117,7 @@ function renderHeader(s) {
     <span class="addr">0x${c.start_hex} → 0x${c.end_hex}</span>
     <span class="size">${c.size} bytes</span>
     <span class="verdict-tag verdict-${c.verdict}">${c.verdict}</span>
-    ${archiveHtml(c.archive)}
+    ${referenceHtml(c.reference)}
     ${evidenceHtml(c.evidence)}
     ${p ? `<span class="prev">after ${p.name}</span>` : ''}
     ${flagsHtml}
@@ -358,14 +358,6 @@ window.addEventListener('resize', () => {
   RESIZE_TIMER = setTimeout(drawArcs, 80);
 });
 
-function getFeedback() {
-  return document.getElementById('feedback-text').value.trim();
-}
-
-function clearFeedback() {
-  document.getElementById('feedback-text').value = '';
-}
-
 async function fetchState() {
   try {
     const r = await fetch('/state');
@@ -393,29 +385,26 @@ async function fetchState() {
       });
     }
 
-    const pendingCount = (s.pending_messages || []).length;
-    const pendingHtml = pendingCount > 0
-      ? ` — ${pendingCount} pending msg${pendingCount === 1 ? '' : 's'} on this candidate`
-      : '';
-    setStatus(`history: ${s.history_count}${pendingHtml}`);
+    setStatus(`history: ${s.history_count}`);
   } catch (e) {
     setStatus('connection lost — is the server running?');
   }
 }
 
 async function submitVerdict(verdict) {
-  const feedback = getFeedback();
+  // Feedback is no longer collected in the UI — the human verbally
+  // explains reject/unsure reasoning to the AI, which records it
+  // verbatim into the session.json history entry's `feedback` list.
   const r = await fetch('/verdict', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({verdict, feedback}),
+    body: JSON.stringify({verdict, feedback: ''}),
   });
   const data = await r.json();
   if (!data.ok) {
     setStatus('verdict rejected: ' + (data.error || 'unknown'));
     return;
   }
-  clearFeedback();
   fetchState();
 }
 

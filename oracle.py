@@ -583,14 +583,14 @@ def _extend_through_trailing_pools(end, binary, vram, hint_end, pool_priors):
 
     SH-2 PC-relative loads (mov.l/mov.w @(disp,PC),Rn) can only reach forward
     ~1KB, so GCC scatters small literal pools into .text — most commonly as a
-    trailing zone after the function's last reachable instruction.  Archive
+    trailing zone after the function's last reachable instruction.  Reference
     convention (and the eval-tool convention we settled on) treats those
     pools as part of the function: they're only-reachable-from-here, they're
     PC-bound to this function, and lumping them in matches Ghidra-style
     boundaries.
 
     We extend by walking forward from `end + 1`, consuming any address that
-    appears in `pool_priors` (the archive-extracted pool address → size map).
+    appears in `pool_priors` (the reference-extracted pool address → size map).
     Stop at the first byte that's NOT in priors — typically the next
     function's prologue, since the pool zone ends exactly where the next
     function begins.
@@ -664,9 +664,9 @@ def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
     hint_end caps the control flow walk (avoids running off into the next TU
     if a branch goes there). Pass tu.end or sub.end if known.
 
-    pool_priors (optional): archive-derived {addr: size} map.  When provided,
+    pool_priors (optional): reference-derived {addr: size} map.  When provided,
     the returned `end` is extended forward through contiguous pool entries
-    (the function's trailing literal-pool zone), matching archive convention.
+    (the function's trailing literal-pool zone), matching reference convention.
     """
     binary_max = vram + len(binary) - 1
     hard_limit = hint_end if hint_end is not None else binary_max
@@ -850,15 +850,15 @@ def _looks_like_fn_start(mnem):
 
 
 def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
-                            archive_starts=None, static_callers=None):
+                            reference_starts=None, static_callers=None):
     """Walk forward from start_addr looking for the next function entry.
 
     Three signals, checked in priority order per address:
       1. static_callers[addr] > 0  — somebody bsr/jsrs to this address;
          definitively a function entry regardless of what its first
          instruction looks like.
-      2. addr in archive_starts    — archive labeled it FUN_<addr>; less
-         decisive (archive has Ghidra hallucinations) but a real signal.
+      2. addr in reference_starts    — reference labeled it FUN_<addr>; less
+         decisive (reference has Ghidra hallucinations) but a real signal.
       3. _looks_like_fn_start(...) — first instruction matches a register-
          push pattern.  Weakest signal — misses non-ABI helper functions
          that have no prologue (e.g. FUN_0602A818, which starts with
@@ -866,13 +866,13 @@ def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
 
     Returns the EARLIEST matching address, or None if nothing matches.
     """
-    archive_starts = archive_starts or set()
+    reference_starts = reference_starts or set()
     static_callers = static_callers or {}
     addr = (start_addr + 1) & ~1
     while addr <= max_addr:
         if static_callers.get(addr, 0) > 0:
             return addr
-        if addr in archive_starts:
+        if addr in reference_starts:
             return addr
         off = addr - vram
         if off + 1 >= len(binary):
@@ -886,7 +886,7 @@ def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
 
 
 def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
-                                       archive_starts=None, static_callers=None):
+                                       reference_starts=None, static_callers=None):
     """Forward-sweep candidate generation.
 
     Sorts verified code subsegs by start. For each, scans the bytes
@@ -916,7 +916,7 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
     if not declared_code or declared_code[0]["start"] > vram:
         next_start = _scan_for_next_prologue(
             binary, vram, vram, binary_end,
-            archive_starts=archive_starts, static_callers=static_callers,
+            reference_starts=reference_starts, static_callers=static_callers,
         )
         if next_start is not None and next_start not in declared_starts:
             tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)
@@ -927,7 +927,7 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
     for prev in declared_code:
         next_start = _scan_for_next_prologue(
             binary, vram, prev["end"] + 1, binary_end,
-            archive_starts=archive_starts, static_callers=static_callers,
+            reference_starts=reference_starts, static_callers=static_callers,
         )
         if next_start is None:
             continue

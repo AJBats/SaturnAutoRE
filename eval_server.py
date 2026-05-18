@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """eval_server.py — single-candidate forward-sweep verdict loop.
 
-Run from the project directory (DaytonaCCEReverse):
-    python D:/Projects/SaturnAutoRE/eval_server.py config/race.bin.yaml
+Run from a project's root directory:
+    python <SaturnAutoRE>/eval_server.py config/<binary>.yaml
 
 State machine, one candidate at a time:
   - Server computes the next forward-sweep candidate from current yaml state.
@@ -62,12 +62,16 @@ def load_session():
     if p and p.exists():
         with open(p) as f:
             sess = json.load(f)
-        # Migrate legacy entries: feedback used to be a single string; new
-        # schema is a list (multiple reject/unsure clicks accumulate).
+        # Feedback is a single string per entry.  Older sessions used a list
+        # (when the UI had a textbox and multiple unsure clicks could
+        # accumulate notes).  Collapse any legacy list to a single newline-
+        # joined string.
         for entry in sess.get("history", []):
             fb = entry.get("feedback")
-            if isinstance(fb, str):
-                entry["feedback"] = [fb] if fb else []
+            if isinstance(fb, list):
+                entry["feedback"] = "\n".join(fb) if fb else ""
+            elif fb is None:
+                entry["feedback"] = ""
         return sess
     return _empty_session()
 
@@ -215,7 +219,7 @@ def _pools_and_branches(ev):
     pool2 |= sp2
     mova |= spm
 
-    # Archive-derived pool priors (addresses the archive's .s files identified
+    # Reference-derived pool priors (addresses the reference's .s files identified
     # as pool data) — fills in pools referenced from not-yet-verified functions.
     for addr, size in STATE.get("pool_priors", {}).items():
         if ev.start <= addr <= ev.end:
@@ -876,7 +880,7 @@ def _compute_current():
     return find_next_forward_sweep_candidate(
         cfg, binary,
         pool_priors=pool_priors,
-        archive_starts=set(STATE.get("archive_starts") or []),
+        reference_starts=set(STATE.get("reference_starts") or []),
         static_callers=STATE.get("static_callers") or {},
     )
 
@@ -896,40 +900,52 @@ def _reload_caches():
     # Invalidate sibling-pool cache when yaml changes
     STATE["sibling_pool_cache"] = {}
     STATE["pool_priors"] = _load_pool_priors()
-    # Archive starts / static callers / runtime hits are static-ish — load
+    # Reference starts / static callers / runtime hits are static-ish — load
     # once and stash. (Runtime hits could be refreshed after a new BP probe;
     # for now, restart the server to pick up new data.)
-    if "archive_starts" not in STATE:
-        STATE["archive_starts"] = _load_archive_starts()
+    if "reference_starts" not in STATE:
+        STATE["reference_starts"] = _load_reference_starts()
     if "static_callers" not in STATE:
         STATE["static_callers"] = _load_static_callers()
     if "runtime_hits" not in STATE:
         STATE["runtime_hits"] = _load_runtime_hits()
 
 
-def _load_archive_starts():
-    """Load archive's view of function start addresses.
-
-    Scans archive_src/src/<module>/*.s for `FUN_<addr>:` labels.  Module
-    is derived from the yaml stem (e.g. race.bin.yaml → race).  These are
-    the addresses the archive thought function bodies began at — usable as
-    an independent confidence check on our own boundaries.
-
-    Returns a SORTED list of int addresses, or [] if the archive dir is
-    missing.
-    """
-    yaml_path = STATE.get("yaml_path")
+def _resolved_dir_option(key):
+    """Read a directory path from cfg.options[key] and resolve it relative
+    to project_root.  Returns None if the option is absent or the
+    resolved path isn't a directory."""
+    cfg = STATE.get("cfg_cache") or {}
+    val = (cfg.get("options") or {}).get(key)
+    if not val:
+        return None
     project_root = STATE.get("project_root")
-    if yaml_path is None or project_root is None:
-        return []
-    module = yaml_path.stem.split(".")[0]  # race.bin → race
-    archive_dir = project_root / "archive_src" / "src" / module
-    if not archive_dir.is_dir():
+    p = Path(val)
+    if not p.is_absolute() and project_root:
+        p = (project_root / p).resolve()
+    return p if p.is_dir() else None
+
+
+def _load_reference_starts():
+    """Load reference's view of function start addresses.
+
+    Configured via `options.reference_dir` in the yaml: a directory of
+    `.s` files containing `FUN_<addr>:` labels (typical splat / Ghidra
+    output structure).  Used as an independent confidence check on our
+    own boundaries.
+
+    Returns a SORTED list of int addresses, or [] if the option is
+    unset or the directory is missing (graceful degradation — the
+    reference-agreement banner signal just shows as 'silent' for every
+    candidate).
+    """
+    reference_dir = _resolved_dir_option("reference_dir")
+    if reference_dir is None:
         return []
     import re
     starts = set()
     fun_re = re.compile(r"^FUN_([0-9A-Fa-f]{8}):\s*$")
-    for s_file in archive_dir.glob("*.s"):
+    for s_file in reference_dir.glob("*.s"):
         for raw in s_file.read_text(errors="replace").splitlines():
             m = fun_re.match(raw.strip())
             if m:
@@ -938,24 +954,28 @@ def _load_archive_starts():
 
 
 def _load_static_callers():
-    """Scan archive .s files for static call references to function addresses.
+    """Scan reference .s files for static call references to function addresses.
+
+    Configured via `options.reference_scan_dir` (the cross-module root for
+    a recursive glob).  Falls back to `options.reference_dir` (this
+    module's reference only) if scan_dir isn't set.
 
     Counts these as a "call site":
       - bsr / bsr.s / jsr / jmp / bra / braf / bsrf  to  FUN_<addr>  or  xref_FUN_<addr>
-      - .4byte FUN_<addr> / DAT_<addr> / xref_FUN_<addr>  (function pointer
-        in a pool, intended to be loaded then called via jsr @rN)
+      - .4byte FUN_<addr> / xref_FUN_<addr>  (function pointer in a pool,
+        intended to be loaded then called via jsr @rN)
+      - .4byte DAT_<addr>  ONLY when <addr> is itself in reference_starts
+        (so a Ghidra-mis-labeled function pointer counts, but a pool
+        ref pointing at interior data doesn't)
 
     Excludes:
       - `FUN_<addr> + 0xN` (these point INTO the body, not at the entry)
       - Comment-only mentions
 
-    Returns {addr: count}.
+    Returns {addr: count}.  Empty when neither option is configured.
     """
-    project_root = STATE.get("project_root")
-    if project_root is None:
-        return {}
-    archive_dir = project_root / "archive_src"
-    if not archive_dir.is_dir():
+    reference_dir = _resolved_dir_option("reference_scan_dir") or _resolved_dir_option("reference_dir")
+    if reference_dir is None:
         return {}
     import re
     callers = {}
@@ -971,7 +991,7 @@ def _load_static_callers():
     # it can be a real function pointer (Ghidra mis-labeled the target as
     # data) or a genuine data pointer (e.g. into another function's pool
     # zone).  Cross-reference: count DAT_<addr> only when <addr> is itself
-    # a known function start in archive_starts.  This catches archives
+    # a known function start in reference_starts.  This catches references
     # like `.4byte DAT_06029810 /* = FUN_06029810 */` while still
     # rejecting `.4byte DAT_06029958 /* = FUN_06029810 + 0x148 */`.
     pool_re_fun = re.compile(
@@ -980,9 +1000,9 @@ def _load_static_callers():
     pool_re_dat = re.compile(
         r"\.4byte\s+DAT_([0-9A-Fa-f]{8})\b(?!\s*\+)"
     )
-    archive_starts = set(STATE.get("archive_starts") or _load_archive_starts())
+    reference_starts = set(STATE.get("reference_starts") or _load_reference_starts())
 
-    for s_file in archive_dir.glob("**/*.s"):
+    for s_file in reference_dir.glob("**/*.s"):
         try:
             text = s_file.read_text(errors="replace")
         except Exception:
@@ -996,10 +1016,10 @@ def _load_static_callers():
                 callers[addr] = callers.get(addr, 0) + 1
             for m in pool_re_dat.finditer(line):
                 addr = int(m.group(1), 16)
-                # Only credit DAT_<addr> when addr is itself an archive
+                # Only credit DAT_<addr> when addr is itself an reference
                 # function start.  Filters out pool refs pointing at
                 # interior data.
-                if addr in archive_starts:
+                if addr in reference_starts:
                     callers[addr] = callers.get(addr, 0) + 1
     return callers
 
@@ -1007,31 +1027,36 @@ def _load_static_callers():
 def _load_runtime_hits():
     """Aggregate BP-pass hit counts across probe summaries.
 
-    Looks in build/probes/*.summary.json and build/mcp_ipc/*.summary.json
-    and takes the MAX hit count per address across all summaries.
+    Configured via `options.runtime_hits_dirs` in the yaml: a list of
+    directories, each globbed for `*.summary.json` files with a
+    `by_address: {hex_addr: count}` field (the standard BP-probe
+    summary format).  Returns {addr: max_hits} taking the MAX across
+    all summaries.
 
     Why max (not sum):
-      - Probes typically overwrite the same `breakpoint_hits.txt` file, so
-        summing across summaries that "point to the same file" still ends
-        up summing across distinct probe runs.
-      - Summing is double-prone when summaries are re-snapshots of the same
-        probe (we saw 2x duplication with sweep_rolling_start +
-        sweep_post_rolling_start).
-      - Max is robust: it's the highest count we've observed for this
-        address across any probe.  Never overcounts; may understate if a
-        probe was strictly partial, but that's the safer side to err on.
+      - Probes typically overwrite the same hits file, so summing across
+        summaries that "point to the same file" sums across distinct
+        runs.
+      - Summing double-counts re-snapshots of the same probe.
+      - Max is robust: highest count observed for the address across
+        any probe.  Never overcounts; may understate if a probe was
+        strictly partial.
 
-    Returns {addr: max_hits}.
+    Returns {} if the option is unset or no summaries exist.
     """
-    project_root = STATE.get("project_root")
-    if project_root is None:
+    cfg = STATE.get("cfg_cache") or {}
+    dirs = (cfg.get("options") or {}).get("runtime_hits_dirs") or []
+    if not dirs:
         return {}
+    project_root = STATE.get("project_root")
     hits = {}
-    for sub in ("build/probes", "build/mcp_ipc"):
-        d = project_root / sub
-        if not d.is_dir():
+    for d in dirs:
+        p = Path(d)
+        if not p.is_absolute() and project_root:
+            p = (project_root / p).resolve()
+        if not p.is_dir():
             continue
-        for f in d.glob("*.summary.json"):
+        for f in p.glob("*.summary.json"):
             try:
                 with open(f) as fp:
                     s = json.load(fp)
@@ -1052,18 +1077,18 @@ def _load_runtime_hits():
 def _compute_candidate_evidence(start, end):
     """Static + runtime evidence for the candidate, plus midpoint warnings.
 
-    A "midpoint" is an archive FUN_<X> start that falls STRICTLY INSIDE
-    (start, end] — i.e., archive thinks there's a function start within our
+    A "midpoint" is an reference FUN_<X> start that falls STRICTLY INSIDE
+    (start, end] — i.e., reference thinks there's a function start within our
     proposed body.  For each, report its own evidence so the human can judge
-    whether to honor archive's split (real entry point) or override it
+    whether to honor reference's split (real entry point) or override it
     (Ghidra hallucination).
     """
     sc = STATE.get("static_callers") or {}
     rh = STATE.get("runtime_hits") or {}
-    archive_starts = STATE.get("archive_starts") or []
+    reference_starts = STATE.get("reference_starts") or []
 
     midpoints = []
-    for a in archive_starts:
+    for a in reference_starts:
         if start < a <= end:
             midpoints.append({
                 "addr": a,
@@ -1079,67 +1104,67 @@ def _compute_candidate_evidence(start, end):
     }
 
 
-def _compute_archive_agreement(start, end):
-    """Compare our (start, end) candidate against the archive's view.
+def _compute_reference_agreement(start, end):
+    """Compare our (start, end) candidate against the reference's view.
 
     Returns dict:
       - verdict: "agrees" | "disagrees" | "silent"
-      - start_match: bool                  — archive has FUN_<start>?
-      - archive_next: int|None             — archive's next FUN start > our start
-      - archive_implied_end: int|None      — archive_next - 1 (its view of end)
-      - end_delta: int|None                — our_end - archive_implied_end
-                                              (positive = we're longer than archive)
+      - start_match: bool                  — reference has FUN_<start>?
+      - reference_next: int|None             — reference's next FUN start > our start
+      - reference_implied_end: int|None      — reference_next - 1 (its view of end)
+      - end_delta: int|None                — our_end - reference_implied_end
+                                              (positive = we're longer than reference)
       - tooltip: str                       — human-readable summary
     """
-    archive_starts = STATE.get("archive_starts") or []
-    start_match = start in archive_starts
+    reference_starts = STATE.get("reference_starts") or []
+    start_match = start in reference_starts
 
-    archive_next = None
-    for a in archive_starts:
+    reference_next = None
+    for a in reference_starts:
         if a > start:
-            archive_next = a
+            reference_next = a
             break
 
-    archive_implied_end = (archive_next - 1) if archive_next is not None else None
-    end_delta = (end - archive_implied_end) if archive_implied_end is not None else None
+    reference_implied_end = (reference_next - 1) if reference_next is not None else None
+    end_delta = (end - reference_implied_end) if reference_implied_end is not None else None
 
-    # Tolerance: archive boundaries include pool/padding between functions, so
+    # Tolerance: reference boundaries include pool/padding between functions, so
     # exact end-byte agreement is rare.  Within 16 bytes counts as "agrees".
     TOL = 16
 
     if not start_match:
         verdict = "silent"
-        tooltip = f"archive has no FUN_{start:08X}"
+        tooltip = f"reference has no FUN_{start:08X}"
     elif end_delta is None:
         verdict = "agrees"
-        tooltip = f"archive start matches; no archive successor (last fn)"
+        tooltip = f"reference start matches; no reference successor (last fn)"
     elif abs(end_delta) <= TOL:
         verdict = "agrees"
         tooltip = (
-            f"archive FUN_{start:08X} → next FUN_{archive_next:08X}; "
-            f"our end {end_delta:+d} bytes vs archive implied end "
-            f"0x{archive_implied_end:08X}"
+            f"reference FUN_{start:08X} → next FUN_{reference_next:08X}; "
+            f"our end {end_delta:+d} bytes vs reference implied end "
+            f"0x{reference_implied_end:08X}"
         )
     else:
         verdict = "disagrees"
         if end_delta > 0:
             tooltip = (
-                f"archive thinks function is shorter by {end_delta} bytes "
-                f"(archive next FUN_{archive_next:08X} → implied end "
-                f"0x{archive_implied_end:08X})"
+                f"reference thinks function is shorter by {end_delta} bytes "
+                f"(reference next FUN_{reference_next:08X} → implied end "
+                f"0x{reference_implied_end:08X})"
             )
         else:
             tooltip = (
-                f"archive thinks function is longer by {-end_delta} bytes "
-                f"(archive next FUN_{archive_next:08X} → implied end "
-                f"0x{archive_implied_end:08X})"
+                f"reference thinks function is longer by {-end_delta} bytes "
+                f"(reference next FUN_{reference_next:08X} → implied end "
+                f"0x{reference_implied_end:08X})"
             )
 
     return {
         "verdict": verdict,
         "start_match": start_match,
-        "archive_next": archive_next,
-        "archive_implied_end": archive_implied_end,
+        "reference_next": reference_next,
+        "reference_implied_end": reference_implied_end,
         "end_delta": end_delta,
         "tooltip": tooltip,
     }
@@ -1151,7 +1176,7 @@ def _detect_internal_gaps(proposed_start=None):
     currently-proposed candidate (if any).
 
     Why include the pending gap: when forward-sweep can't find a real
-    function in a zone (no archive label, no prologue, no callers), it
+    function in a zone (no reference label, no prologue, no callers), it
     skips over to the next function it CAN find — leaving a would-be gap
     that the user will create the instant they approve.  We catch this
     state pre-emptively rather than waiting for the approval to fire the
@@ -1231,7 +1256,7 @@ def _load_pool_priors():
     """Load pool address priors from <yaml_stem>.pool_priors.txt if present.
 
     Returns dict {addr: size_in_bytes} where size is 4 (mov.l) or 2 (mov.w).
-    These are pool addresses identified by the archive — used to augment our
+    These are pool addresses identified by the reference — used to augment our
     own pool detection, so pools referenced from not-yet-verified functions
     still render as proper pool data instead of bogus decoded instructions.
     """
@@ -1341,17 +1366,8 @@ def state():
         # a real function in that zone) before the user creates it.
         internal_gaps = _detect_internal_gaps(proposed_start=ev.start)
         lines = render_listing(ev, prev)
-        archive = _compute_archive_agreement(ev.start, ev.end)
+        reference = _compute_reference_agreement(ev.start, ev.end)
         evidence = _compute_candidate_evidence(ev.start, ev.end)
-
-        # If the latest history entry is for THIS candidate and not yet
-        # approved, the count is how many feedback messages have stacked up.
-        pending_msgs = []
-        if history:
-            last = history[-1]
-            if (last.get("candidate_start") == ev.start
-                    and last.get("verdict") != "approved"):
-                pending_msgs = last.get("feedback") or []
 
         return jsonify({
             "all_caught_up": False,
@@ -1364,14 +1380,13 @@ def state():
                 "verdict": ev.verdict,
                 "yellow_flags": ev.yellow_flags,
                 "name": f"FUN_{ev.start:08X}",
-                "archive": archive,
+                "reference": reference,
                 "evidence": evidence,
             },
             "previous": {
                 "start_hex": f"{prev['start']:08X}",
                 "name": f"FUN_{prev['start']:08X}",
             } if prev else None,
-            "pending_messages": pending_msgs,
             "history_count": len(history),
             "progress": progress,
             "internal_gaps": internal_gaps,
@@ -1416,7 +1431,6 @@ def unstamp():
 def verdict():
     data = request.get_json(force=True)
     v = data.get("verdict")
-    feedback = (data.get("feedback") or "").strip()
 
     if v not in ("approved", "rejected", "unsure"):
         return jsonify({"ok": False, "error": "bad verdict"}), 400
@@ -1431,10 +1445,6 @@ def verdict():
         session = load_session()
         session["ai_override"] = None
 
-        # One record PER CANDIDATE.  Each reject/unsure click appends to the
-        # record's `feedback` list.  An approve closes out the record by
-        # setting verdict="approved".  Misclicks are recoverable — just click
-        # the right button next; the verdict field gets overwritten.
         history = session.setdefault("history", [])
         last = history[-1] if history else None
         same_candidate = (
@@ -1443,27 +1453,43 @@ def verdict():
             and last.get("verdict") != "approved"
         )
 
-        if same_candidate:
-            last["verdict"] = v
-            last["candidate_end"] = ev.end
-            last["ts"] = time.time()
-            if feedback:
-                last.setdefault("feedback", []).append(feedback)
-        else:
+        if v in ("rejected", "unsure"):
+            # No-op if the same candidate is already in a reject/unsure
+            # state.  The AI records the human's reasoning into the
+            # existing record's `feedback` field out of band.
+            if same_candidate and last.get("verdict") in ("rejected", "unsure"):
+                save_session(session)
+                return jsonify({"ok": True, "no_op": True})
             history.append({
                 "verdict": v,
                 "candidate_start_hex": f"{ev.start:08X}",
                 "candidate_start": ev.start,
                 "candidate_end": ev.end,
-                "feedback": [feedback] if feedback else [],
+                "feedback": "",
                 "ts": time.time(),
             })
+            save_session(session)
+            return jsonify({"ok": True})
 
-        if v == "approved":
-            tu = next((t for t in STATE["cfg_cache"]["tus"] if t["start"] <= ev.start <= t["end"]), None)
-            file_name = tu["name"] if tu else f"tu_{ev.start:08X}"
-            _append_subseg_to_yaml(ev.start, ev.end, file_name)
-
+        # v == "approved"
+        if same_candidate:
+            # Promote the prior reject/unsure entry to approved (preserves
+            # the AI-recorded feedback that explained the prior verdict).
+            last["verdict"] = "approved"
+            last["candidate_end"] = ev.end
+            last["ts"] = time.time()
+        else:
+            history.append({
+                "verdict": "approved",
+                "candidate_start_hex": f"{ev.start:08X}",
+                "candidate_start": ev.start,
+                "candidate_end": ev.end,
+                "feedback": "",
+                "ts": time.time(),
+            })
+        tu = next((t for t in STATE["cfg_cache"]["tus"] if t["start"] <= ev.start <= t["end"]), None)
+        file_name = tu["name"] if tu else f"tu_{ev.start:08X}"
+        _append_subseg_to_yaml(ev.start, ev.end, file_name)
         save_session(session)
         return jsonify({"ok": True})
 

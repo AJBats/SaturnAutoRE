@@ -219,7 +219,7 @@ def build_global_labels(binary, vram, subsegs, pool_priors=None):
     # (pool semantics) instead of generic `xref_XXXXXXXX`.
     cross_pool = collect_global_pool_targets(binary, vram, subsegs)
 
-    # Merge in archive-derived pool priors (passed in by caller via pool_priors)
+    # Merge in reference-derived pool priors (passed in by caller via pool_priors)
     for addr, kind in (pool_priors or {}).items():
         cross_pool.setdefault(addr, kind)
 
