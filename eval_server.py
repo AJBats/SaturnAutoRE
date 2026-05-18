@@ -749,12 +749,19 @@ def _emit_function_lines(lines, ev, section):
 def _emit_raw_bytes(lines, start, end, section):
     """Emit raw bytes for intermediate/trailing sections.
 
-    Uses pool_priors to render known pool addresses as `.4byte`/`.2byte` data
-    with `.L_pool_*` labels, instead of bogus instruction decodings.
+    Uses both pool_priors (reference's declared pool addresses) AND
+    binary_pool_targets (any address loaded by a PC-relative load
+    anywhere in the binary — reference-independent) to render known
+    pool addresses as `.4byte`/`.2byte` data with `.L_pool_*` labels
+    instead of bogus instruction decodings.  binary_pool_targets
+    catches pool words that the current candidate doesn't itself
+    load but some other function in the binary does (data-as-code
+    trap that the trailing zone is especially prone to).
     """
     binary = STATE["binary_cache"]
     vram = STATE["vram_cache"]
     priors = STATE.get("pool_priors", {})
+    binary_pool = STATE.get("binary_pool_targets", {})
     binary_end = vram + len(binary) - 1
     end = min(end, binary_end)
     addr = start
@@ -763,8 +770,10 @@ def _emit_raw_bytes(lines, start, end, section):
         if off + 1 >= len(binary):
             break
 
-        # Prior pool entry — emit as pool data
-        size = priors.get(addr)
+        # Prior pool entry — emit as pool data.  pool_priors wins when
+        # both sources have an entry (reference's reading is usually
+        # more precise about pool boundaries than raw binary scan).
+        size = priors.get(addr) or binary_pool.get(addr)
         if size == 4 and addr + 3 <= end and off + 3 < len(binary):
             value = (binary[off] << 24) | (binary[off+1] << 16) | (binary[off+2] << 8) | binary[off+3]
             lines.append({
@@ -889,7 +898,16 @@ def _compute_current(ignore_override=False):
     binary = STATE["binary_cache"]
     cfg = STATE["cfg_cache"]
 
-    pool_priors = STATE.get("pool_priors") or {}
+    # Merge reference-derived pool_priors with binary-wide PC-relative
+    # load targets.  The binary-wide scan catches pool words that
+    # reference's auto-disassembler missed (the data-as-code trap that
+    # otherwise causes oracle's trailing-pool extension to stop short
+    # at the function's last code byte instead of swallowing the
+    # pool zone that immediately follows).  pool_priors wins on
+    # conflicts since reference's size annotations are usually more
+    # precise than the raw-binary fallback.
+    pool_priors = dict(STATE.get("binary_pool_targets") or {})
+    pool_priors.update(STATE.get("pool_priors") or {})
 
     override = session.get("ai_override") if not ignore_override else None
     if override:
@@ -947,6 +965,19 @@ def _reload_caches():
     # for now, restart the server to pick up new data.)
     if "reference_starts" not in STATE:
         STATE["reference_starts"] = _load_reference_starts()
+    if "binary_pool_targets" not in STATE:
+        # Binary-wide PC-relative load target scan.  Any address loaded
+        # by `mov.l/mov.w/mova @(disp,PC)` anywhere in the binary IS
+        # pool data — there's no other interpretation of that target.
+        # Used by the trailing-zone renderer so pool words that the
+        # current candidate doesn't itself reference (but some other
+        # function does) still render as `.4byte`/`.2byte` instead of
+        # falling through to bogus instruction decodings of the data.
+        # Loaded BEFORE static_callers so the v2 caller scan can skip
+        # bytes inside known pool words (avoids phantom branch
+        # decodings of data — e.g. pool 0x25E6A01A bytes A0 1A look
+        # like a `bra +0x34` but aren't).
+        STATE["binary_pool_targets"] = _load_binary_pool_targets()
     if "static_callers" not in STATE:
         # Same-module callers: raw-binary scan of THIS binary's bytes,
         # reference-independent and accurate.  Drives oracle's
@@ -959,6 +990,51 @@ def _reload_caches():
         STATE["cross_module_callers"] = _load_cross_module_callers()
     if "runtime_hits" not in STATE:
         STATE["runtime_hits"] = _load_runtime_hits()
+
+
+def _load_binary_pool_targets():
+    """Scan the entire binary for PC-relative load targets.
+
+    Reference-independent: doesn't read .s files or pool_priors.  Walks
+    every 2-byte-aligned address in the binary, decodes the opcode, and
+    if it's `mov.l @(disp,PC),Rn` / `mov.w @(disp,PC),Rn` / `mova
+    @(disp,PC),r0`, records the target address with the right size
+    (4 for mov.l/mova, 2 for mov.w).
+
+    Returns {addr: size}.  Used as an additional pool-detection source
+    by `_emit_raw_bytes` so trailing-zone bytes that other functions
+    load as pool words render as `.4byte`/`.2byte` instead of being
+    mis-decoded as instructions (the data-as-code trap).
+    """
+    binary = STATE["binary_cache"]
+    vram = STATE["vram_cache"]
+    pool_sizes = {}
+    end_addr = vram + len(binary) - 1
+    for addr in range(vram, end_addr, 2):
+        off = addr - vram
+        op = (binary[off] << 8) | binary[off + 1]
+        hi = (op >> 12) & 0xF
+        if hi == 0xD:
+            # mov.l @(disp,PC), Rn — 4-byte aligned target
+            disp = op & 0xFF
+            tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
+            if vram <= tgt <= end_addr:
+                pool_sizes[tgt] = 4
+        elif hi == 0x9:
+            # mov.w @(disp,PC), Rn — 2-byte target; don't downgrade if
+            # mov.l already claimed it (same address can be loaded both
+            # ways, but mov.l implies 4-byte semantics for rendering).
+            disp = op & 0xFF
+            tgt = addr + 4 + disp * 2
+            if vram <= tgt <= end_addr and tgt not in pool_sizes:
+                pool_sizes[tgt] = 2
+        elif hi == 0xC and ((op >> 8) & 0xF) == 7:
+            # mova @(disp,PC), r0 — 4-byte aligned target (jump table head)
+            disp = op & 0xFF
+            tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
+            if vram <= tgt <= end_addr:
+                pool_sizes[tgt] = 4
+    return pool_sizes
 
 
 def _resolved_dir_option(key):
@@ -1038,9 +1114,22 @@ def _load_static_callers():
     vram = STATE.get("vram_cache")
     if binary is None or vram is None:
         return {}
+    # Build a "pool data" address set: any byte inside a known pool word
+    # (loaded by some PC-relative load elsewhere in the binary) is data,
+    # not code.  Decoding bytes inside those words as branch instructions
+    # produces phantom callers when the data happens to bit-align as a
+    # valid bsr/bra opcode (e.g. pool 0x25E6A01A bytes A0 1A decode as
+    # `bra +0x34`).  Skip those addresses during the branch scan.
+    pool_targets = STATE.get("binary_pool_targets") or {}
+    pool_data_addrs = set()
+    for tgt, size in pool_targets.items():
+        for i in range(0, size, 2):
+            pool_data_addrs.add(tgt + i)
     callers = {}
     end = vram + len(binary) - 1
     for addr in range(vram, end, 2):
+        if addr in pool_data_addrs:
+            continue
         off = addr - vram
         op = (binary[off] << 8) | binary[off + 1]
         hi = (op >> 12) & 0xF

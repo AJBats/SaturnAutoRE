@@ -636,10 +636,11 @@ def _extend_through_trailing_pools(end, binary, vram, hint_end, pool_priors):
     boundaries.
 
     We extend by walking forward from `end + 1`, consuming any address that
-    appears in `pool_priors` (the reference-extracted pool address → size map).
-    Stop at the first byte that's NOT in priors — typically the next
-    function's prologue, since the pool zone ends exactly where the next
-    function begins.
+    appears in `pool_priors` (a {addr: size} dict — typically a UNION of
+    reference-extracted priors AND binary-wide PC-relative load targets so
+    pool words that reference missed but the binary itself loads still get
+    swallowed).  Stop at the first byte that's NOT in priors — typically
+    the next function's prologue.
 
     Returns the new end address (inclusive), or the original `end` if no
     extension applies.
@@ -782,6 +783,7 @@ def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
         if mnem and mnem.startswith("rts") and addr != final_rts:
             conditional_rts.append(addr)
 
+
     # Classify branches as internal/external relative to [start, end]
     branches = _classify_branch_internality(branches, start, end)
 
@@ -798,7 +800,7 @@ def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
     # Build verdict
     verdict, yellow = _verdict(
         saved, stack_alloc, restored, stack_dealloc,
-        final_rts, branches, conditional_rts
+        final_rts, branches, conditional_rts,
     )
     flags.extend(yellow)
 
@@ -842,8 +844,17 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
     # `mov.l rX, @-r15` argument push that preceded a jsr).  Compilers
     # don't dealloc what they didn't alloc, so dealloc-without-alloc is
     # never a real bug — it's a walker false positive.
-    if stack_alloc > 0 and stack_alloc != stack_dealloc:
-        flags.append(f"stack alloc/dealloc mismatch: {stack_alloc} vs {stack_dealloc}")
+    #
+    # Only flag UNDER-dealloc — the epilogue freeing less stack than
+    # the prologue allocated, which would leak frames upward and
+    # eventually corrupt the caller.  Over-dealloc (epi freeing MORE
+    # than alloc) is a benign pattern: GCC sometimes merges the epi
+    # dealloc with a mid-body push cleanup into a single `add #+N, r15`
+    # (e.g. prologue allocs 4, body pushes r4 for jsr arg, then one
+    # `add #+8, r15` cleans both up).  Catching over-dealloc as a "bug"
+    # produced phantom mismatches on cycle-optimized GCC code.
+    if stack_alloc > 0 and stack_dealloc < stack_alloc:
+        flags.append(f"stack under-dealloc: alloc {stack_alloc} but only {stack_dealloc} freed")
     else:
         score += 1
 
