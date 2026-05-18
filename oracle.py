@@ -257,48 +257,87 @@ def _walk_prologue(binary, vram, start):
     return last_prologue, saved, stack, flags
 
 
-def _walk_epilogue_backward(binary, vram, end, func_start=None):
+_EPI_HARD_STOPS = ("rts", "rte", "bra", "bsr", "bf", "bt", "bf/s", "bt/s",
+                    "jmp", "jsr", "braf", "bsrf")
+
+
+def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
     """Walk backward from `end` (last byte) recognizing epilogue instructions.
+
+    Stop criteria (semantically grounded, no magic interleave count):
+      1. Every pop we accept must match the prologue's `saved` list at the
+         next expected position.  Push order forward → pop order forward
+         is REVERSED(saved) → walking backward through pops the order is
+         `saved` itself.  When `expected_idx` reaches `len(saved)`, any
+         further pop encountered is body code (e.g. a `mov.l @r15+, r0`
+         that pairs with a mid-function `mov.l r13, @-r15` scratch save
+         from before a jsr) — stop.
+      2. Hard-stop on control flow (`bsr/jsr/bf/bt/bra/...`).  The
+         epilogue lives in a single linear basic block ending in `rts`;
+         a branch instruction means we've crossed into the prior block.
+      3. Bounded interleave tolerance for true noise (e.g. an
+         `extu.b r0, r0` value-shape fixup between matched pops).  This
+         only ticks BETWEEN matches; once `expected_idx` is exhausted the
+         next non-match terminates immediately.
+      4. Stack dealloc (`add #N, r15`) is recorded separately — not in
+         `saved`, so it doesn't advance expected_idx but it does reset
+         the interleave counter.
+
+    `saved` is the list returned by `_walk_prologue` (in push order).
+    If omitted or empty, the walker is in "best-effort" mode: it'll
+    only succeed if there's literally nothing between rts and func_start
+    that needs structured matching.
 
     Returns:
       epilogue_start_addr
-      restored           — list of register names restored (in pop order, last in delay slot)
+      restored           — list of register names restored, in forward
+                           execution order (first popped first, delay
+                           slot last)
       stack              — bytes deallocated by `add #N, r15`
       final_rts          — addr of the rts
-      delay_slot_addr    — addr of the delay-slot instruction (== end - 1 effectively)
+      delay_slot_addr    — addr of the delay-slot instruction
     """
-    # End is inclusive. Delay slot instruction occupies (end - 1, end).
+    saved = saved or []
+    expected = list(saved)  # walking backward, expected pop order == saved
+
     delay_slot = end - 1
     rts_addr = delay_slot - 2
 
     op_rts = _read_opcode(binary, vram, rts_addr)
     mnem_rts, _ = decode_sh2(op_rts, rts_addr) if op_rts is not None else (None, None)
-
     if mnem_rts != "rts":
-        return None, [], 0, None, None  # epilogue not at expected location
+        return None, [], 0, None, None
 
-    # Delay slot is the last "epilogue" instruction (often a register pop).
+    # Delay slot is conceptually the FIRST step of our backward walk.
+    # If it's a pop (r0-r14, pr, or macl) and matches expected[0], consume
+    # it.  GCC commonly schedules the LAST epilogue pop into the delay
+    # slot of rts — including `lds.l @r15+, macl` for the macl restore
+    # (e.g. tiny math helpers like mini-fn 0x0602C020).
     op_ds = _read_opcode(binary, vram, delay_slot)
     mnem_ds, _ = decode_sh2(op_ds, delay_slot) if op_ds is not None else (None, None)
+    ds_pop_reg = None
+    if mnem_ds:
+        ds_pop_reg = (_pop_register(mnem_ds)
+                      or ("pr" if _is_pr_pop(mnem_ds) else None)
+                      or ("macl" if _is_macl_pop(mnem_ds) else None))
+    delay_slot_consumed = False
+    if ds_pop_reg and expected and ds_pop_reg == expected[0]:
+        delay_slot_consumed = True
+        expected_idx = 1
+    else:
+        # Either not a pop, or doesn't match expected[0] — leave it out
+        # so the match check downstream doesn't get a phantom mismatch.
+        expected_idx = 0
 
-    restored = []
-    ds_pop = _pop_register(mnem_ds) if mnem_ds else None
-
-    # Walk backward from rts_addr - 2 collecting register pops, pr/macl pops, stack dealloc.
-    # Bound by func_start so we don't scan past the function's prologue into prior bytes.
-    #
-    # GCC's scheduler can interleave a few non-epilogue ops (return-value
-    # computation, condition setup, etc.) between the restores — most
-    # commonly an `extu.b r0, r0` or similar value-shape fixup between the
-    # macl pop and the pr pop.  Mirror _walk_prologue's MAX_INTERLEAVE
-    # tolerance so we don't bail before finding stack-dealloc / macl-pop
-    # that sit ahead of an interleaved instruction.
     MAX_INTERLEAVE = 6
+    matches = []                      # pops captured in walk order
+    matched_stack = 0
+    matched_stack_addr = None
     epilogue_start = rts_addr
     addr = rts_addr - 2
-    stack = 0
     lower_bound = func_start if func_start is not None else 0
     consecutive_non_epi = 0
+
     while addr >= lower_bound:
         op = _read_opcode(binary, vram, addr)
         if op is None:
@@ -306,34 +345,49 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None):
         mnem, _ = decode_sh2(op, addr)
         if mnem is None:
             break
+        head = mnem.split()[0] if mnem else ""
+
+        # Hard stop on control flow.  Epilogue is single-block.
+        if head in _EPI_HARD_STOPS:
+            break
+
+        # Pop / pr-pop / macl-pop: must match expected sequence.
         reg = _pop_register(mnem)
-        if reg:
-            restored.insert(0, reg)
-            epilogue_start = addr
-            consecutive_non_epi = 0
-        elif _is_pr_pop(mnem):
-            restored.insert(0, "pr")
-            epilogue_start = addr
-            consecutive_non_epi = 0
-        elif _is_macl_pop(mnem):
-            restored.insert(0, "macl")
-            epilogue_start = addr
-            consecutive_non_epi = 0
-        elif _is_stack_dealloc(mnem) is not None:
-            stack = _is_stack_dealloc(mnem)
+        is_pr = _is_pr_pop(mnem)
+        is_macl = _is_macl_pop(mnem)
+        dealloc = _is_stack_dealloc(mnem)
+
+        if reg or is_pr or is_macl:
+            popped = reg or ("pr" if is_pr else "macl")
+            if expected_idx < len(expected) and popped == expected[expected_idx]:
+                matches.append(popped)
+                expected_idx += 1
+                epilogue_start = addr
+                consecutive_non_epi = 0
+            else:
+                # Pop without a matching slot in `saved` → body code, stop.
+                break
+        elif dealloc is not None:
+            matched_stack = dealloc
+            matched_stack_addr = addr
             epilogue_start = addr
             consecutive_non_epi = 0
         else:
             consecutive_non_epi += 1
             if consecutive_non_epi > MAX_INTERLEAVE:
                 break
+
         addr -= 2
 
-    # Append delay-slot pop last (if it is a pop)
-    if ds_pop:
-        restored.append(ds_pop)
+    # Build `restored` in forward execution order.  Walking backward we
+    # collected matches in the order: r14, r13, ..., pr, macl.  Forward
+    # execution pops them in reverse: macl, pr, ..., r13, r14.  Delay slot
+    # pop (if matched) executes LAST → goes at the end.
+    restored = list(reversed(matches))
+    if delay_slot_consumed:
+        restored.append(ds_pop_reg)
 
-    return epilogue_start, restored, stack, rts_addr, delay_slot
+    return epilogue_start, restored, matched_stack, rts_addr, delay_slot
 
 
 def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
@@ -635,7 +689,7 @@ def analyze_candidate(binary, vram, start, hint_end=None, pool_priors=None):
     # boundary).  Epilogue detection has to see real instructions; pool data
     # would scramble it.
     epi_start, restored, stack_dealloc, final_rts, delay_slot = _walk_epilogue_backward(
-        binary, vram, code_end, func_start=start
+        binary, vram, code_end, func_start=start, saved=saved,
     )
     epilogue_range = (epi_start, code_end) if epi_start is not None else (None, None)
 
@@ -711,12 +765,39 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
     else:
         score += 1
 
-    # Check prologue/epilogue register correspondence
-    # Push order: high-to-low. Pop order: low-to-high. So reversed(saved) == restored, modulo pr/macl handling.
-    saved_norm = [r for r in saved if r != "pr" and r != "macl"]
-    restored_norm = [r for r in restored if r != "pr" and r != "macl"]
-    if saved_norm and list(reversed(saved_norm)) != restored_norm:
-        flags.append(f"prologue/epilogue register mismatch: pushed {saved}, restored {restored}")
+    # Prologue/epilogue correspondence.  Two-tier:
+    #
+    #  (a) pr / macl MUST round-trip.  Pushing pr without popping it before
+    #      rts crashes the function (the rts pops PC from the wrong slot).
+    #      Same for macl.  Flag immediately if the prologue saved them but
+    #      the epilogue walker didn't see the pop.
+    #
+    #  (b) GP registers (r0-r14) can be legitimately asymmetric: GCC will
+    #      sometimes emit a save-around-jsr in the prologue area to
+    #      preserve a scratch register across an internal call (e.g.
+    #      FUN_0602AE74's `mov.l r4, @-r15` right after `sts.l pr` — r4 is
+    #      popped MID-BODY at the function's first jsr return, not at the
+    #      function's rts).  The epilogue walker (with the new strict-
+    #      matching rule) will only consume pops that match the
+    #      prologue's push list in reverse-walk order, so `restored` is
+    #      always a SUFFIX of `reversed(saved)`.  Anything missing from
+    #      the head of that suffix is a "mid-life save" and not a problem.
+    saved_critical = {r for r in saved if r in ("pr", "macl")}
+    restored_critical = {r for r in restored if r in ("pr", "macl")}
+    missing_critical = saved_critical - restored_critical
+
+    saved_gp = [r for r in saved if r not in ("pr", "macl")]
+    restored_gp = [r for r in restored if r not in ("pr", "macl")]
+    expected_gp = list(reversed(saved_gp))
+    gp_suffix_ok = (not restored_gp) or (restored_gp == expected_gp[-len(restored_gp):])
+
+    if missing_critical:
+        flags.append(
+            f"critical: prologue pushed {sorted(missing_critical)} but epilogue never restored — function would crash on return")
+    elif not gp_suffix_ok:
+        # Defensive — should not fire under the new walker, but catches
+        # any future regression in walker matching logic.
+        flags.append(f"prologue/epilogue register order mismatch: pushed {saved}, restored {restored}")
     else:
         score += 1
 

@@ -67,6 +67,37 @@ function evidenceHtml(e) {
   return parts.join('');
 }
 
+function renderGapAlert(gaps) {
+  const el = document.getElementById('gap-alert');
+  if (!el) return;
+  if (!gaps || gaps.length === 0) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    return;
+  }
+  const totalBytes = gaps.reduce((n, g) => n + g.size, 0);
+  const items = gaps.map(g => `
+    <li>
+      <code>0x${g.start_hex} -> 0x${g.end_hex}</code>
+      <span class="gap-size">(${g.size} bytes)</span>
+      after <code>${g.preceding_name}</code>
+      <button class="gap-fix-btn" data-start="${g.preceding_start}"
+              title="Unstamp ${g.preceding_name} so you can re-review and extend its boundary to swallow the gap">
+        review ${g.preceding_name}
+      </button>
+    </li>
+  `).join('');
+  el.classList.remove('hidden');
+  el.innerHTML = `
+    <div class="gap-alert-title">
+      &#x26A0; INTERNAL GAP${gaps.length === 1 ? '' : 'S'} DETECTED
+      &mdash; ${gaps.length} gap${gaps.length === 1 ? '' : 's'},
+      ${totalBytes} byte${totalBytes === 1 ? '' : 's'} uncovered between verified subsegs
+    </div>
+    <ul class="gap-alert-list">${items}</ul>
+  `;
+}
+
 function renderHeader(s) {
   const el = document.getElementById('header-content');
   if (s.all_caught_up) {
@@ -341,6 +372,7 @@ async function fetchState() {
     const s = await r.json();
 
     renderHeader(s);
+    renderGapAlert(s.internal_gaps);
 
     if (s.all_caught_up) {
       document.getElementById('listing').innerHTML = '';
@@ -391,6 +423,33 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-approve').addEventListener('click', () => submitVerdict('approved'));
   document.getElementById('btn-reject').addEventListener('click',  () => submitVerdict('rejected'));
   document.getElementById('btn-unsure').addEventListener('click',  () => submitVerdict('unsure'));
+
+  // "review FUN_X" button inside the gap alert → POST /unstamp for the
+  // preceding subseg so the human can re-review it with current oracle
+  // logic and extend the boundary to swallow the gap.
+  document.getElementById('gap-alert').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.gap-fix-btn');
+    if (!btn) return;
+    const start = parseInt(btn.dataset.start, 10);
+    if (Number.isNaN(start)) return;
+    btn.disabled = true;
+    btn.textContent = 'unstamping…';
+    const r = await fetch('/unstamp', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({start: `0x${start.toString(16).toUpperCase().padStart(8, '0')}`}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      btn.disabled = false;
+      btn.textContent = 'failed — retry';
+      setStatus('unstamp failed: ' + (data.error || 'unknown'));
+      return;
+    }
+    // Next /state poll will re-propose the unstamped function as the
+    // current candidate.
+    fetchState();
+  });
 
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;

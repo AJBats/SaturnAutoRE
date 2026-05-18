@@ -1145,6 +1145,72 @@ def _compute_archive_agreement(start, end):
     }
 
 
+def _detect_internal_gaps(proposed_start=None):
+    """Find every uncovered byte range BETWEEN consecutive verified code
+    subsegs PLUS the pending gap between the latest verified subseg and the
+    currently-proposed candidate (if any).
+
+    Why include the pending gap: when forward-sweep can't find a real
+    function in a zone (no archive label, no prologue, no callers), it
+    skips over to the next function it CAN find — leaving a would-be gap
+    that the user will create the instant they approve.  We catch this
+    state pre-emptively rather than waiting for the approval to fire the
+    banner.
+
+    The actual tail (after the proposed candidate's end) is still
+    excluded — that's the unswept frontier ahead of forward-sweep, not a
+    gap.
+
+    Returns a list of gap dicts.  Each dict has a `pending: bool` field —
+    True means the gap is between latest-stamped and current proposal
+    (would be created on approval); False means it already exists in
+    the yaml (a real bug to backfill).
+    """
+    cfg = STATE["cfg_cache"]
+    subs = sorted(
+        [s for s in cfg.get("subsegments", []) if s.get("type") == "code"],
+        key=lambda s: s["start"],
+    )
+    gaps = []
+    prev = None
+    for s in subs:
+        if prev is not None and s["start"] > prev["end"] + 1:
+            gap_start = prev["end"] + 1
+            gap_end = s["start"] - 1
+            gaps.append({
+                "start": gap_start,
+                "end": gap_end,
+                "start_hex": f"{gap_start:08X}",
+                "end_hex": f"{gap_end:08X}",
+                "size": gap_end - gap_start + 1,
+                "preceding_start": prev["start"],
+                "preceding_start_hex": f"{prev['start']:08X}",
+                "preceding_end_hex": f"{prev['end']:08X}",
+                "preceding_name": f"FUN_{prev['start']:08X}",
+                "pending": False,
+            })
+        prev = s
+
+    # Pending gap between latest verified and the proposed candidate.
+    if proposed_start is not None and prev is not None:
+        if proposed_start > prev["end"] + 1:
+            gap_start = prev["end"] + 1
+            gap_end = proposed_start - 1
+            gaps.append({
+                "start": gap_start,
+                "end": gap_end,
+                "start_hex": f"{gap_start:08X}",
+                "end_hex": f"{gap_end:08X}",
+                "size": gap_end - gap_start + 1,
+                "preceding_start": prev["start"],
+                "preceding_start_hex": f"{prev['start']:08X}",
+                "preceding_end_hex": f"{prev['end']:08X}",
+                "preceding_name": f"FUN_{prev['start']:08X}",
+                "pending": True,
+            })
+    return gaps
+
+
 def _compute_progress():
     """Sum verified code subseg bytes vs total binary size.
 
@@ -1266,9 +1332,14 @@ def state():
                 "all_caught_up": True,
                 "history_count": len(history),
                 "progress": progress,
+                "internal_gaps": _detect_internal_gaps(),
             })
 
         prev, ev = nxt
+        # Pass the proposed candidate's start so the detector ALSO surfaces
+        # the gap between latest-stamped and proposal (forward-sweep skipped
+        # a real function in that zone) before the user creates it.
+        internal_gaps = _detect_internal_gaps(proposed_start=ev.start)
         lines = render_listing(ev, prev)
         archive = _compute_archive_agreement(ev.start, ev.end)
         evidence = _compute_candidate_evidence(ev.start, ev.end)
@@ -1303,6 +1374,7 @@ def state():
             "pending_messages": pending_msgs,
             "history_count": len(history),
             "progress": progress,
+            "internal_gaps": internal_gaps,
             "lines": lines,
         })
 

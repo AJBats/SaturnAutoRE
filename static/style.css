@@ -9,6 +9,66 @@ body {
   padding: 0;
 }
 
+/* Sticky wrapper so the gap alert and the header stack together at top
+   instead of overlapping (both had top:0 sticky → the alert's higher
+   z-index covered the metrics in the header).  The wrapper sticks; both
+   children flow naturally inside. */
+#sticky-top {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+}
+
+/* Gap alert — loud red banner above the candidate header.
+   Surfaces whenever there's an uncovered range BETWEEN two verified
+   subsegs OR between latest-stamped and the proposed candidate
+   (pre-stamp warning). */
+.gap-alert {
+  background: #4a1a1a;
+  color: #fdd;
+  border-bottom: 2px solid #c33;
+  padding: 0.6em 1em;
+}
+.gap-alert.hidden { display: none; }
+.gap-alert-title {
+  font-weight: bold;
+  color: #fcc;
+  margin-bottom: 0.3em;
+}
+.gap-alert-list {
+  margin: 0;
+  padding-left: 1.4em;
+  font-size: 12px;
+  color: #ecc;
+}
+.gap-alert-list li { margin: 0.2em 0; }
+.gap-alert-list code {
+  background: #2a1010;
+  padding: 0 0.3em;
+  border-radius: 0.2em;
+  color: #fdd;
+}
+.gap-alert .gap-size { color: #faa; }
+.gap-alert .gap-fix-btn {
+  margin-left: 0.6em;
+  background: #6a2a2a;
+  color: #fdd;
+  border: 1px solid #c66;
+  padding: 0.1em 0.6em;
+  border-radius: 0.2em;
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.gap-alert .gap-fix-btn:hover {
+  background: #8a3a3a;
+  border-color: #f88;
+}
+.gap-alert .gap-fix-btn:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
 header#header {
   padding: 0.4em 1em;
   background: #252526;
