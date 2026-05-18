@@ -911,6 +911,7 @@ def _compute_current(ignore_override=False):
         pool_priors=pool_priors,
         reference_starts=set(STATE.get("reference_starts") or []),
         static_callers=STATE.get("static_callers") or {},
+        cross_module_callers=STATE.get("cross_module_callers") or {},
     )
 
 
@@ -1471,6 +1472,22 @@ def _build_candidate_payload(prev, ev):
     reference = _compute_reference_agreement(ev.start, ev.end)
     evidence = _compute_candidate_evidence(ev.start, ev.end)
     lines = render_listing(ev, prev)
+
+    # Phantom hint: if the candidate's *only* supporting signal is a
+    # cross-module hot-swap caller (no same-module caller, no prologue
+    # register pushes), prepend a loud yellow flag so the human spots
+    # it immediately.  Oracle's forward sweep still proposes these so
+    # we don't silently skip 30 phantoms in a row — but the banner
+    # makes clear they're almost certainly hot-swap collisions.
+    yellow_flags = list(ev.yellow_flags)
+    has_cross = evidence.get("cross_module_callers", 0) > 0
+    has_same  = evidence.get("static_callers", 0) > 0
+    no_prologue = any("no prologue register pushes" in f for f in yellow_flags)
+    if has_cross and not has_same and no_prologue:
+        yellow_flags.insert(
+            0, "supported only by cross-module phantom callers (likely hot-swap collision, not a real entry)"
+        )
+
     return {
         "candidate": {
             "start_hex": f"{ev.start:08X}",
@@ -1479,7 +1496,7 @@ def _build_candidate_payload(prev, ev):
             "end": ev.end,
             "size": ev.end - ev.start + 1,
             "verdict": ev.verdict,
-            "yellow_flags": ev.yellow_flags,
+            "yellow_flags": yellow_flags,
             "name": f"FUN_{ev.start:08X}",
             "reference": reference,
             "evidence": evidence,

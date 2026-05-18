@@ -850,29 +850,38 @@ def _looks_like_fn_start(mnem):
 
 
 def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
-                            reference_starts=None, static_callers=None):
+                            reference_starts=None, static_callers=None,
+                            cross_module_callers=None):
     """Walk forward from start_addr looking for the next function entry.
 
-    Three signals, checked in priority order per address:
-      1. static_callers[addr] > 0  — somebody bsr/jsrs to this address;
-         definitively a function entry regardless of what its first
-         instruction looks like.
+    Four signals, any of which makes us propose `addr` as the next candidate:
+      1. static_callers[addr] > 0  — somebody in this binary's reference
+         bsr/jsrs to this address; definitively a function entry.
       2. addr in reference_starts    — reference labeled it FUN_<addr>; less
          decisive (reference has Ghidra hallucinations) but a real signal.
-      3. _looks_like_fn_start(...) — first instruction matches a register-
-         push pattern.  Weakest signal — misses non-ABI helper functions
-         that have no prologue (e.g. FUN_0602A818, which starts with
-         `mov.l @r6, r6` and is called 4× via bsr).
+      3. cross_module_callers[addr] > 0  — same-name reference in a sibling
+         hot-swap module bsr/jsrs to this address.  Can't physically resolve
+         to this binary at runtime, but worth surfacing as a candidate so
+         the human can quickly judge + reject rather than having us silently
+         skip over 30 phantoms in a row.  The candidate-evaluator tags it
+         with a yellow flag so it's loud in the banner.
+      4. _looks_like_fn_start(...) — first instruction matches a register-
+         push pattern.  Misses non-ABI helper functions that have no
+         prologue (e.g. FUN_0602A818, which starts with `mov.l @r6, r6`
+         and is called 4× via bsr).
 
     Returns the EARLIEST matching address, or None if nothing matches.
     """
     reference_starts = reference_starts or set()
     static_callers = static_callers or {}
+    cross_module_callers = cross_module_callers or {}
     addr = (start_addr + 1) & ~1
     while addr <= max_addr:
         if static_callers.get(addr, 0) > 0:
             return addr
         if addr in reference_starts:
+            return addr
+        if cross_module_callers.get(addr, 0) > 0:
             return addr
         off = addr - vram
         if off + 1 >= len(binary):
@@ -886,7 +895,8 @@ def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
 
 
 def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
-                                       reference_starts=None, static_callers=None):
+                                       reference_starts=None, static_callers=None,
+                                       cross_module_callers=None):
     """Forward-sweep candidate generation.
 
     Sorts verified code subsegs by start. For each, scans the bytes
@@ -929,6 +939,7 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
         next_start = _scan_for_next_prologue(
             binary, vram, vram, binary_end,
             reference_starts=reference_starts, static_callers=static_callers,
+            cross_module_callers=cross_module_callers,
         )
         if next_start is not None and not _covered_by_existing(next_start):
             tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)
@@ -940,6 +951,7 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
         next_start = _scan_for_next_prologue(
             binary, vram, prev["end"] + 1, binary_end,
             reference_starts=reference_starts, static_callers=static_callers,
+            cross_module_callers=cross_module_callers,
         )
         if next_start is None:
             continue
