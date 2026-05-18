@@ -250,14 +250,26 @@ header#header > #header-content {
   /* prevent overflow from leaking out — each pane scrolls independently */
 }
 
+/* Row of pane-banners — lives inside #sticky-top alongside the gap-alert
+   and progress header so it inherits viewport-level stickiness from its
+   parent.  Banner widths track the listing-pane widths below (both use
+   flex:1 in matching flex rows). */
+.banners-row {
+  display: flex;
+  flex-direction: row;
+  align-items: stretch;
+}
+.banners-row > .pane-banner { flex: 1; min-width: 0; }
+.banners-row > .pane-banner.hidden { display: none; }
+
 /* Per-pane banner — full candidate metadata (verdict, reference,
-   evidence, midpoints, flags) for ONE side of the diff. */
+   evidence, midpoints, flags) for ONE side of the diff.  NB: no
+   `position: sticky` here — the parent #sticky-top already provides
+   that.  Adding sticky here too created a nested-sticky stacking-context
+   bug that made content fight visually. */
 .pane-banner {
   padding: 0.5em 1em;
   border-bottom: 1px solid #333;
-  position: sticky;
-  top: 0;
-  z-index: 5;
   display: flex;
   align-items: center;
   gap: 0.8em;

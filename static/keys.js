@@ -492,6 +492,7 @@ async function fetchState() {
       primaryListing.innerHTML = '';
       primaryBanner.innerHTML = '';
       naturalPane.classList.add('hidden');
+      naturalBanner.classList.add('hidden');
       setStatus(`history: ${s.history_count}`);
       LAST_CANDIDATE_START = null;
       LAST_NATURAL_START = null;
@@ -541,8 +542,10 @@ async function fetchState() {
 
     if (overrideActive) {
       naturalPane.classList.remove('hidden');
+      naturalBanner.classList.remove('hidden');
     } else {
       naturalPane.classList.add('hidden');
+      naturalBanner.classList.add('hidden');
       naturalBanner.innerHTML = '';
       naturalListing.innerHTML = '';
     }
