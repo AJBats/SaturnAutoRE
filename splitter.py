@@ -146,7 +146,7 @@ def load_pool_priors(yaml_path):
     if not priors_path.exists():
         return {}
     priors = {}
-    for line in priors_path.read_text().splitlines():
+    for line in priors_path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue

@@ -42,7 +42,7 @@ def extract(archive_dir, output_file):
     for s_file in archive_dir.glob("*.s"):
         files_scanned += 1
         current_addr = None
-        for raw_line in s_file.read_text().splitlines():
+        for raw_line in s_file.read_text(errors="replace").splitlines():
             stripped = raw_line.strip()
             if not stripped:
                 continue

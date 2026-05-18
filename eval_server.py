@@ -266,7 +266,14 @@ def _compute_indent_depths(ev):
     if binary is None or vram is None:
         return {}
 
-    fn_start, fn_end = ev.start, ev.end
+    # CFG region analysis must NOT walk through the trailing pool zone:
+    # pool bytes can spell branch opcodes (rts/jmp/etc.) and create bogus
+    # basic blocks that pollute the region containment graph.  Use the
+    # last reachable instruction's end as our cap instead of ev.end.
+    if not ev.reachable:
+        return {}
+    fn_start = ev.start
+    fn_end = max(ev.reachable) + 1
 
     # ----- 1. Identify block-start addresses
     block_starts = {fn_start}
@@ -749,7 +756,11 @@ def render_listing(ev, prev_subseg):
     lines = []
 
     if prev_subseg:
-        prev_ev = analyze_candidate(binary, vram, prev_subseg["start"], hint_end=prev_subseg["end"])
+        prev_ev = analyze_candidate(
+            binary, vram, prev_subseg["start"],
+            hint_end=prev_subseg["end"],
+            pool_priors=STATE.get("pool_priors"),
+        )
         # Honor yaml's `end` — that's what the splitter uses to emit race.s.
         # Oracle's CFG-walk may stop earlier (e.g., at a jmp's delay slot,
         # before unreachable bytes the compiler emitted as a dead epilogue).
@@ -861,7 +872,7 @@ def _load_archive_starts():
     starts = set()
     fun_re = re.compile(r"^FUN_([0-9A-Fa-f]{8}):\s*$")
     for s_file in archive_dir.glob("*.s"):
-        for raw in s_file.read_text().splitlines():
+        for raw in s_file.read_text(errors="replace").splitlines():
             m = fun_re.match(raw.strip())
             if m:
                 starts.add(int(m.group(1), 16))
@@ -1089,7 +1100,7 @@ def _load_pool_priors():
     if not priors_path.exists():
         return {}
     priors = {}
-    for line in priors_path.read_text().splitlines():
+    for line in priors_path.read_text(errors="replace").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
