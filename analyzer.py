@@ -1,0 +1,1741 @@
+#!/usr/bin/env python3
+"""analyzer.py — single source of truth for code intelligence.
+
+Successor to oracle.py + the analytical half of eval_server.py.  Holds every
+decision about "what these bytes mean": pool vs code, function boundaries,
+CFG reachability, branch internality, callgraph, reference agreement,
+midpoints, indent depths, indirect resolutions, sweep state.
+
+eval_server2.py is its only consumer.  Eval server NEVER asks "what is at
+address X" — it asks the analyzer for already-decorated ListingRow objects
+and templates them into HTML.
+
+This file is the SKELETON.  Data classes are defined here; implementations
+are filled in phase by phase per the refactor plan.  See:
+  - Phase 1: BinaryModel.byte_kind / pool_words / instructions
+  - Phase 2: BinaryModel.callers / reference_starts / runtime_hits
+  - Phase 3: BinaryModel.analyze_function
+  - Phase 4: FunctionAnalysis.indent_depths / reference / midpoints / etc.
+  - Phase 5: SweepState
+  - Phase 6: SweepState.listing
+  - Phase 7: SweepState.aligned_listings
+"""
+
+from __future__ import annotations
+
+import sys as _sys
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+# Phase 3b: analyzer is self-contained.  Only external dependency is the
+# SH-2 decoder, which lives in lib/.  Oracle.py is no longer imported.
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR / "lib") not in _sys.path:
+    _sys.path.insert(0, str(_SCRIPT_DIR / "lib"))
+
+from sh2_decode import decode_sh2 as _decode_sh2
+
+
+# ---------------------------------------------------------------------------
+# Byte-level classification — the foundation everything else builds on.
+# ---------------------------------------------------------------------------
+
+class ByteKind(Enum):
+    """What does a single 2-byte-aligned address represent?
+
+    Computed once per BinaryModel construction by unifying:
+      - reference-derived pool_priors
+      - whole-binary PC-relative load target scan (two-pass to avoid the
+        data-as-code trap where bytes inside a pool word bit-align as a
+        valid mov.l opcode)
+      - padding-pair detection (0x0000 / 0x0009)
+      - jump-table walking from braf+mova+mov.w switch idioms
+      - reachable-set walks from every known function entry
+
+    Every downstream consumer (function-end extension, listing renderer,
+    indent computation, indirect resolution) reads from this map.  No
+    consumer re-derives.
+    """
+    INSTRUCTION = "instruction"
+    POOL4 = "pool4"                  # 4-byte literal (.4byte)
+    POOL2 = "pool2"                  # 2-byte literal (.2byte)
+    JUMP_TABLE_ENTRY = "jump_table"  # 2-byte signed offset into a braf table
+    PADDING = "padding"              # alignment fill (zero / nop)
+    UNKNOWN = "unknown"              # not yet classified
+
+
+class InstructionCategory(Enum):
+    """Coarse-grained category for an instruction, driving UI categorization
+    (cat-return / cat-call / cat-uncond / cat-cond / cat-pool / cat-compare).
+
+    Set by the analyzer once per decoded instruction; eval_server maps to
+    CSS classes verbatim — no re-classification clientside or serverside.
+    """
+    RETURN = "return"                  # rts / rte
+    CALL = "call"                       # jsr / bsr / bsrf
+    UNCOND_BRANCH = "uncond_branch"    # bra / jmp / braf
+    COND_BRANCH = "cond_branch"        # bf / bt / bf/s / bt/s
+    INDIRECT_BRANCH = "indirect_branch"  # jmp @rN / braf rN  (set additionally to UNCOND_BRANCH for indirect cases)
+    POOL_LOAD = "pool_load"            # mov.l/mov.w @(disp,PC) / mova
+    COMPARE = "compare"                # tst / cmp.*
+    OTHER = "other"
+
+
+@dataclass
+class Instruction:
+    """Per-instruction decoded record.  Populated for every addr where
+    byte_kind == INSTRUCTION.
+
+    RESERVED — no consumer today.  Phase 6 (listing model) is the
+    likely first consumer: each ListingRow with kind=INSTRUCTION would
+    pull its decoded text + category from here instead of re-decoding."""
+    addr: int
+    opcode: int                         # 16-bit raw opcode
+    mnem: str                           # disassembled text from decode_sh2
+    decoded_target: Optional[int]       # PC-relative target if the opcode encodes one (branches, PC-rel loads)
+    category: InstructionCategory
+    length_bytes: int = 2                # always 2 for SH-2 but field reserved
+
+
+@dataclass
+class PoolWord:
+    """Per-pool-address record.  Populated for every addr where
+    byte_kind in {POOL4, POOL2}."""
+    addr: int
+    size: int                           # 2 or 4
+    value: int                          # the literal value at this addr
+    loaded_from: list = field(default_factory=list)  # list of instruction addrs that load this pool word
+
+
+# ---------------------------------------------------------------------------
+# Callgraph
+# ---------------------------------------------------------------------------
+
+class CallKind(Enum):
+    """How a call site references its target.
+
+    RESERVED — phase 2 stores caller COUNTS in flat {addr: int} dicts
+    (BinaryModel.static_callers / .cross_module_callers) for byte-exact
+    parity with eval_server.  Promoting to structured CallSite records
+    is forward-facing; no consumer yet."""
+    DIRECT_BSR = "direct_bsr"          # `bsr disp` — PC-relative call
+    DIRECT_BRA = "direct_bra"          # `bra disp` — PC-relative jump (tail call)
+    DIRECT_JSR = "direct_jsr"          # `jsr @rN` where rN loaded from PC-rel pool (resolved)
+    DIRECT_JMP = "direct_jmp"          # `jmp @rN` similarly resolved
+    FUNCTION_POINTER = "function_pointer"  # 4-byte word in a pool whose value lands in vram range, 2-byte aligned
+    CROSS_MODULE = "cross_module"      # text-scanned from sibling hot-swap module .s files
+
+
+@dataclass
+class CallSite:
+    """Structured caller record.  RESERVED — see CallKind."""
+    src: Optional[int]                  # caller address (None for cross-module/pool-only refs without resolved src)
+    kind: CallKind
+    module: Optional[str] = None        # module name for cross-module callers
+
+
+# ---------------------------------------------------------------------------
+# Branch / control-flow records
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Branch:
+    """A branch instruction inside a function.  Same role as oracle.py's
+    BranchInfo, kept here so analyzer is self-contained."""
+    src: int
+    target: Optional[int]               # None for register-indirect branches
+    mnem: str                           # 'bra', 'bsr', 'bf', 'bf/s', 'jmp', 'jsr', etc.
+    internal: bool                      # target inside [func.start, func.end]
+    direction: Optional[str] = None     # 'forward' / 'backward' / None (for indirect)
+
+
+# ---------------------------------------------------------------------------
+# Per-function analysis
+# ---------------------------------------------------------------------------
+
+class Verdict(str, Enum):
+    """Verdict tier emitted by the analyzer's scoring.  Inherits from
+    `str` so it serializes to JSON as its value string and concatenates
+    into CSS class names (`f"verdict-{v}"` → `"verdict-HIGH"`) without
+    needing explicit `.value` access at the wire boundary."""
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class ReferenceAgreement:
+    """Comparison of analyzer's proposed boundary against reference's view."""
+    verdict: str                        # "agrees" | "disagrees" | "silent"
+    start_match: bool
+    reference_next: Optional[int]       # reference's next FUN start > our start
+    reference_implied_end: Optional[int]  # reference_next - 1
+    end_delta: Optional[int]            # our_end - reference_implied_end (positive = we're longer)
+    tooltip: str
+
+
+@dataclass
+class Midpoint:
+    """A reference FUN_<X> start that falls strictly inside our proposed
+    function's range — i.e., reference thinks there's a function start
+    within our body."""
+    addr: int
+    static_callers: int
+    cross_module_callers: int
+    runtime_hits: int
+
+
+@dataclass
+class FunctionEvidence:
+    """Caller / runtime evidence for a function's start."""
+    static_callers: int = 0
+    cross_module_callers: int = 0
+    runtime_hits: int = 0
+
+
+@dataclass
+class FunctionAnalysis:
+    """Full analytical record for one function.  Replaces oracle.py's
+    FunctionEvidence and absorbs the per-function fields eval_server
+    currently computes separately (indent_depths, reference, midpoints,
+    indirect resolutions, phantom_hint)."""
+
+    # ----- Boundaries
+    start: int
+    end: int                            # last byte inclusive, including trailing pool
+
+    # ----- Prologue / epilogue
+    prologue_range: tuple                # (start, end_inclusive)
+    prologue_saved: list                 # ['r14', 'r13', ..., 'pr', 'macl']
+    prologue_stack: int                  # bytes reserved (negative add #-N, r15)
+    epilogue_range: tuple                # (start, end_inclusive) or (None, None)
+    final_exit: Optional[int]            # addr of rts/jmp/braf/bra whose delay slot is at end-1
+    delay_slot: Optional[int]            # addr of the delay-slot instruction
+
+    # ----- Control flow
+    branches: list = field(default_factory=list)         # Branch[]
+    conditional_returns: list = field(default_factory=list)  # addrs of non-final rts
+    pool_targets: list = field(default_factory=list)     # all PC-rel load targets in reachable set
+    reachable: set = field(default_factory=set)          # set of addrs reachable from start
+
+    # ----- Indent depths from CFG region analysis (moved from eval_server)
+    indent_depths: dict = field(default_factory=dict)    # {addr: depth}
+
+    # ----- Indirect-target resolutions inside this function (moved from eval_server)
+    indirect_resolutions: dict = field(default_factory=dict)  # {addr: resolved_target}
+
+    # ----- Verdict
+    verdict: Verdict = Verdict.UNKNOWN
+    yellow_flags: list = field(default_factory=list)
+
+    # ----- Reference / midpoint / evidence
+    reference: Optional[ReferenceAgreement] = None
+    midpoints: list = field(default_factory=list)        # Midpoint[]
+    evidence: FunctionEvidence = field(default_factory=FunctionEvidence)
+    phantom_hint: bool = False                            # cross-module-only + no prologue + no same-module caller
+
+
+# ---------------------------------------------------------------------------
+# Listing rows — the rich rendering primitives eval_server templates from.
+# ---------------------------------------------------------------------------
+
+class RowKind(Enum):
+    """What kind of row is this — drives eval_server's HTML template
+    selection.  Renderer never re-classifies."""
+    SECTION_HEADER = "section_header"   # 'prev' / 'intermediate' / 'current' / 'trailing' banner
+    LABEL = "label"                      # `.L_<addr>:` branch target marker
+    INSTRUCTION = "instruction"          # decoded SH-2 op
+    POOL4 = "pool4"                      # `.4byte 0x...` literal
+    POOL2 = "pool2"                      # `.2byte 0x...` literal
+    PADDING = "padding"                  # alignment fill
+    RAW = "raw"                          # fallback decode in intermediate/trailing zones (rare after byte_kind fully populated)
+    BLANK = "blank"                      # diff-alignment placeholder for split view
+
+
+class Section(Enum):
+    PREV = "prev"
+    INTERMEDIATE = "intermediate"
+    CURRENT = "current"
+    TRAILING = "trailing"
+
+
+class PinAction(Enum):
+    """What does the row's `+` button do?  Set by analyzer per row;
+    eval_server reads it verbatim to wire the click handler."""
+    PIN_START = "pin_start"             # above current candidate start
+    PIN_END = "pin_end"                  # on or below current candidate start
+    NONE = "none"
+
+
+class UnpinAction(Enum):
+    """What does the row's `[ unpin ]` button do?  Only set on section
+    headers; reflects which header it sits on."""
+    UNPIN_ALL = "unpin_all"             # PROPOSED header — nuke the entire override
+    UNPIN_END = "unpin_end"             # TRAILING header — drop only the end pin
+    NONE = "none"
+
+
+@dataclass
+class ListingRow:
+    """One row of the listing — fully decorated, no decisions left for
+    eval_server beyond field-to-CSS-class mapping.
+
+    Most fields are optional; their relevance depends on `kind` and
+    `section`.  Eval_server's renderer must be a single template that
+    reads these fields and emits a span — no branching on kind beyond
+    template selection."""
+
+    # ----- Identity
+    row_id: int                          # stable index within the listing
+    kind: RowKind
+    section: Optional[Section]
+
+    # ----- Position / anchoring (for diff alignment + scroll)
+    addr: Optional[int] = None
+    anchor_addr: Optional[int] = None    # used by split-view diff alignment (for section headers)
+
+    # ----- Content (varies by kind)
+    bytes_hex: str = ""                  # "A2 A4" — formatted for display
+    text: str = ""                        # mnem ("mov.l r4, @-r15") or pool literal (".4byte 0x12345678")
+    label: str = ""                       # for LABEL rows ('.L_06028A40:'), pool labels ('.L_pool_06037296'), or section header text
+    margin: str = ""                      # '↓' / '↑' / '→' direction arrow
+    tag: str = ""                         # right-column annotation ('⇒ EXIT', '⇒ TAIL?', '↩ ret', etc.)
+
+    # ----- Function-relative roles (only meaningful inside Section.CURRENT)
+    is_prologue: bool = False
+    is_epilogue: bool = False
+    is_final_rts: bool = False
+    is_conditional_rts: bool = False
+    is_unreachable: bool = False
+
+    # ----- Categorization (drives CSS .cat-* classes)
+    category: Optional[InstructionCategory] = None
+    is_tail_call: bool = False           # external uncond branch — loudest red
+
+    # ----- Indent depth (capped for display in renderer)
+    indent: int = 0
+
+    # ----- Branch metadata (for arc drawing — only set on instructions/pools with internal targets)
+    branch_target: Optional[int] = None
+    branch_direction: Optional[str] = None  # 'forward' / 'backward'
+    branch_type: Optional[str] = None        # 'cond' / 'uncond'
+
+    # ----- Indirect-target resolution annotation ("⇒ FUN_X" inline tail)
+    indirect_resolved_label: str = ""    # "FUN_0602AB10" or "0x06037000" — empty if not applicable
+
+    # ----- Decoration flags (precedence already resolved: attn > midpoint > ref_end)
+    is_attn: bool = False
+    is_midpoint: bool = False
+    is_ref_end: bool = False
+
+    # ----- Action wiring — eval_server reads these to attach click handlers
+    pin_action: PinAction = PinAction.NONE
+    unpin_action: UnpinAction = UnpinAction.NONE
+
+
+# ---------------------------------------------------------------------------
+# Sweep state — yaml + session-driven derived state
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Gap:
+    """One uncovered byte range between verified subsegs, or between the
+    last verified subseg and the proposed candidate."""
+    start: int
+    end: int
+    size: int
+    preceding_start: int
+    preceding_name: str                  # 'FUN_06028000'
+    pending: bool                        # True if gap is "would be created on approval"
+
+
+@dataclass
+class Progress:
+    verified_bytes: int
+    total_bytes: int
+    pct: float
+
+
+@dataclass
+class VerifiedSubseg:
+    """Mirrors the yaml subseg shape but as a typed record."""
+    start: int
+    end: int
+    type: str = "code"
+    file: str = ""
+
+
+@dataclass
+class NextCandidate:
+    """What SweepState.next_candidate returns: the next function the human
+    should verdict, plus its immediately-preceding verified subseg (for
+    rendering the 'prev' section above it)."""
+    previous: Optional[VerifiedSubseg]
+    function: FunctionAnalysis
+
+
+# ---------------------------------------------------------------------------
+# Static-analysis helpers (moved verbatim from oracle.py in phase 3b).
+#
+# Pure functions: take binary/vram/etc. as arguments, return analysis
+# results.  No `self`; no module state.  Used by BinaryModel.analyze_function
+# and (later) by SweepState.next_candidate.
+# ---------------------------------------------------------------------------
+
+_BRANCH_MNEMONICS = {"bra", "bsr", "bf", "bt", "bf/s", "bt/s"}
+_DELAYED_BRANCH   = {"bra", "bsr", "bf/s", "bt/s", "jmp", "jsr", "braf", "bsrf", "rts", "rte"}
+_UNCONDITIONAL_EXIT = {"bra", "jmp", "rts", "rte"}
+_EPI_HARD_STOPS = ("rts", "rte", "bra", "bsr", "bf", "bt", "bf/s", "bt/s",
+                    "jmp", "jsr", "braf", "bsrf")
+
+# Function-start signals — patterns that strongly suggest "a function begins
+# at this address."  Used by forward sweep to scan past pool/data zones.
+# RESERVED FOR PHASE 5 — wired by SweepState.next_candidate when forward
+# sweep moves from oracle.find_next_forward_sweep_candidate into analyzer.
+_FN_START_PREFIXES = (
+    # Callee-saved pushes — strong signal that a real function starts here.
+    "mov.l r8, @-r15", "mov.l r9, @-r15", "mov.l r10, @-r15",
+    "mov.l r11, @-r15", "mov.l r12, @-r15", "mov.l r13, @-r15",
+    "mov.l r14, @-r15",
+    # PR / MACL push — typical pre-prologue save.
+    "sts.l pr, @-r15", "sts.l macl, @-r15",
+    # Scratch-register pushes — tiny helper functions (memclr/memcpy-style
+    # loops, jsr trampolines) save only r0-r7 because they don't call out.
+    "mov.l r0, @-r15", "mov.l r1, @-r15", "mov.l r2, @-r15",
+    "mov.l r3, @-r15", "mov.l r4, @-r15", "mov.l r5, @-r15",
+    "mov.l r6, @-r15", "mov.l r7, @-r15",
+)
+
+
+# ----- Mnemonic predicates --------------------------------------------------
+
+def _push_register(mnem):
+    """If mnem is `mov.l rN, @-r15`, return rN; else None."""
+    if not mnem.startswith("mov.l r"):
+        return None
+    parts = mnem.split()
+    if len(parts) != 3 or parts[2] != "@-r15":
+        return None
+    return parts[1].rstrip(",")
+
+
+def _pop_register(mnem):
+    """If mnem is `mov.l @r15+, rN` for any rN in r0-r14, return rN.
+
+    Originally only r8-r14 (callee-saved) counted as epilogue restoration on
+    the theory that r0-r7 pops were argument cleanup mid-function.  But tiny
+    helper functions that only push r0-r7 in their prologue also need their
+    pops recognized as the epilogue, or the walker bails immediately.  Mid-
+    function scratch pop/push pairs are safely far from the rts — the
+    epilogue walker's MAX_INTERLEAVE tolerance prevents the walker from
+    reaching them.
+    """
+    if not mnem.startswith("mov.l @r15+, r"):
+        return None
+    parts = mnem.split()
+    if len(parts) != 3:
+        return None
+    reg = parts[2]
+    if reg in {f"r{i}" for i in range(0, 15)}:
+        return reg
+    return None
+
+
+def _is_pr_push(mnem):   return mnem == "sts.l pr, @-r15"
+def _is_pr_pop(mnem):    return mnem == "lds.l @r15+, pr"
+def _is_macl_push(mnem): return mnem == "sts.l macl, @-r15"
+def _is_macl_pop(mnem):  return mnem == "lds.l @r15+, macl"
+
+
+def _is_stack_alloc(mnem):
+    """add #-N, r15 — returns N (positive) or None."""
+    if not mnem.startswith("add #-"):
+        return None
+    parts = mnem.split()
+    if len(parts) != 3 or parts[2] != "r15":
+        return None
+    imm = parts[1].rstrip(",")
+    if not imm.startswith("#-0x"):
+        return None
+    try:
+        return int(imm[4:], 16)
+    except ValueError:
+        return None
+
+
+def _is_stack_dealloc(mnem):
+    """add #N, r15 — returns N or None."""
+    if not mnem.startswith("add #") or mnem.startswith("add #-"):
+        return None
+    parts = mnem.split()
+    if len(parts) != 3 or parts[2] != "r15":
+        return None
+    imm = parts[1].rstrip(",")
+    if not imm.startswith("#0x"):
+        return None
+    try:
+        return int(imm[3:], 16)
+    except ValueError:
+        return None
+
+
+def _branch_target(mnem):
+    """If mnem is a direct branch (bra/bsr/bf/bt/...), return target addr; else None."""
+    parts = mnem.split()
+    if not parts or parts[0] not in _BRANCH_MNEMONICS:
+        return None
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1].rstrip(","), 16)
+    except ValueError:
+        return None
+
+
+def _is_indirect_branch(mnem):
+    """jmp @rN / jsr @rN / braf rN / bsrf rN — control flow with no static target."""
+    parts = mnem.split()
+    if not parts:
+        return False
+    return parts[0] in {"jmp", "jsr", "braf", "bsrf"}
+
+
+def _read_opcode(binary, vram, addr):
+    off = addr - vram
+    if off + 1 >= len(binary):
+        return None
+    return (binary[off] << 8) | binary[off + 1]
+
+
+def _looks_like_fn_start(mnem):
+    if not mnem:
+        return False
+    for prefix in _FN_START_PREFIXES:
+        if mnem == prefix or mnem.startswith(prefix):
+            return True
+    return False
+
+
+# ----- Prologue / epilogue walkers ------------------------------------------
+
+def _walk_prologue(binary, vram, start):
+    """Walk forward from `start` recognizing prologue instructions.
+
+    GCC schedulers can interleave non-prologue ops (tst, mov #imm, etc.)
+    between register pushes.  We allow up to MAX_INTERLEAVE consecutive
+    non-prologue instructions before stopping.  Anything obviously past
+    prologue (branches, calls, returns) stops immediately.
+
+    Returns:
+      prologue_end_addr  — addr of LAST prologue instruction (inclusive)
+      saved              — list of register names saved (in push order)
+      stack              — bytes reserved by `add #-N, r15`, or 0
+      flags              — list of yellow flag strings
+    """
+    MAX_INTERLEAVE = 6   # consecutive non-prologue allowed (GCC scheduler can
+                          # interleave several tst/mov-imm/etc. ops between
+                          # register pushes — observed up to 4 in FUN_060295DE)
+    HARD_STOPS = ("rts", "rte", "bra", "bsr", "bf", "bt", "jmp", "jsr", "braf", "bsrf")
+
+    saved = []
+    stack = 0
+    flags = []
+    addr = start
+    last_prologue = start - 2
+    consecutive_non_prologue = 0
+
+    while True:
+        op = _read_opcode(binary, vram, addr)
+        if op is None:
+            break
+        mnem, _ = _decode_sh2(op, addr)
+        if mnem is None:
+            break
+
+        head = mnem.split()[0] if mnem else ""
+        if head in HARD_STOPS:
+            break
+
+        reg = _push_register(mnem)
+        if reg and reg in {f"r{i}" for i in range(0, 15)}:
+            # Track scratch (r0-r7) AND callee-saved (r8-r14) pushes the
+            # same way.  Tiny helpers (memclr/memcpy loops) only save
+            # scratch regs and were otherwise getting a false "no prologue
+            # register pushes detected" yellow flag.
+            saved.append(reg)
+            last_prologue = addr
+            consecutive_non_prologue = 0
+        elif _is_pr_push(mnem):
+            saved.append("pr")
+            last_prologue = addr
+            consecutive_non_prologue = 0
+        elif _is_macl_push(mnem):
+            saved.append("macl")
+            last_prologue = addr
+            consecutive_non_prologue = 0
+        elif _is_stack_alloc(mnem) is not None:
+            stack = _is_stack_alloc(mnem)
+            last_prologue = addr
+            break  # add to r15 ends prologue cleanly
+        else:
+            consecutive_non_prologue += 1
+            if consecutive_non_prologue > MAX_INTERLEAVE:
+                break
+
+        addr += 2
+
+    return last_prologue, saved, stack, flags
+
+
+def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
+    """Walk backward from `end` (last byte) recognizing epilogue instructions.
+
+    Stop criteria (semantically grounded, no magic interleave count):
+      1. Every pop we accept must match the prologue's `saved` list at the
+         next expected position.  Push order forward → pop order forward
+         is REVERSED(saved) → walking backward through pops the order is
+         `saved` itself.  When `expected_idx` reaches `len(saved)`, any
+         further pop encountered is body code (e.g. a `mov.l @r15+, r0`
+         that pairs with a mid-function `mov.l r13, @-r15` scratch save
+         from before a jsr) — stop.
+      2. Hard-stop on control flow (`bsr/jsr/bf/bt/bra/...`).  The
+         epilogue lives in a single linear basic block ending in `rts`;
+         a branch instruction means we've crossed into the prior block.
+      3. Bounded interleave tolerance for true noise (e.g. an
+         `extu.b r0, r0` value-shape fixup between matched pops).  This
+         only ticks BETWEEN matches; once `expected_idx` is exhausted the
+         next non-match terminates immediately.
+      4. Stack dealloc (`add #N, r15`) is recorded separately — not in
+         `saved`, so it doesn't advance expected_idx but it does reset
+         the interleave counter.
+
+    `saved` is the list returned by `_walk_prologue` (in push order).
+    If omitted or empty, the walker is in "best-effort" mode: it'll
+    only succeed if there's literally nothing between rts and func_start
+    that needs structured matching.
+
+    Returns:
+      epilogue_start_addr
+      restored           — list of register names restored, in forward
+                           execution order (first popped first, delay
+                           slot last)
+      stack              — bytes deallocated by `add #N, r15`
+      final_rts          — addr of the rts
+      delay_slot_addr    — addr of the delay-slot instruction
+    """
+    saved = saved or []
+    expected = list(saved)  # walking backward, expected pop order == saved
+
+    delay_slot = end - 1
+    rts_addr = delay_slot - 2
+
+    op_rts = _read_opcode(binary, vram, rts_addr)
+    mnem_rts, _ = _decode_sh2(op_rts, rts_addr) if op_rts is not None else (None, None)
+    # Accept four legitimate exit forms (all have a delay slot):
+    #   - rts            : standard return (pops PC from PR)
+    #   - jmp @Rn        : indirect tail call — control transfers to Rn
+    #                       and that function's rts returns to OUR caller
+    #                       (we've already restored PR to caller's value).
+    #   - braf Rn        : PC-relative indirect tail call.
+    #   - bra disp       : direct PC-relative tail call (target encoded
+    #                       in the opcode, ±4KB range).  GCC emits this
+    #                       when the tail-call target is statically known
+    #                       and nearby; functionally identical to jmp @Rn
+    #                       for the caller's accounting.
+    # All four are followed by a delay slot which GCC commonly schedules
+    # the last epilogue pop into.
+    exit_head = mnem_rts.split()[0] if mnem_rts else ""
+    if exit_head not in ("rts", "jmp", "braf", "bra"):
+        return None, [], 0, None, None
+
+    # Delay slot is conceptually the FIRST step of our backward walk.
+    # GCC schedules ONE useful instruction into the rts delay slot for
+    # cycle efficiency.  Two patterns matter:
+    #   (a) A pop matching expected[0] (the last epilogue restore).
+    #       e.g. `lds.l @r15+, macl` for macl restore in tiny helpers.
+    #   (b) A stack dealloc `add #+N, r15` that balances the prologue
+    #       alloc.  Saturn compilers very commonly do this for
+    #       functions with no register saves but a small frame
+    #       allocation — the alloc gets dealloc'd in the delay slot
+    #       for free.  Without recognizing this, the alloc/dealloc
+    #       checker would see "alloc N but 0 freed" → phantom flag.
+    op_ds = _read_opcode(binary, vram, delay_slot)
+    mnem_ds, _ = _decode_sh2(op_ds, delay_slot) if op_ds is not None else (None, None)
+    ds_pop_reg = None
+    if mnem_ds:
+        ds_pop_reg = (_pop_register(mnem_ds)
+                      or ("pr" if _is_pr_pop(mnem_ds) else None)
+                      or ("macl" if _is_macl_pop(mnem_ds) else None))
+    ds_dealloc = _is_stack_dealloc(mnem_ds) if mnem_ds else None
+    delay_slot_consumed = False
+    matched_stack = 0
+    matched_stack_addr = None
+    if ds_pop_reg and expected and ds_pop_reg == expected[0]:
+        delay_slot_consumed = True
+        expected_idx = 1
+    elif ds_dealloc is not None:
+        # Delay-slot stack dealloc — capture as the function's dealloc.
+        # Don't set delay_slot_consumed (that flag means "we captured a
+        # POP from the delay slot to append to `restored`") and don't
+        # advance expected_idx (the dealloc isn't a register restore).
+        matched_stack = ds_dealloc
+        matched_stack_addr = delay_slot
+        expected_idx = 0
+    else:
+        # Either not a pop/dealloc, or doesn't match expected[0] — leave
+        # it out so the match check downstream doesn't get a phantom
+        # mismatch.
+        expected_idx = 0
+
+    MAX_INTERLEAVE = 6
+    matches = []
+    epilogue_start = rts_addr
+    addr = rts_addr - 2
+    lower_bound = func_start if func_start is not None else 0
+    consecutive_non_epi = 0
+
+    while addr >= lower_bound:
+        op = _read_opcode(binary, vram, addr)
+        if op is None:
+            break
+        mnem, _ = _decode_sh2(op, addr)
+        if mnem is None:
+            break
+        head = mnem.split()[0] if mnem else ""
+
+        # Hard stop on control flow.  Epilogue is single-block.
+        if head in _EPI_HARD_STOPS:
+            break
+
+        # Hard stop on a stack PUSH (mov.l rN, @-r15 / sts.l pr/macl,
+        # @-r15).  Pushes are unambiguously body code — they decrement
+        # r15 to save a value mid-function (commonly to free up an arg
+        # register before a jsr).  An epilogue never pushes.  Stopping
+        # here prevents the walker from sliding past the body boundary
+        # and picking up mid-body deallocs as if they were epilogue
+        # deallocs (the false-alarm case that fires the
+        # stack-alloc/dealloc-mismatch flag).
+        if (_push_register(mnem) is not None
+                or mnem == "sts.l pr, @-r15"
+                or mnem == "sts.l macl, @-r15"):
+            break
+
+        # Pop / pr-pop / macl-pop: must match expected sequence.
+        reg = _pop_register(mnem)
+        is_pr = _is_pr_pop(mnem)
+        is_macl = _is_macl_pop(mnem)
+        dealloc = _is_stack_dealloc(mnem)
+
+        if reg or is_pr or is_macl:
+            popped = reg or ("pr" if is_pr else "macl")
+            if expected_idx < len(expected) and popped == expected[expected_idx]:
+                matches.append(popped)
+                expected_idx += 1
+                epilogue_start = addr
+                consecutive_non_epi = 0
+            else:
+                # Pop without a matching slot in `saved` → body code, stop.
+                break
+        elif dealloc is not None:
+            # Capture only the FIRST dealloc encountered walking backward
+            # (= LAST in forward execution = the epilogue's own dealloc,
+            # which sits immediately before the pops).  Any subsequent
+            # dealloc found walking backward is body code (e.g. a bulk
+            # `add #+0xC, r15` that cleans up mid-life pushes used as
+            # scratch around an internal jsr).  Without this guard the
+            # walker overwrites matched_stack with the body dealloc and
+            # the verdict fires a phantom alloc/dealloc mismatch.
+            if matched_stack_addr is not None:
+                break
+            matched_stack = dealloc
+            matched_stack_addr = addr
+            epilogue_start = addr
+            consecutive_non_epi = 0
+        else:
+            consecutive_non_epi += 1
+            if consecutive_non_epi > MAX_INTERLEAVE:
+                break
+
+        addr -= 2
+
+    # Build `restored` in forward execution order.  Walking backward we
+    # collected matches in the order: r14, r13, ..., pr, macl.  Forward
+    # execution pops them in reverse: macl, pr, ..., r13, r14.  Delay slot
+    # pop (if matched) executes LAST → goes at the end.
+    restored = list(reversed(matches))
+    if delay_slot_consumed:
+        restored.append(ds_pop_reg)
+
+    return epilogue_start, restored, matched_stack, rts_addr, delay_slot
+
+
+# ----- braf-switch jump-table detection -------------------------------------
+
+def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
+                                 func_start=None, hard_limit=None):
+    """Recognize the GCC SH-2 switch-dispatch idiom around `braf_pc`.
+
+    Idiom (within ~12 bytes before braf):
+        mova @(disp,PC), r0
+        mov.w @(r0,rN), r0
+        braf r0
+        <delay slot>
+
+    Returns list[int] of target addresses (possibly empty).
+    """
+    if not pool_priors:
+        return []
+
+    braf_op = _read_opcode(binary, vram, braf_pc)
+    if braf_op is None or (braf_op & 0xF0FF) != 0x0023:
+        return []
+    braf_reg = (braf_op >> 8) & 0xF
+    if braf_reg != 0:
+        return []
+
+    movw_seen = False
+    table_base = None
+    for back in range(2, 14, 2):
+        addr = braf_pc - back
+        if addr < vram:
+            break
+        op = _read_opcode(binary, vram, addr)
+        if op is None:
+            continue
+        # mov.w @(r0, rM), r0  encoding 0000 0000 mmmm 1101
+        if (op & 0xF00F) == 0x000D and ((op >> 8) & 0xF) == 0:
+            movw_seen = True
+            continue
+        # mova @(disp, PC), r0  encoding 11000111 dddddddd
+        if (op & 0xFF00) == 0xC700:
+            disp = (op & 0xFF) * 4
+            table_base = ((addr + 4) & ~3) + disp
+            break
+
+    if not movw_seen or table_base is None:
+        return []
+
+    lo = func_start if func_start is not None else vram
+    hi = hard_limit if hard_limit is not None else (vram + len(binary) - 1)
+    targets = []
+    t = table_base
+    while pool_priors.get(t) == 2:
+        off = t - vram
+        if off + 1 >= len(binary):
+            break
+        raw = (binary[off] << 8) | binary[off + 1]
+        sval = raw - 0x10000 if raw & 0x8000 else raw
+        target = braf_pc + 4 + sval
+        if lo <= target <= hi:
+            targets.append(target)
+        t += 2
+
+    return targets
+
+
+# ----- Control-flow walk + branch classification + pool extension ----------
+
+def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
+    """Walk reachable addresses from `start` via control flow.  Returns
+    (reachable, max_reachable, branches, indirect_calls).
+
+    Branches collected as analyzer.Branch records (internal=False initially;
+    set later by _classify_branch_internality)."""
+    reachable = set()
+    branches = []
+    indirect = []
+    worklist = [start]
+    while worklist:
+        pc = worklist.pop()
+        while True:
+            if pc > hard_limit_addr or pc in reachable:
+                break
+            reachable.add(pc)
+            op = _read_opcode(binary, vram, pc)
+            if op is None:
+                break
+            mnem, _ = _decode_sh2(op, pc)
+            if mnem is None:
+                pc += 2
+                continue
+
+            head = mnem.split()[0] if mnem else ""
+
+            # Direct branch with static target
+            if head in _BRANCH_MNEMONICS:
+                tgt = _branch_target(mnem)
+                b = Branch(src=pc, target=tgt, mnem=head, internal=False)
+                branches.append(b)
+                # bsr is a CALL (control returns) — don't follow target, fall through after delay slot
+                is_call = head == "bsr"
+                # Don't follow branches whose target lands OUTSIDE this
+                # function's range — those are tail-calls / external
+                # exits.  Walking into them pulls in branches from
+                # OTHER functions' bodies, which then get counted as
+                # "this function's external bras" and inflate the
+                # bras_external flag count (and pollute the rendered
+                # branches list with unreachable source addresses).
+                in_range = (tgt is not None and start <= tgt <= hard_limit_addr)
+                # delay-slot branches: bra, bsr, bf/s, bt/s
+                if head in {"bf/s", "bt/s", "bra", "bsr"}:
+                    reachable.add(pc + 2)
+                    if in_range and tgt not in reachable and not is_call:
+                        worklist.append(tgt)
+                    if head == "bra":
+                        # unconditional jump — control does NOT fall through past delay slot
+                        break
+                    # bsr / bf/s / bt/s — fall through after delay slot
+                    pc += 4
+                    continue
+                else:
+                    # bf, bt: no delay slot; fall through to pc+2
+                    if in_range and tgt not in reachable:
+                        worklist.append(tgt)
+                    pc += 2
+                    continue
+
+            # Indirect branch
+            if _is_indirect_branch(mnem):
+                indirect.append(pc)
+                # Delay slot is reached
+                reachable.add(pc + 2)
+                if head in {"jmp", "braf"}:
+                    # braf: try the SH-2 switch-dispatch idiom — seed case
+                    # bodies as reachable so they don't render "unreach".
+                    if head == "braf":
+                        case_targets = _detect_braf_switch_targets(
+                            binary, vram, pc, pool_priors,
+                            func_start=start, hard_limit=hard_limit_addr,
+                        )
+                        for tgt in case_targets:
+                            branches.append(Branch(
+                                src=pc, target=tgt, mnem="braf", internal=False,
+                            ))
+                            if tgt not in reachable:
+                                worklist.append(tgt)
+                    # unconditional — terminates THIS linear walk; targets
+                    # (if any) continue via worklist
+                    break
+                # jsr/bsrf — call returns, fall through
+                pc += 4
+                continue
+
+            # rts / rte (unconditional, with delay slot)
+            if head in {"rts", "rte"}:
+                reachable.add(pc + 2)
+                break
+
+            pc += 2
+
+    max_reachable = max(reachable) if reachable else start
+    return reachable, max_reachable, branches, indirect
+
+
+def _classify_branch_internality(branches, start, end):
+    """Set Branch.internal in-place based on whether target falls in
+    [start, end].  Also fills in `direction` field for analyzer.Branch."""
+    for b in branches:
+        if b.target is not None and start <= b.target <= end:
+            b.internal = True
+        else:
+            b.internal = False
+        if b.target is None:
+            b.direction = None
+        elif b.target > b.src:
+            b.direction = "forward"
+        else:
+            b.direction = "backward"
+    return branches
+
+
+def _extend_through_trailing_pools(end, binary, vram, hint_end, pool_priors):
+    """Walk forward from `end + 1` swallowing contiguous pool-prior entries.
+
+    SH-2 PC-relative loads (mov.l/mov.w @(disp,PC),Rn) can only reach forward
+    ~1KB, so GCC scatters small literal pools into .text — most commonly as a
+    trailing zone after the function's last reachable instruction.  Reference
+    convention (and the eval-tool convention we settled on) treats those
+    pools as part of the function: they're only-reachable-from-here, they're
+    PC-bound to this function, and lumping them in matches Ghidra-style
+    boundaries.
+
+    We extend by walking forward from `end + 1`, consuming any address that
+    appears in `pool_priors` (a {addr: size} dict — typically a UNION of
+    reference-extracted priors AND binary-wide PC-relative load targets so
+    pool words that reference missed but the binary itself loads still get
+    swallowed).  Stop at the first byte that's NOT in priors — typically
+    the next function's prologue.
+
+    Returns the new end address (inclusive), or the original `end` if no
+    extension applies.
+    """
+    if not pool_priors:
+        return end
+    binary_end = vram + len(binary) - 1
+    cap = min(hint_end if hint_end is not None else binary_end, binary_end)
+    addr = end + 1
+
+    def _is_padding_pair(off):
+        if off + 1 >= len(binary):
+            return False
+        b0, b1 = binary[off], binary[off + 1]
+        return (b0, b1) == (0x00, 0x00) or (b0, b1) == (0x00, 0x09)
+
+    while addr <= cap:
+        size = pool_priors.get(addr)
+        if size is not None:
+            new_end = addr + size - 1
+            if new_end > cap:
+                break
+            end = new_end
+            addr = new_end + 1
+            continue
+
+        # Not in priors. Two extension cases:
+        #
+        # (a) Pool-bridge: 2 or 4 bytes of zero alignment immediately before
+        #     the next pool entry.  Pool tables are 4-byte aligned so this
+        #     gap is common when the code zone ends at a 2-byte boundary.
+        #
+        # (b) Trailing alignment padding: 2 bytes of zero (0x00 0x00) or
+        #     SH-2 nop (0x00 0x09) emitted before the next function starts
+        #     at a 4-byte boundary.  GCC uses this whenever the function's
+        #     last code byte lands on an odd 4-byte boundary.
+        bridged = None
+        for pad in (2, 4):
+            check = addr + pad
+            if check > cap or pool_priors.get(check) is None:
+                continue
+            off = addr - vram
+            if off + pad > len(binary):
+                continue
+            if all(binary[off + i] == 0 for i in range(pad)):
+                bridged = check
+                break
+        if bridged is not None:
+            end = bridged - 1
+            addr = bridged
+            continue
+
+        off = addr - vram
+        if _is_padding_pair(off):
+            end = addr + 1
+            addr += 2
+            continue
+
+        break
+    return end
+
+
+# ----- Verdict scoring -----------------------------------------------------
+
+def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, conditional_rts):
+    flags = []
+    score = 0
+    max_score = 4
+
+    if final_rts is None:
+        flags.append("no clean function exit at expected position (rts/jmp/braf)")
+        return "LOW", flags
+    score += 1
+
+    if not saved:
+        flags.append("no prologue register pushes detected")
+    else:
+        score += 1
+
+    # Only flag mismatch when the prologue ACTUALLY allocated stack
+    # (stack_alloc > 0).  If prologue_stack is 0, any dealloc the walker
+    # captured is almost certainly a mid-body cleanup `add #+N, r15`
+    # immediately following the pops backward (e.g. cleaning up a
+    # `mov.l rX, @-r15` argument push that preceded a jsr).  Compilers
+    # don't dealloc what they didn't alloc, so dealloc-without-alloc is
+    # never a real bug — it's a walker false positive.
+    #
+    # Only flag UNDER-dealloc — the epilogue freeing less stack than
+    # the prologue allocated, which would leak frames upward and
+    # eventually corrupt the caller.  Over-dealloc (epi freeing MORE
+    # than alloc) is a benign pattern: GCC sometimes merges the epi
+    # dealloc with a mid-body push cleanup into a single `add #+N, r15`
+    # (e.g. prologue allocs 4, body pushes r4 for jsr arg, then one
+    # `add #+8, r15` cleans both up).  Catching over-dealloc as a "bug"
+    # produced phantom mismatches on cycle-optimized GCC code.
+    if stack_alloc > 0 and stack_dealloc < stack_alloc:
+        flags.append(f"stack under-dealloc: alloc {stack_alloc} but only {stack_dealloc} freed")
+    else:
+        score += 1
+
+    # Prologue/epilogue correspondence.  Two-tier:
+    #
+    #  (a) pr / macl MUST round-trip.  Pushing pr without popping it before
+    #      rts crashes the function (the rts pops PC from the wrong slot).
+    #      Same for macl.  Flag immediately if the prologue saved them but
+    #      the epilogue walker didn't see the pop.
+    #
+    #  (b) GP registers (r0-r14) can be legitimately asymmetric: GCC will
+    #      sometimes emit a save-around-jsr in the prologue area to
+    #      preserve a scratch register across an internal call (e.g.
+    #      FUN_0602AE74's `mov.l r4, @-r15` right after `sts.l pr` — r4 is
+    #      popped MID-BODY at the function's first jsr return, not at the
+    #      function's rts).  The epilogue walker (with the new strict-
+    #      matching rule) will only consume pops that match the
+    #      prologue's push list in reverse-walk order, so `restored` is
+    #      always a SUFFIX of `reversed(saved)`.  Anything missing from
+    #      the head of that suffix is a "mid-life save" and not a problem.
+    saved_critical = {r for r in saved if r in ("pr", "macl")}
+    restored_critical = {r for r in restored if r in ("pr", "macl")}
+    missing_critical = saved_critical - restored_critical
+
+    saved_gp = [r for r in saved if r not in ("pr", "macl")]
+    restored_gp = [r for r in restored if r not in ("pr", "macl")]
+    expected_gp = list(reversed(saved_gp))
+    gp_suffix_ok = (not restored_gp) or (restored_gp == expected_gp[-len(restored_gp):])
+
+    if missing_critical:
+        flags.append(
+            f"critical: prologue pushed {sorted(missing_critical)} but epilogue never restored — function would crash on return")
+    elif not gp_suffix_ok:
+        # Defensive — should not fire under the new walker, but catches
+        # any future regression in walker matching logic.
+        flags.append(f"prologue/epilogue register order mismatch: pushed {saved}, restored {restored}")
+    else:
+        score += 1
+
+    if conditional_rts:
+        flags.append(f"{len(conditional_rts)} conditional rts (not necessarily wrong, but worth eye)")
+
+    external_branches = [b for b in branches if not b.internal and b.target is not None]
+    bras_external = [b for b in external_branches if b.mnem == "bra"]
+    if bras_external:
+        flags.append(f"{len(bras_external)} unconditional bra exits to outside function")
+
+    if score == max_score and not flags:
+        return "HIGH", flags
+    if score >= 3:
+        return "MEDIUM", flags
+    return "LOW", flags
+
+
+# ---------------------------------------------------------------------------
+# The model itself.  Implementations land here phase by phase.
+# ---------------------------------------------------------------------------
+
+class BinaryModel:
+    """Whole-binary code intelligence.  Built once per server boot; refreshed
+    only when reference/probe inputs change (which they don't during a
+    session).  Verified-subseg state is held by SweepState, not here.
+
+    Construction reads:
+      - binary bytes (target_path)
+      - vram (load address)
+      - pool_priors_path (optional, from <yaml>.pool_priors.txt)
+      - reference_dir (optional, .s files with FUN_<addr>: labels)        [phase 2]
+      - reference_scan_dir (optional, sibling .s tree)                     [phase 2]
+      - runtime_hits_dirs (optional, *.summary.json probe files)           [phase 2]
+
+    Phase plan:
+      Phase 1: __init__ + byte_kind + pool_words                  ← DONE
+      Phase 2: callers + reference_starts + runtime_hits
+      Phase 3: analyze_function (replaces oracle.analyze_candidate)
+    """
+
+    def __init__(self,
+                 binary: bytes,
+                 vram: int,
+                 pool_priors_path: Optional[Path] = None,
+                 reference_dir: Optional[Path] = None,
+                 reference_scan_dir: Optional[Path] = None,
+                 runtime_hits_dirs: Optional[list] = None,
+                 ):
+        self.binary = binary
+        self.vram = vram
+        self.end_addr = vram + len(binary) - 1
+
+        # Phase 1 outputs
+        self.byte_kind: dict = {}            # {addr: ByteKind}
+        self.pool_words: dict = {}           # {addr: PoolWord}
+
+        # Phase 2 outputs
+        # NOTE: kept as flat {addr: count} dicts to match eval_server's
+        # wire format exactly for parity.  The richer CallSite-list shape
+        # in this file's dataclasses is reserved for future enrichment
+        # when a consumer needs it (no consumer today, so we don't build
+        # what we don't use).
+        self.static_callers: dict = {}       # {addr: int} — same-binary calls
+        self.cross_module_callers: dict = {} # {addr: int} — sibling hot-swap modules
+        self.reference_starts: set = set()   # set of int addrs
+        self.reference_nexts: dict = {}      # {ref_start: next_ref_start}
+        self.runtime_hits: dict = {}         # {addr: int}
+
+        # Phase 3 outputs
+        self.instructions: dict = {}         # {addr: Instruction}
+        self.indirect_resolutions: dict = {} # {addr: resolved_target}
+
+        # ----- Phase 1: pool detection -----
+        # Union of (a) reference-derived priors from the .pool_priors.txt
+        # sidecar AND (b) whole-binary PC-relative load target scan
+        # (two-pass to filter the data-as-code trap).  Matches the union
+        # eval_server.py currently builds inline via
+        # `dict(binary_pool_targets); priors.update(file_priors)`.
+        #
+        # The binary-scan subset is also retained on `self` because the
+        # phase-2 caller scan needs to skip ONLY binary-scan pool bytes
+        # (not file priors) for byte-exact parity with
+        # eval_server._load_static_callers.
+        file_priors = self._load_file_priors(pool_priors_path)
+        self._binary_pool_targets = self._scan_binary_pool_targets()
+
+        pool_union = dict(self._binary_pool_targets)
+        pool_union.update(file_priors)       # file priors win on conflict
+
+        for addr, size in pool_union.items():
+            self.byte_kind[addr] = ByteKind.POOL4 if size == 4 else ByteKind.POOL2
+            self.pool_words[addr] = PoolWord(
+                addr=addr,
+                size=size,
+                value=self._read_word(addr, size),
+                loaded_from=[],              # reserved — no consumer yet
+            )
+
+        # ----- Phase 2: reference / callgraph / runtime -----
+        # Order matters: reference_starts feeds cross_module_callers.
+        self.reference_starts = self._load_reference_starts(reference_dir)
+        self.reference_nexts  = self._build_reference_nexts(self.reference_starts)
+        self.static_callers   = self._scan_static_callers()
+        self.cross_module_callers = self._scan_cross_module_callers(
+            reference_scan_dir, reference_dir,
+        )
+        self.runtime_hits = self._load_runtime_hits(runtime_hits_dirs)
+
+    # ------------------------------------------------------------------
+    # Public helpers
+    # ------------------------------------------------------------------
+
+    def pool_priors_dict(self) -> dict:
+        """Return a {addr: size} dict equivalent to the union eval_server
+        currently feeds to oracle.analyze_candidate(..., pool_priors=...).
+
+        UNION VIEW — combines file_priors + binary-scan targets.  When a
+        consumer needs the binary-scan SUBSET only (as `_scan_static_callers`
+        does to build its pool-data skip set), access
+        `self._binary_pool_targets` directly rather than this method.
+
+        Used during phase 3 transition: while analyze_function isn't yet
+        implemented, eval_server (or the parity harness) can swap its
+        inline `dict(binary_pool_targets); update(file_priors)` for
+        `model.pool_priors_dict()` and get identical behavior.
+        """
+        out = {}
+        for addr, kind in self.byte_kind.items():
+            if kind is ByteKind.POOL4:
+                out[addr] = 4
+            elif kind is ByteKind.POOL2:
+                out[addr] = 2
+        return out
+
+    def is_address_in_function(self, addr: int, fn: FunctionAnalysis) -> bool:
+        """Cheap membership check — used by eval_server to validate pin
+        requests without re-analyzing.
+
+        RESERVED — no consumer today; phase 8 (eval_server2 routes) will
+        call this from /pin-start and /pin-end handlers."""
+        return fn.start <= addr <= fn.end
+
+    def analyze_function(self,
+                         start: int,
+                         hint_end: Optional[int] = None,
+                         ) -> FunctionAnalysis:
+        """Phase 3b: produces FunctionAnalysis using inlined helpers.
+
+        Mirrors oracle.analyze_candidate's flow exactly:
+          1. Walk prologue → saved/stack/flags
+          2. Control-flow walk → reachable + branches
+          3. Epilogue walk backward from last reachable instruction
+          4. Augment restored set with PR/MACL pops anywhere in reachable
+             (handles GCC's early-cycle-scheduled restores)
+          5. Extend end through trailing pool zone
+          6. Find conditional_rts
+          7. Classify branch internality (also sets direction)
+          8. Collect pool_targets
+          9. Run verdict
+
+        Phase-4 fields (indent_depths, reference, midpoints, evidence,
+        phantom_hint, indirect_resolutions) stay at dataclass defaults
+        until phase 4 moves the corresponding eval_server logic here.
+        """
+        binary = self.binary
+        vram = self.vram
+        pool_priors = self.pool_priors_dict()
+
+        binary_max = vram + len(binary) - 1
+        hard_limit = hint_end if hint_end is not None else binary_max
+
+        # 1. Prologue
+        prologue_end, saved, stack_alloc, flags = _walk_prologue(binary, vram, start)
+        prologue_range = (start, prologue_end)
+
+        # 2. Control flow + branches.  Pool_priors lets the walker trace
+        # switch-dispatch jump tables (braf r0 over a .short table).
+        reachable, max_reachable, branches, indirect = _control_flow_walk(
+            binary, vram, start, hard_limit, pool_priors=pool_priors,
+        )
+
+        # Last byte of the function is the last byte of the last reachable
+        # instruction.  For rts/rte/bra with delay slots, the delay slot's
+        # 2nd byte is the end.
+        code_end = max_reachable + 1
+
+        # 3. Epilogue walk from the last code byte (NOT post-extension
+        # boundary — pool data would scramble it).
+        epi_start, restored, stack_dealloc, final_rts, delay_slot = _walk_epilogue_backward(
+            binary, vram, code_end, func_start=start, saved=saved,
+        )
+        epilogue_range = (epi_start, code_end) if epi_start is not None else (None, None)
+
+        # 4. Augment `restored` with PR / MACL pops anywhere in reachable.
+        # GCC will cycle-schedule the restore early, placing it OUTSIDE the
+        # contiguous-epilogue window the backward walker tracks.  Without
+        # this scan the critical-pr/macl-not-restored flag fires on
+        # otherwise-fine cycle-optimized functions.
+        if "pr" in saved and "pr" not in restored:
+            for a in reachable:
+                op = _read_opcode(binary, vram, a)
+                if op is None:
+                    continue
+                mnem, _ = _decode_sh2(op, a)
+                if mnem and _is_pr_pop(mnem):
+                    restored.append("pr")
+                    break
+        if "macl" in saved and "macl" not in restored:
+            for a in reachable:
+                op = _read_opcode(binary, vram, a)
+                if op is None:
+                    continue
+                mnem, _ = _decode_sh2(op, a)
+                if mnem and _is_macl_pop(mnem):
+                    restored.append("macl")
+                    break
+
+        # 5. Extend end through trailing pool zone (no-op if pool_priors empty).
+        end = _extend_through_trailing_pools(code_end, binary, vram, hard_limit, pool_priors)
+
+        # 6. Find conditional rts (rts that are NOT the final one).
+        conditional_rts = []
+        for addr in sorted(reachable):
+            op = _read_opcode(binary, vram, addr)
+            if op is None:
+                continue
+            mnem, _ = _decode_sh2(op, addr)
+            if mnem and mnem.startswith("rts") and addr != final_rts:
+                conditional_rts.append(addr)
+
+        # 7. Classify branches (sets internal + direction).
+        branches = _classify_branch_internality(branches, start, end)
+
+        # 8. Collect pool targets (rescan reachable instructions).
+        pool_targets = []
+        for addr in sorted(reachable):
+            op = _read_opcode(binary, vram, addr)
+            if op is None:
+                continue
+            _, tgt = _decode_sh2(op, addr)
+            if tgt is not None:
+                pool_targets.append(tgt)
+
+        # 9. Verdict.
+        verdict_str, yellow = _verdict(
+            saved, stack_alloc, restored, stack_dealloc,
+            final_rts, branches, conditional_rts,
+        )
+        flags.extend(yellow)
+        try:
+            verdict_enum = Verdict[verdict_str]
+        except KeyError:
+            verdict_enum = Verdict.UNKNOWN
+
+        return FunctionAnalysis(
+            start=start,
+            end=end,
+            prologue_range=prologue_range,
+            prologue_saved=saved,
+            prologue_stack=stack_alloc,
+            epilogue_range=epilogue_range,
+            final_exit=final_rts,
+            delay_slot=delay_slot,
+            branches=branches,
+            conditional_returns=conditional_rts,
+            pool_targets=pool_targets,
+            reachable=reachable,
+            verdict=verdict_enum,
+            yellow_flags=flags,
+            # Phase-4 fields stay at defaults
+        )
+
+    # ------------------------------------------------------------------
+    # Phase 1 internals
+    # ------------------------------------------------------------------
+
+    def _read_word(self, addr: int, size: int) -> int:
+        """Read a big-endian 2- or 4-byte word at addr.  Used during
+        pool_words construction."""
+        off = addr - self.vram
+        if size == 4 and off + 3 < len(self.binary):
+            b = self.binary
+            return (b[off] << 24) | (b[off+1] << 16) | (b[off+2] << 8) | b[off+3]
+        if size == 2 and off + 1 < len(self.binary):
+            b = self.binary
+            return (b[off] << 8) | b[off+1]
+        return 0
+
+    def _load_file_priors(self, priors_path: Optional[Path]) -> dict:
+        """Load pool address priors from <yaml_stem>.pool_priors.txt.
+
+        Format: one address-size pair per line, hex addr + decimal size:
+            0x06037296 2
+            0x0603729C 4
+            # comments allowed, blank lines OK
+
+        Mirrors eval_server._load_pool_priors verbatim.  Returns {addr: size}.
+        """
+        if priors_path is None or not priors_path.exists():
+            return {}
+        priors = {}
+        for raw in priors_path.read_text(errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                try:
+                    priors[int(parts[0], 16)] = int(parts[1])
+                except ValueError:
+                    pass
+        return priors
+
+    def _scan_binary_pool_targets(self) -> dict:
+        """Two-pass binary-wide PC-relative load target scan.
+
+        Walks every 2-byte-aligned address, decodes the opcode, and if it's
+        a PC-relative load (`mov.l @(disp,PC),Rn`, `mov.w @(disp,PC),Rn`,
+        `mova @(disp,PC),r0`), records the target address with the right
+        size (4 for mov.l/mova, 2 for mov.w).
+
+        Two passes avoid the data-as-code trap: bytes INSIDE a pool word
+        can themselves bit-align as a valid `mov.l @(disp,PC)` opcode and
+        produce a phantom pool target.  Pass 1 builds the naive pool set;
+        pass 2 re-scans skipping bytes inside pass-1 pool words.
+
+        Mirrors eval_server._load_binary_pool_targets verbatim.  Returns
+        {addr: size}.
+        """
+        binary = self.binary
+        vram = self.vram
+        end_addr = self.end_addr
+
+        def scan(skip_addrs: set) -> dict:
+            pool_sizes = {}
+            for addr in range(vram, end_addr, 2):
+                if addr in skip_addrs:
+                    continue
+                off = addr - vram
+                op = (binary[off] << 8) | binary[off + 1]
+                hi = (op >> 12) & 0xF
+                if hi == 0xD:
+                    # mov.l @(disp,PC), Rn — 4-byte aligned target
+                    disp = op & 0xFF
+                    tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
+                    if vram <= tgt <= end_addr:
+                        pool_sizes[tgt] = 4
+                elif hi == 0x9:
+                    # mov.w @(disp,PC), Rn — 2-byte target.  Don't downgrade
+                    # if mov.l already claimed it (same address can be loaded
+                    # both ways, but mov.l implies 4-byte semantics).
+                    disp = op & 0xFF
+                    tgt = addr + 4 + disp * 2
+                    if vram <= tgt <= end_addr and tgt not in pool_sizes:
+                        pool_sizes[tgt] = 2
+                elif hi == 0xC and ((op >> 8) & 0xF) == 7:
+                    # mova @(disp,PC), r0 — 4-byte aligned target (jump-table head)
+                    disp = op & 0xFF
+                    tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
+                    if vram <= tgt <= end_addr:
+                        pool_sizes[tgt] = 4
+            return pool_sizes
+
+        # Pass 1: naive scan, no skips
+        pass1 = scan(set())
+        # Pass 2: skip every 2-byte address inside a pass-1 pool word
+        pool_data_addrs = set()
+        for tgt, size in pass1.items():
+            for i in range(0, size, 2):
+                pool_data_addrs.add(tgt + i)
+        return scan(pool_data_addrs)
+
+    # ------------------------------------------------------------------
+    # Phase 2 internals — reference / callgraph / runtime
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _load_reference_starts(reference_dir: Optional[Path]) -> set:
+        """Parse `FUN_<addr>:` labels from every .s file in reference_dir.
+
+        Mirrors eval_server._load_reference_starts.  Returns a set of int
+        addrs (eval_server returns sorted list; set + sorted-on-demand is
+        cheaper for membership tests).
+        """
+        if reference_dir is None or not reference_dir.is_dir():
+            return set()
+        import re
+        starts = set()
+        fun_re = re.compile(r"^FUN_([0-9A-Fa-f]{8}):\s*$")
+        for s_file in reference_dir.glob("*.s"):
+            for raw in s_file.read_text(errors="replace").splitlines():
+                m = fun_re.match(raw.strip())
+                if m:
+                    starts.add(int(m.group(1), 16))
+        return starts
+
+    @staticmethod
+    def _build_reference_nexts(reference_starts: set) -> dict:
+        """Precompute the next-reference-start for each reference start.
+
+        Used by FunctionAnalysis.reference (phase 4) to compute end_delta
+        without re-iterating reference_starts on every lookup.
+        """
+        if not reference_starts:
+            return {}
+        sorted_starts = sorted(reference_starts)
+        nexts = {}
+        for i, s in enumerate(sorted_starts):
+            nexts[s] = sorted_starts[i + 1] if i + 1 < len(sorted_starts) else None
+        return nexts
+
+    def _scan_static_callers(self) -> dict:
+        """Scan THIS binary's bytes for call references to each address.
+
+        Two patterns:
+          1. Direct PC-relative branches (`bsr disp`, `bra disp`): top
+             nibble 0xA / 0xB, 12-bit signed disp.
+          2. Pool-loaded function pointers: `mov.l @(disp,PC),Rn` reads
+             a 4-byte pool word; if the word's value lands in vram range
+             AND is 2-byte aligned, count it as a function-pointer ref.
+
+        Skips bytes inside known pool words (from the binary-scan subset
+        only — NOT file priors — to match eval_server byte-for-byte).
+        Pool bytes that bit-align as bsr/bra opcodes would otherwise
+        produce phantom callers.
+
+        Mirrors eval_server._load_static_callers.  Returns {addr: count}.
+        """
+        import struct
+        binary = self.binary
+        vram = self.vram
+        end = self.end_addr
+
+        # Build pool-data-skip set from the binary-scan subset (matching
+        # eval_server's STATE["binary_pool_targets"] usage exactly).
+        pool_data_addrs = set()
+        for tgt, size in self._binary_pool_targets.items():
+            for i in range(0, size, 2):
+                pool_data_addrs.add(tgt + i)
+
+        callers: dict = {}
+        for addr in range(vram, end, 2):
+            if addr in pool_data_addrs:
+                continue
+            off = addr - vram
+            op = (binary[off] << 8) | binary[off + 1]
+            hi = (op >> 12) & 0xF
+            if hi in (0xA, 0xB):
+                disp = op & 0xFFF
+                if disp > 0x7FF:
+                    disp -= 0x1000
+                target = addr + 4 + disp * 2
+                if vram <= target <= end:
+                    callers[target] = callers.get(target, 0) + 1
+            elif hi == 0xD:
+                disp = op & 0xFF
+                pool_addr = (addr & 0xFFFFFFFC) + 4 + disp * 4
+                poff = pool_addr - vram
+                if 0 <= poff + 3 < len(binary):
+                    v = struct.unpack(">I", binary[poff:poff + 4])[0]
+                    if vram <= v <= end and (v & 1) == 0:
+                        callers[v] = callers.get(v, 0) + 1
+        return callers
+
+    def _scan_cross_module_callers(self,
+                                    scan_dir: Optional[Path],
+                                    this_module_dir: Optional[Path],
+                                    ) -> dict:
+        """Text-scan sibling hot-swap module .s files for same-name refs.
+
+        Saturn games hot-swap modules into a shared load address (Daytona's
+        race/select/result2p/name/backup/ending all live at 0x06028000,
+        only one resident at a time).  A `bsr FUN_X` in select's reference
+        cannot resolve to this binary at runtime — but we surface them as
+        informational pills so the human knows the address collides with
+        same-name targets in other binaries.
+
+        Skips .s files inside `this_module_dir` — those are picked up by
+        `_scan_static_callers` from raw binary bytes.
+
+        Mirrors eval_server._load_cross_module_callers.  Returns {addr: count}.
+        """
+        if scan_dir is None or this_module_dir is None:
+            return {}
+        if not scan_dir.is_dir() or not this_module_dir.is_dir():
+            return {}
+        import re
+        this_module_resolved = this_module_dir.resolve()
+        branch_re = re.compile(
+            r"\b(?:bsr|bsr\.s|jsr|jmp|bra|braf|bsrf)\b[^/]*?"
+            r"\b(?:xref_)?FUN_([0-9A-Fa-f]{8})\b(?!\s*\+)"
+        )
+        pool_re_fun = re.compile(
+            r"\.4byte\s+(?:xref_FUN_|FUN_)([0-9A-Fa-f]{8})\b(?!\s*\+)"
+        )
+        pool_re_dat = re.compile(
+            r"\.4byte\s+DAT_([0-9A-Fa-f]{8})\b(?!\s*\+)"
+        )
+        reference_starts = self.reference_starts
+        cross: dict = {}
+        for s_file in scan_dir.glob("**/*.s"):
+            try:
+                in_same = s_file.resolve().is_relative_to(this_module_resolved)
+            except (AttributeError, ValueError):
+                in_same = str(s_file.resolve()).startswith(str(this_module_resolved))
+            if in_same:
+                continue
+            try:
+                text = s_file.read_text(errors="replace")
+            except Exception:
+                continue
+            for line in text.splitlines():
+                for m in branch_re.finditer(line):
+                    a = int(m.group(1), 16); cross[a] = cross.get(a, 0) + 1
+                for m in pool_re_fun.finditer(line):
+                    a = int(m.group(1), 16); cross[a] = cross.get(a, 0) + 1
+                for m in pool_re_dat.finditer(line):
+                    a = int(m.group(1), 16)
+                    if a in reference_starts:
+                        cross[a] = cross.get(a, 0) + 1
+        return cross
+
+    @staticmethod
+    def _load_runtime_hits(runtime_hits_dirs: Optional[list]) -> dict:
+        """Aggregate BP-pass hit counts across probe summaries.
+
+        Each directory is globbed for `*.summary.json` files; their
+        `by_address: {hex_addr: count}` field gets max-merged across
+        summaries (probes overwrite their own summary so summing across
+        re-snapshots would double-count).
+
+        Mirrors eval_server._load_runtime_hits.  Returns {addr: max_count}.
+        """
+        if not runtime_hits_dirs:
+            return {}
+        import json as _json
+        hits: dict = {}
+        for d in runtime_hits_dirs:
+            p = Path(d)
+            if not p.is_dir():
+                continue
+            for f in p.glob("*.summary.json"):
+                try:
+                    with open(f) as fp:
+                        s = _json.load(fp)
+                except Exception:
+                    continue
+                ba = s.get("by_address") or {}
+                for hex_addr, count in ba.items():
+                    try:
+                        addr = int(hex_addr, 16)
+                        c = int(count)
+                        if c > hits.get(addr, 0):
+                            hits[addr] = c
+                    except (ValueError, TypeError):
+                        pass
+        return hits
+
+
+# ---------------------------------------------------------------------------
+# Sweep state — encapsulates yaml + override-driven candidate selection,
+# gap detection, progress, and the listing model.
+# ---------------------------------------------------------------------------
+
+class SweepState:
+    """Yaml-state-dependent derived state.  Cheap to construct per /state
+    poll (the BinaryModel is the expensive bit, reused across polls).
+
+    Phase plan:
+      Phase 5: next_candidate / gaps / progress
+      Phase 6: listing (per-pane)
+      Phase 7: aligned_listings (split-view diff)
+    """
+
+    model: BinaryModel
+    verified: list                       # list[VerifiedSubseg], sorted by start
+    tus: list                             # raw TU dicts (start/end/name)
+
+    def __init__(self,
+                 model: BinaryModel,
+                 yaml_cfg: dict,
+                 ai_override: Optional[dict] = None,
+                 ):
+        # IMPLEMENTATION LANDS IN PHASE 5.
+        raise NotImplementedError("phase 5 not yet implemented")
+
+    def next_candidate(self) -> Optional[NextCandidate]:
+        # IMPLEMENTATION LANDS IN PHASE 5.
+        raise NotImplementedError("phase 5 not yet implemented")
+
+    def natural_candidate(self) -> Optional[NextCandidate]:
+        """Same as next_candidate but ignores ai_override — used to build
+        the 'ORACLE NATURAL' pane in split view."""
+        raise NotImplementedError("phase 5 not yet implemented")
+
+    def gaps(self, proposed_start: Optional[int] = None) -> list:
+        # IMPLEMENTATION LANDS IN PHASE 5.
+        raise NotImplementedError("phase 5 not yet implemented")
+
+    def progress(self) -> Progress:
+        # IMPLEMENTATION LANDS IN PHASE 5.
+        raise NotImplementedError("phase 5 not yet implemented")
+
+    def listing(self,
+                candidate: FunctionAnalysis,
+                previous: Optional[VerifiedSubseg],
+                attn: Optional[list] = None,
+                ) -> list:
+        """Build the rich row list for one pane.  Emits four sections
+        (prev / intermediate / current / trailing) with all decorations
+        pre-applied.  Eval_server's only job is HTML templating.
+
+        Phase 6 implementation will:
+          - Look up model.byte_kind for every address — single source of truth
+          - Emit section headers with anchor_addr for diff alignment
+          - Apply prologue/epilogue/final_rts/cond_rts/unreachable flags
+          - Resolve attn/midpoint/ref_end precedence per row (attn > mid > ref_end)
+          - Set pin_action per row (above start → PIN_START; on/below → PIN_END)
+          - Set unpin_action on section-current and section-trailing headers
+            when an override is active in this state
+          - Compose tag column from category + flags + indirect_resolved
+        """
+        raise NotImplementedError("phase 6 not yet implemented")
+
+    def aligned_listings(self,
+                         primary: FunctionAnalysis,
+                         natural: FunctionAnalysis,
+                         primary_previous: Optional[VerifiedSubseg],
+                         natural_previous: Optional[VerifiedSubseg],
+                         attn: Optional[list] = None,
+                         ) -> tuple:
+        """For split-view rendering: produce two equal-length row lists
+        aligned by anchor address.  Replaces keys.js `alignLines()`.
+
+        Phase 7 will interleave by anchor_addr with BLANK placeholders on
+        the missing side."""
+        raise NotImplementedError("phase 7 not yet implemented")
