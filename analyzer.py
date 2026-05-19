@@ -1650,6 +1650,18 @@ class BinaryModel:
         # pool references.
         self._analyze_cache: dict = {}
 
+        # `global_reachable` is the union of `reachable` across every
+        # function we've analyzed.  Used by the renderer to discriminate
+        # "executed code" from "pool data that bit-aligns as an opcode":
+        # if an address is in this set, some function's CFG walk reaches
+        # it — it's code; if not, it's either pool data or an unstamped
+        # function we haven't analyzed yet (in which case the
+        # _is_fn_start_signal check catches the latter).
+        #
+        # Recomputed lazily when _analyze_cache grows.
+        self._global_reachable_cache: set = set()
+        self._global_reachable_cache_size: int = 0
+
         # ----- Phase 1: pool detection -----
         # Union of (a) reference-derived priors from the .pool_priors.txt
         # sidecar AND (b) whole-binary PC-relative load target scan
@@ -1715,6 +1727,18 @@ class BinaryModel:
             elif kind is ByteKind.POOL2:
                 out[addr] = 2
         return out
+
+    @property
+    def global_reachable(self) -> set:
+        """Union of `reachable` across every analyzed function in the
+        cache.  Recomputed lazily when the cache grows."""
+        if len(self._analyze_cache) != self._global_reachable_cache_size:
+            out = set()
+            for fa in self._analyze_cache.values():
+                out |= fa.reachable
+            self._global_reachable_cache = out
+            self._global_reachable_cache_size = len(self._analyze_cache)
+        return self._global_reachable_cache
 
     def is_address_in_function(self, addr: int, fn: FunctionAnalysis) -> bool:
         """Cheap membership check — used by eval_server to validate pin
@@ -2918,17 +2942,34 @@ class SweepState:
     def _emit_raw_rows(self, rows, next_id, start, end, section):
         """Emit raw-byte rows for intermediate / trailing zones.
 
-        Uses model.byte_kind (which is the union of file priors + binary
-        pool target scan) to decide pool-vs-instruction per address.
-        Anything not classified as pool gets a best-effort instruction
-        decode — this is the screenshot-bug zone where pool bytes that
-        happened to bit-align as branch opcodes get spuriously decoded.
-        Fix lives in extending byte_kind, not in changing emission here.
+        Tracks a "current zone" (pool vs code) as it walks.  When
+        `byte_kind[addr]` is UNKNOWN — i.e., neither the binary-wide
+        PC-relative load scan nor the reference's pool_priors marked
+        this address — we default the rendering to whatever zone we're
+        already in, instead of always decoding as an instruction.
+
+        Why this matters (the screenshot-bug zone): pool data values
+        whose bytes fall in 0xA000-0xBFFF bit-align as `bra` / `bsr`
+        opcodes; with naive decoding they render as bogus branches.
+        Honoring local zone context renders them correctly as `.2byte`
+        when we're walking through a pool zone.
+
+        Zone transitions:
+          - Hitting a known POOL2/POOL4 → switch to `pool`.
+          - Hitting an address with a strong function-start signal
+            (static caller refs, reference FUN_ label, or a register-
+            push prologue pattern) → switch to `code`.
+
+        Initial zone for the section: look back up to 4 bytes for a
+        POOL marker.  If found, start as `pool` (e.g. the trailing
+        zone right after a function whose tail was pool data).
+        Otherwise start as `code`.
         """
         binary = self.model.binary
         vram = self.model.vram
         binary_end = self.model.end_addr
         end = min(end, binary_end)
+        current_zone = self._zone_at(start)
         addr = start
         while addr <= end:
             off = addr - vram
@@ -2947,6 +2988,7 @@ class SweepState:
                     text=f".4byte 0x{value:08X}",
                     label=f".L_pool_{addr:08X}",
                 ))
+                current_zone = "pool"
                 addr += 4
                 continue
             if kind is ByteKind.POOL2 and addr + 1 <= end and off + 1 < len(binary):
@@ -2960,10 +3002,48 @@ class SweepState:
                     text=f".2byte 0x{value:04X}",
                     label=f".L_pool_{addr:08X}",
                 ))
+                current_zone = "pool"
                 addr += 2
                 continue
 
-            # Otherwise decode as instruction (best-effort).
+            # UNKNOWN byte_kind — decide pool-vs-code via two positive
+            # code signals (any one trips the zone to 'code') and one
+            # negative signal (no reachability + currently in pool →
+            # stays pool):
+            #
+            #   Positive (switch to code):
+            #     1. addr is reachable from SOME analyzed function's CFG
+            #        walk — definitively executed code.
+            #     2. addr has a function-start signal (static caller,
+            #        reference FUN_ label, register-push prologue) —
+            #        next function starts here.
+            #
+            #   Negative (stay in pool):
+            #     If neither of the above trips AND we're currently in
+            #     a pool zone, this byte renders as `.2byte` regardless
+            #     of what it bit-aligns to as an opcode.  Fixes the whole
+            #     "pool data values decode as bra/bsr/dt/whatever"
+            #     class of bug.
+            if addr in self.model.global_reachable:
+                current_zone = "code"
+            elif self._is_fn_start_signal(addr):
+                current_zone = "code"
+
+            if current_zone == "pool":
+                value = (binary[off] << 8) | binary[off+1]
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.POOL2,
+                    section=section,
+                    addr=addr,
+                    bytes_hex=" ".join(f"{binary[off+i]:02X}" for i in range(2)),
+                    text=f".2byte 0x{value:04X}",
+                    label=f".L_pool_{addr:08X}",
+                ))
+                addr += 2
+                continue
+
+            # Code zone — decode as instruction (best-effort).
             op = (binary[off] << 8) | binary[off+1]
             mnem, _ = _decode_sh2(op, addr)
             if mnem is None:
@@ -2979,6 +3059,38 @@ class SweepState:
                 category=category,
             ))
             addr += 2
+
+    def _zone_at(self, addr: int) -> str:
+        """Return 'pool' or 'code' for the immediate-preceding context
+        of `addr`.  Used to seed _emit_raw_rows' initial current_zone.
+
+        Looks backward up to 4 bytes for a POOL marker (pool words are
+        2 or 4 bytes; byte_kind only stores the start-of-word address).
+        """
+        for back in (2, 4):
+            prev_addr = addr - back
+            if prev_addr < self.model.vram:
+                break
+            kind = self.model.byte_kind.get(prev_addr)
+            if kind in (ByteKind.POOL2, ByteKind.POOL4):
+                return "pool"
+        return "code"
+
+    def _is_fn_start_signal(self, addr: int) -> bool:
+        """True if `addr` has a strong function-start signal.  Three
+        sources, any one trips: same-binary static callers, reference
+        FUN_ label, or a register-push prologue pattern at the opcode."""
+        if self.model.static_callers.get(addr, 0) > 0:
+            return True
+        if addr in self.model.reference_starts:
+            return True
+        off = addr - self.model.vram
+        if off + 1 < len(self.model.binary):
+            op = (self.model.binary[off] << 8) | self.model.binary[off + 1]
+            mnem, _ = _decode_sh2(op, addr)
+            if _looks_like_fn_start(mnem):
+                return True
+        return False
 
     # ----- Per-function pool view (with sibling pool refs) -------------
 
