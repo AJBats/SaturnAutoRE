@@ -1,7 +1,9 @@
 // keys.js — single-candidate forward-sweep eval UI.
 
 let LAST_CANDIDATE_START = null;
+let LAST_CANDIDATE_END = null;
 let LAST_NATURAL_START = null;
+let LAST_NATURAL_END = null;
 let LAST_ATTN_KEY = '';
 
 function setStatus(text) {
@@ -224,7 +226,7 @@ function alignLines(leftLines, rightLines) {
 // which is row-aligned).  Red highlight + "ref: next FUN" tag — same
 // red palette as the `reference: disagrees` banner pill so the two
 // cues are visually linked.
-function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet, showUnpin) {
+function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet, showUnpinAll, showUnpinEnd) {
   if (!lines || !lines.length) {
     target.textContent = '';
     if (isPrimary) CURRENT_BRANCHES = [];
@@ -245,15 +247,27 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
     if (isMid)    cls += ' midpoint';
     if (isRefEnd) cls += ' ref-end';
     if (line.kind === 'section') {
-      // On the primary pane's trailing-zone section header, surface an
-      // [ unpin ] button when an ai_override is active.  Renders to the
-      // LEFT of the section label so it stays visible even when the
-      // pane is narrower than the label text (horizontal scroll would
-      // otherwise hide a right-anchored button).
-      const isTrailingHeader = cls.indexOf('section-trailing-header') !== -1;
-      const unpinBtn = (showUnpin && isTrailingHeader)
-        ? `<button class="unpin-btn" title="clear the active ai_override (revert to oracle's natural candidate)">[ unpin ]</button>`
-        : '';
+      // On the primary pane, surface [ unpin ] buttons on the PROPOSED
+      // (section-current) and TRAILING headers when an ai_override is
+      // active — with DIFFERENT semantics:
+      //   - PROPOSED header [unpin]: clears the whole override
+      //     (start, end, attn — start over from scratch).
+      //   - TRAILING header [unpin]: clears only candidate_end (keeps
+      //     any pinned start; falls back to oracle's natural end).
+      // Use a data attribute so the click handler knows which to call.
+      const isTrailing = cls.indexOf('section-trailing-header') !== -1;
+      const isCurrent  = cls.indexOf('section-current-header')  !== -1;
+      let unpinBtn = '';
+      // Each button only renders when it has something to clear.
+      // showUnpinAll = "any pin exists" (start OR end).
+      // showUnpinEnd = "an end pin specifically exists".
+      // Without this gating, both buttons would show whenever override
+      // is active, even when one of them would be a no-op.
+      if (showUnpinAll && isCurrent) {
+        unpinBtn = `<button class="unpin-btn" data-unpin-scope="all" title="clear the entire ai_override (start, end, attn) — start over from scratch">[ unpin ]</button>`;
+      } else if (showUnpinEnd && isTrailing) {
+        unpinBtn = `<button class="unpin-btn" data-unpin-scope="end" title="clear only the pinned end — falls back to oracle's natural end">[ unpin ]</button>`;
+      }
       return `<span class="line ${cls}">${unpinBtn}${escapeHtml(line.label || '')}</span>`;
     }
     const indent = (line.indent || 0);
@@ -545,15 +559,23 @@ async function fetchState() {
       document.getElementById('btn-unsure').classList.remove('pressed');
       setStatus(`history: ${s.history_count}`);
       LAST_CANDIDATE_START = null;
+      LAST_CANDIDATE_END = null;
       LAST_NATURAL_START = null;
+      LAST_NATURAL_END = null;
       return;
     }
 
     const overrideActive = !!s.override_active && !!s.natural_view;
     const primStart = s.candidate.start;
+    const primEnd   = s.candidate.end;
     const natStart  = overrideActive ? s.natural_view.candidate.start : null;
-    const primChanged = (primStart !== LAST_CANDIDATE_START);
-    const natChanged  = (natStart  !== LAST_NATURAL_START);
+    const natEnd    = overrideActive ? s.natural_view.candidate.end   : null;
+    // Re-render whenever EITHER boundary changes on either pane.  An
+    // end-only pin update (start stays the same) would otherwise not
+    // trigger a re-render — banner refreshes unconditionally but the
+    // listing rows would render against the stale boundary.
+    const primChanged = (primStart !== LAST_CANDIDATE_START) || (primEnd !== LAST_CANDIDATE_END);
+    const natChanged  = (natStart  !== LAST_NATURAL_START)   || (natEnd  !== LAST_NATURAL_END);
 
     // Banners are cheap to rebuild — refresh every poll so banner pills
     // stay current even when listings haven't been re-rendered.
@@ -602,10 +624,14 @@ async function fetchState() {
         // row goes on the missing side.  Works whether the override
         // tightens OR expands scope.
         const aligned = alignLines(s.lines, s.natural_view.lines);
-        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet, primRefEndSet, overrideActive);
-        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet,  natRefEndSet, false);
+        // showUnpinAll = any pin exists on the override (so the
+        // PROPOSED [unpin] button has something to clear).
+        // showUnpinEnd = an end pin specifically exists (so the
+        // TRAILING [unpin] button has something to clear).
+        renderListing(aligned.left,  primaryListing, true,  attnSet, primMidSet, primRefEndSet, overrideActive, !!s.end_pinned);
+        renderListing(aligned.right, naturalListing, false, attnSet, natMidSet,  natRefEndSet, false, false);
       } else {
-        renderListing(s.lines, primaryListing, true, attnSet, primMidSet, primRefEndSet, overrideActive);
+        renderListing(s.lines, primaryListing, true, attnSet, primMidSet, primRefEndSet, overrideActive, !!s.end_pinned);
       }
       requestAnimationFrame(() => {
         // Scroll the current candidate's section header into view, but
@@ -633,7 +659,9 @@ async function fetchState() {
     }
 
     LAST_CANDIDATE_START = primStart;
+    LAST_CANDIDATE_END   = primEnd;
     LAST_NATURAL_START   = natStart;
+    LAST_NATURAL_END     = natEnd;
     setStatus(`history: ${s.history_count}`);
 
     // Reflect "what verdict did I last press on this candidate" so the
@@ -682,10 +710,16 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('listing-wrap').addEventListener('click', async (e) => {
     const unpin = e.target.closest('.unpin-btn');
     if (unpin) {
-      const r = await fetch('/unpin-end', {method: 'POST'});
+      // Scope tells us which endpoint to call: "all" clears the whole
+      // override (proposed header), "end" clears only candidate_end
+      // (trailing header).  Default to "end" for safety if attribute
+      // is missing.
+      const scope = unpin.dataset.unpinScope || 'end';
+      const url = scope === 'all' ? '/unpin-all' : '/unpin-end';
+      const r = await fetch(url, {method: 'POST'});
       const data = await r.json();
       if (!data.ok) {
-        setStatus('unpin failed: ' + (data.error || 'unknown'));
+        setStatus(`${url.slice(1)} failed: ` + (data.error || 'unknown'));
         return;
       }
       fetchState();
@@ -698,14 +732,30 @@ document.addEventListener('DOMContentLoaded', () => {
     const addr = parseInt(line.dataset.addr, 10);
     if (Number.isNaN(addr) || addr <= 0) return;
     const hex = '0x' + addr.toString(16).toUpperCase().padStart(8, '0');
-    const r = await fetch('/pin-end', {
+    // Route based on click position relative to the current candidate:
+    //  - Above current start → pin-start (this addr becomes the new
+    //    function start; oracle computes the end from there).
+    //  - At or below current start → pin-end (this addr is where the
+    //    NEXT function starts, so current ends at addr - 1).
+    // Server-side comparisons against the live candidate state cover
+    // the edge cases (e.g. clicking at exact candidate start = noop
+    // via the "addr must be after start" validation).
+    let url, body;
+    if (LAST_CANDIDATE_START != null && addr < LAST_CANDIDATE_START) {
+      url = '/pin-start';
+      body = {addr: hex};
+    } else {
+      url = '/pin-end';
+      body = {next_start: hex};
+    }
+    const r = await fetch(url, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({next_start: hex}),
+      body: JSON.stringify(body),
     });
     const data = await r.json();
     if (!data.ok) {
-      setStatus('pin-end failed: ' + (data.error || 'unknown'));
+      setStatus(`${url.slice(1)} failed: ` + (data.error || 'unknown'));
       return;
     }
     fetchState();

@@ -295,7 +295,8 @@ header#header > #header-content {
    appears. */
 .pin-zone {
   display: inline-block;
-  width: 1.2em;
+  width: 1.6em;
+  padding: 0 0.2em;
   text-align: center;
   color: #6c6;
   cursor: pointer;

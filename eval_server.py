@@ -1709,6 +1709,11 @@ def state():
             and last.get("verdict") in ("rejected", "unsure")):
             current_verdict = last["verdict"]
 
+        # Granular pin flags so the UI can show [unpin] buttons only
+        # where they'd actually do something.  override_active alone is
+        # too coarse — would render an end-unpin button even when only
+        # candidate_start is pinned (and vice versa).
+        ov = session.get("ai_override") or {}
         return jsonify({
             "all_caught_up": False,
             "candidate": primary_payload["candidate"],
@@ -1716,6 +1721,8 @@ def state():
             "lines":     primary_payload["lines"],
             "natural_view": natural_view,
             "override_active": bool(session.get("ai_override")),
+            "start_pinned": "candidate_start" in ov,
+            "end_pinned":   "candidate_end"   in ov,
             "attn": attn_addrs,
             "current_verdict": current_verdict,
             "history_count": len(history),
@@ -1828,18 +1835,103 @@ def pin_end():
     return jsonify({"ok": True, "candidate_end": f"0x{new_end:08X}"})
 
 
+@app.route("/pin-start", methods=["POST"])
+def pin_start():
+    """Pin the current candidate's start to the given address.
+
+    Body JSON: {"addr": "0x06034C68"}
+
+    Triggered when the human clicks `+` on a line ABOVE the current
+    candidate.  Use case: an obvious gap exists between the previous
+    verified subseg and oracle's proposed candidate, and the human
+    sees the real function start in that gap.  One click pins it.
+
+    Replaces any existing ai_override entirely (no partial-state
+    tracking — avoids start-after-end inversions).  After pin-start
+    the human can two-click by also pinning the end if needed.
+    """
+    data = request.get_json(force=True)
+    raw = data.get("addr")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'addr'"}), 400
+    try:
+        addr = _coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+
+    with LOCK:
+        _reload_caches()
+        cfg = STATE["cfg_cache"]
+        # Reject if addr lands inside an already-verified subseg.
+        for s in (cfg.get("subsegments") or []):
+            if s.get("type") != "code":
+                continue
+            if s["start"] <= addr <= s["end"]:
+                return jsonify({
+                    "ok": False,
+                    "error": f"addr 0x{addr:08X} is inside verified subseg FUN_{s['start']:08X}",
+                }), 400
+        # Find the immediately-preceding verified subseg as previous_subseg
+        # (same logic the forward sweep uses to render the prev section
+        # correctly — pick the latest verified subseg whose end < addr).
+        prev = max(
+            (s for s in (cfg.get("subsegments") or [])
+             if s.get("type") == "code" and s["end"] < addr),
+            key=lambda s: s["end"],
+            default=None,
+        )
+
+        session = load_session()
+        override = {"candidate_start": f"0x{addr:08X}"}
+        if prev:
+            override["previous_subseg"] = prev
+        session["ai_override"] = override
+        save_session(session)
+    return jsonify({"ok": True, "candidate_start": f"0x{addr:08X}"})
+
+
 @app.route("/unpin-end", methods=["POST"])
 def unpin_end():
-    """Clear the active ai_override entirely — counterpart to /pin-end.
+    """Remove ONLY candidate_end from ai_override.
 
-    Removes session.ai_override.  Next /state poll will show oracle's
-    natural candidate.  Triggered by the `[ unpin ]` button in the
-    primary pane's trailing-zone header.
+    Surgical counterpart to /pin-end.  Keeps any pinned start (and
+    attn list) intact — UI falls back to oracle's natural end from
+    the still-pinned start.  Triggered by the trailing-zone [unpin]
+    button.
 
-    Clears the WHOLE override (not just candidate_end) because the
-    pin-end workflow always sets candidate_start to the current
-    ev.start — so removing candidate_end while leaving candidate_start
-    pinned would be a no-op anyway.
+    If after removing candidate_end the override has no
+    meaningfully-pinned start (candidate_start equals what oracle
+    would naturally propose, or no candidate_start at all), clear
+    the override entirely — leaves no stale `{candidate_start: X}`
+    behind that would lock the candidate in place.
+    """
+    with LOCK:
+        session = load_session()
+        override = dict(session.get("ai_override") or {})
+        had_end = "candidate_end" in override
+        override.pop("candidate_end", None)
+        # If nothing useful is left, clear entirely.  candidate_start
+        # alone is only useful if the user explicitly pinned the start
+        # to something other than what natural would propose — but we
+        # can't easily distinguish, so the heuristic is "only keep
+        # override around if candidate_start is set and there's also
+        # an attn list or some other override-only field that the
+        # user might want preserved".
+        keep = bool(override.get("candidate_start")) and (
+            "attn" in override or "previous_subseg" in override
+        )
+        session["ai_override"] = override if keep else None
+        save_session(session)
+    return jsonify({"ok": True, "had_end": had_end})
+
+
+@app.route("/unpin-all", methods=["POST"])
+def unpin_all():
+    """Clear the entire ai_override.
+
+    Triggered by the PROPOSED-header [unpin] button.  Nuclear option —
+    drops candidate_start, candidate_end, attn, and previous_subseg
+    in one shot.  Use when starting over from scratch.
     """
     with LOCK:
         session = load_session()
