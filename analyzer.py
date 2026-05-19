@@ -220,6 +220,7 @@ class FunctionAnalysis:
     conditional_returns: list = field(default_factory=list)  # addrs of non-final rts
     pool_targets: list = field(default_factory=list)     # all PC-rel load targets in reachable set
     reachable: set = field(default_factory=set)          # set of addrs reachable from start
+    indirect_calls: list = field(default_factory=list)   # addrs of jsr/jmp/braf/bsrf (register-indirect)
 
     # ----- Indent depths from CFG region analysis (moved from eval_server)
     indent_depths: dict = field(default_factory=dict)    # {addr: depth}
@@ -1119,6 +1120,332 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
     return "LOW", flags
 
 
+# ----- Indent depths from CFG region analysis -------------------------------
+
+def _compute_indent_depths(binary, vram, fn_start, fn_end, branches):
+    """Compute nesting depth per address via CFG region analysis.
+
+    Approach:
+      1. Build basic blocks: split at every branch instruction and every
+         branch target.
+      2. Build edges (successor relationships) between blocks.
+      3. Identify structured regions:
+           - if-then / if-then-else: a block ending in a conditional whose
+             two successors merge at a common postdominator
+           - while / do-while: a backward edge from a block to a dominator
+      4. Build a region tree from the regions; depth = nesting of regions.
+
+    For unreducible control flow (irregular goto, tail calls), the region
+    decomposition leaves those addresses at depth 0 — better to be flat
+    than misleading.
+
+    `fn_end` is the address of the last byte of the function's last
+    reachable instruction (= max(reachable) + 1).  Pool data past that
+    must NOT be walked: pool bytes can spell branch opcodes and create
+    bogus basic blocks that pollute the region containment graph.
+
+    Returns dict {addr: int_depth} — sparse, only entries with depth > 0.
+    """
+    if not branches:
+        return {}
+    if binary is None or vram is None:
+        return {}
+
+    # ----- 1. Identify block-start addresses
+    block_starts = {fn_start}
+    branches_by_src = {}
+    for b in branches:
+        if not b.internal or b.target is None:
+            continue
+        branches_by_src[b.src] = b
+        block_starts.add(b.target)
+        # Instruction after a branch (or its delay slot) begins a new block.
+        delay = 2 if b.mnem in {"bra", "bsr", "bf/s", "bt/s"} else 0
+        after = b.src + 2 + delay
+        if fn_start <= after <= fn_end:
+            block_starts.add(after)
+
+    # Also: instruction after rts/jmp/braf (no static target but ends a block)
+    addr = fn_start
+    while addr <= fn_end:
+        off = addr - vram
+        if off + 1 >= len(binary):
+            break
+        op = (binary[off] << 8) | binary[off + 1]
+        mnem, _ = _decode_sh2(op, addr)
+        if mnem:
+            head = mnem.split()[0]
+            if head in {"rts", "rte", "jmp", "braf"}:
+                # Includes delay slot
+                after = addr + 4
+                if fn_start <= after <= fn_end:
+                    block_starts.add(after)
+        addr += 2
+
+    block_starts_sorted = sorted(s for s in block_starts if fn_start <= s <= fn_end)
+    if not block_starts_sorted:
+        return {}
+
+    # ----- 2. Build blocks (each is [start, end_inclusive])
+    blocks = []
+    for i, s in enumerate(block_starts_sorted):
+        e = (block_starts_sorted[i + 1] - 1) if i + 1 < len(block_starts_sorted) else fn_end
+        blocks.append({"start": s, "end": e, "id": i})
+    addr_to_block = {}
+    for blk in blocks:
+        for a in range(blk["start"], blk["end"] + 1, 2):
+            addr_to_block[a] = blk["id"]
+
+    # ----- 3. Build successor edges per block
+    for blk in blocks:
+        blk["succs"] = []
+    for blk in blocks:
+        # Find this block's terminating control-flow instruction.
+        term_addr = None
+        term_mnem = None
+        a = blk["start"]
+        while a <= blk["end"]:
+            off = a - vram
+            if off + 1 < len(binary):
+                op = (binary[off] << 8) | binary[off + 1]
+                mn, _ = _decode_sh2(op, a)
+                if mn:
+                    head = mn.split()[0]
+                    if head in {"rts", "rte", "jmp", "braf", "bra", "bsr", "bf", "bt", "bf/s", "bt/s"}:
+                        term_addr = a
+                        term_mnem = mn
+            a += 2
+
+        if term_mnem is None:
+            # No branch in this block — falls through to next block by address
+            nxt = blk["end"] + 1
+            if nxt in addr_to_block:
+                blk["succs"].append(addr_to_block[nxt])
+            continue
+
+        head = term_mnem.split()[0]
+        b = branches_by_src.get(term_addr)
+        if head in {"bra"}:
+            if b and b.target in addr_to_block:
+                blk["succs"].append(addr_to_block[b.target])
+        elif head in {"bf", "bt", "bf/s", "bt/s"}:
+            # Conditional: target + fall-through-after-delay
+            if b and b.target in addr_to_block:
+                blk["succs"].append(addr_to_block[b.target])
+            delay = 2 if head in {"bf/s", "bt/s"} else 0
+            after = term_addr + 2 + delay
+            if after in addr_to_block:
+                blk["succs"].append(addr_to_block[after])
+        elif head in {"rts", "rte"}:
+            pass  # no successor (function exit)
+        elif head in {"jmp", "braf"}:
+            pass  # indirect — no static successor we can resolve
+        elif head == "bsr":
+            # Call returns; fall-through after delay slot
+            after = term_addr + 4
+            if after in addr_to_block:
+                blk["succs"].append(addr_to_block[after])
+
+    # ----- 4. Identify structured regions
+    # Strategy: scan blocks for two patterns:
+    #   (a) if/if-else: block ends in conditional, both successors converge
+    #   (b) loop: block has back-edge to an earlier block (potential header)
+    regions = []
+
+    # Find back-edges (loops) — a successor that points to an earlier block.
+    for blk in blocks:
+        for s in blk["succs"]:
+            if s <= blk["id"]:
+                header_id = s
+                tail_id = blk["id"]
+                # Loop body = blocks reachable from header without going through tail+1
+                body = set()
+                stack = [header_id]
+                while stack:
+                    cur = stack.pop()
+                    if cur in body or cur > tail_id:
+                        continue
+                    body.add(cur)
+                    for nx in blocks[cur]["succs"]:
+                        if nx not in body and nx >= header_id and nx <= tail_id:
+                            stack.append(nx)
+                regions.append({"kind": "loop", "header": header_id,
+                                "body": body, "exit": None})
+
+    # Find if/if-else: block with two successors, both reach a common merge.
+    def reaches_from(block_id, stop_at=None):
+        visited = set()
+        stack = [block_id]
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            if cur == stop_at:
+                continue
+            for nx in blocks[cur]["succs"]:
+                if nx not in visited:
+                    stack.append(nx)
+        return visited
+
+    for blk in blocks:
+        if len(blk["succs"]) != 2:
+            continue
+        target_succ = blk["succs"][0]
+        fall_succ = blk["succs"][1]
+        if target_succ <= blk["id"] or fall_succ <= blk["id"]:
+            continue  # backward (loop) handled separately
+        reach_target = reaches_from(target_succ)
+        reach_fall = reaches_from(fall_succ)
+        common = reach_target & reach_fall
+        if not common:
+            continue
+        merge = min(common)
+
+        # Two structural patterns:
+        #   (a) Branched-to has its own body before reaching the merge.
+        #       This is bt-with-body or bf-with-bra-to-merge. The branched-to
+        #       arm is the "interesting" code — indent it.  Fall-through
+        #       (often just bra-to-merge plumbing) stays at outer depth.
+        #   (b) Branched-to IS the merge (target_succ == merge). This is the
+        #       bf-no-else / skip-the-body pattern: the conditional jumps OVER
+        #       the if-body. The fall-through path IS the if-body — indent it.
+        if target_succ == merge:
+            body = reach_fall - {merge}
+        else:
+            body = reach_target - {merge}
+        body = {bid for bid in body if blk["id"] < bid < merge}
+        if not body:
+            continue
+        regions.append({"kind": "if", "header": blk["id"],
+                        "body": body, "exit": merge})
+
+    # Drop "if" regions whose body is empty (degenerate — no real nesting)
+    regions = [r for r in regions if r["body"]]
+
+    # ----- 5. Build region tree by containment; depth = chain length.
+    # A region R1 is "inside" R2 if R1.body ⊆ R2.body and R1.header in R2.body.
+    # Sibling case: if both regions share the same exit (merge point), they
+    # are NOT nested — they're parallel arms of a dispatch.  This is the
+    # difference between a switch (many bts to common end) and a nested
+    # if/else (each branch with its own merge).
+    def region_contains(outer, inner):
+        if outer is inner:
+            return False
+        if inner["header"] not in outer["body"]:
+            return False
+        if not inner["body"].issubset(outer["body"]):
+            return False
+        if (outer.get("exit") is not None
+                and outer.get("exit") == inner.get("exit")
+                and outer["kind"] == "if" and inner["kind"] == "if"):
+            return False
+        return True
+
+    # depth of each region = 1 + max depth of any container.
+    # Process OUTERMOST first so parent depths are known when children compute.
+    region_depth = [0] * len(regions)
+    order = sorted(range(len(regions)), key=lambda i: -len(regions[i]["body"]))
+    for i in order:
+        parent_depth = 0
+        for j in range(len(regions)):
+            if j == i:
+                continue
+            if region_contains(regions[j], regions[i]):
+                if region_depth[j] > parent_depth:
+                    parent_depth = region_depth[j]
+        region_depth[i] = parent_depth + 1
+
+    # ----- 6. Assign per-address depth = depth of innermost containing region
+    addr_depths = {}
+    addr = fn_start
+    while addr <= fn_end:
+        bid = addr_to_block.get(addr)
+        if bid is None:
+            addr += 2
+            continue
+        best_depth = 0
+        for ri, r in enumerate(regions):
+            if bid in r["body"]:
+                if region_depth[ri] > best_depth:
+                    best_depth = region_depth[ri]
+        if best_depth > 0:
+            addr_depths[addr] = best_depth
+        addr += 2
+
+    return addr_depths
+
+
+# ----- Indirect-target resolution -------------------------------------------
+
+def _resolve_indirect_target(binary, vram, reachable, fn_start, addr, mnem):
+    """For jmp/jsr/bsrf/braf @rN, find the most recent `mov.l @(disp,PC),
+    rN` that loaded that register, and read the 4-byte pool word it
+    targets — that's the actual runtime branch target.
+
+    GCC almost always emits the load 1–4 instructions before the
+    indirect branch (load pool, jump-to-Rn pattern).  We walk backward
+    in the function's reachable set, stopping at the first instruction
+    that either:
+      - loads the target register from a PC-relative pool (success), OR
+      - writes the target register some other way (gives up — we
+        can't determine the value statically).
+
+    Returns the resolved target address, or None if not resolvable.
+    """
+    parts = mnem.split()
+    if len(parts) < 2:
+        return None
+    operand = parts[1].lstrip("@").rstrip(",")
+    if not operand.startswith("r") or not operand[1:].isdigit():
+        return None
+    reg = operand
+    cur = addr - 2
+    # Walk backward up to 16 instructions — well past GCC's typical
+    # 1–4 instruction gap between load and indirect branch.
+    for _ in range(16):
+        if cur < fn_start or cur not in reachable:
+            break
+        off = cur - vram
+        if off + 1 >= len(binary):
+            break
+        op = (binary[off] << 8) | binary[off + 1]
+        m, tgt = _decode_sh2(op, cur)
+        if m is None:
+            cur -= 2
+            continue
+        # Word-boundary match for `..., rN` as the destination — bare
+        # substring would treat `r1` as a prefix of `r15`, etc.
+        def _ends_with_reg(s, r):
+            tail = f", {r}"
+            idx = s.rfind(tail)
+            if idx < 0:
+                return False
+            nxt = s[idx + len(tail) : idx + len(tail) + 1]
+            return nxt == "" or not nxt.isdigit()
+
+        # mov.l @(0x..., PC), rN — the load we're looking for
+        if m.startswith("mov.l @(0x") and _ends_with_reg(m, reg) and tgt is not None:
+            poff = tgt - vram
+            if 0 <= poff + 3 < len(binary):
+                v = (binary[poff] << 24) | (binary[poff+1] << 16) | (binary[poff+2] << 8) | binary[poff+3]
+                return v
+            return None
+        # Any other write to rN — stop, value unknowable statically
+        # (covers: mov.l @rX, rN ; mov rX, rN ; mov #imm, rN ; etc.)
+        # Store-to-mem forms (`mov.l rN, @...`) have rN as source, not
+        # destination — skip those.  Cmp/tst don't modify their second
+        # operand either.
+        if (_ends_with_reg(m, reg)
+                and not m.startswith(("cmp", "tst",
+                                      f"mov.l {reg},",
+                                      f"mov.w {reg},",
+                                      f"mov.b {reg},"))):
+            return None
+        cur -= 2
+    return None
+
+
 # ---------------------------------------------------------------------------
 # The model itself.  Implementations land here phase by phase.
 # ---------------------------------------------------------------------------
@@ -1204,6 +1531,10 @@ class BinaryModel:
         # Order matters: reference_starts feeds cross_module_callers.
         self.reference_starts = self._load_reference_starts(reference_dir)
         self.reference_nexts  = self._build_reference_nexts(self.reference_starts)
+        # Sorted list for "next reference start after arbitrary addr"
+        # lookups (used by phase-4 reference agreement).  Computed once
+        # because the set never changes during a session.
+        self._reference_starts_sorted = sorted(self.reference_starts)
         self.static_callers   = self._scan_static_callers()
         self.cross_module_callers = self._scan_cross_module_callers(
             reference_scan_dir, reference_dir,
@@ -1356,6 +1687,51 @@ class BinaryModel:
         except KeyError:
             verdict_enum = Verdict.UNKNOWN
 
+        # ----- Phase 4: per-function enrichment -----
+        # All fields below were previously computed in eval_server and
+        # bolted onto FunctionEvidence after the fact.  Pulling them into
+        # FunctionAnalysis means eval_server2 just reads them.
+
+        # CFG region depths.  Uses the same fn_start/fn_end as eval_server:
+        # function start through last reachable instruction's end byte
+        # (code_end, NOT the post-pool-extension `end`) so pool data
+        # doesn't pollute the region graph.
+        indent_depths = _compute_indent_depths(
+            binary, vram, start, code_end, branches,
+        )
+
+        # Indirect-branch target resolutions.  For every jmp/jsr/braf/bsrf
+        # instruction in `indirect`, walk backward to find the load that
+        # produced its register value.  Pre-computed here so the renderer
+        # doesn't re-scan per row.
+        indirect_resolutions = {}
+        for ind_addr in indirect:
+            op = _read_opcode(binary, vram, ind_addr)
+            if op is None:
+                continue
+            mnem, _ = _decode_sh2(op, ind_addr)
+            if mnem is None:
+                continue
+            resolved = _resolve_indirect_target(
+                binary, vram, reachable, start, ind_addr, mnem,
+            )
+            if resolved is not None:
+                indirect_resolutions[ind_addr] = resolved
+
+        # Reference agreement, evidence, midpoints.
+        reference = self._compute_reference_agreement(start, end)
+        evidence, midpoints = self._compute_evidence_and_midpoints(start, end)
+
+        # Phantom-caller hint.  Computed from the augmented flag list
+        # (which already includes _verdict's "no prologue" string when
+        # applicable).  When phantom_hint is True we ALSO prepend the
+        # human-facing warning string to flags — matching eval_server's
+        # _build_candidate_payload behavior so consumers see the warning
+        # in the same form they always have.
+        phantom_hint = self._compute_phantom_hint(evidence, flags)
+        if phantom_hint:
+            flags = ["supported only by cross-module phantom callers (likely hot-swap collision, not a real entry)"] + list(flags)
+
         return FunctionAnalysis(
             start=start,
             end=end,
@@ -1369,9 +1745,15 @@ class BinaryModel:
             conditional_returns=conditional_rts,
             pool_targets=pool_targets,
             reachable=reachable,
+            indirect_calls=list(indirect),
             verdict=verdict_enum,
             yellow_flags=flags,
-            # Phase-4 fields stay at defaults
+            indent_depths=indent_depths,
+            indirect_resolutions=indirect_resolutions,
+            reference=reference,
+            midpoints=midpoints,
+            evidence=evidence,
+            phantom_hint=phantom_hint,
         )
 
     # ------------------------------------------------------------------
@@ -1623,6 +2005,123 @@ class BinaryModel:
                     if a in reference_starts:
                         cross[a] = cross.get(a, 0) + 1
         return cross
+
+    # ------------------------------------------------------------------
+    # Phase 4 internals — per-function enrichment
+    # ------------------------------------------------------------------
+
+    def _compute_reference_agreement(self, start: int, end: int) -> ReferenceAgreement:
+        """Compare proposed (start, end) against the reference's view.
+
+        Returns a ReferenceAgreement with:
+          - verdict: "agrees" | "disagrees" | "silent"
+          - start_match: bool (does reference have FUN_<start>?)
+          - reference_next: addr of reference's next FUN > start, or None
+          - reference_implied_end: reference_next - 1, or None
+          - end_delta: our_end - reference_implied_end (positive = we're longer)
+          - tooltip: human-readable summary
+
+        Mirrors eval_server._compute_reference_agreement.  Tolerance for
+        "agrees" is 16 bytes — reference boundaries include pool/padding
+        between functions so exact end-byte agreement is rare.
+        """
+        start_match = start in self.reference_starts
+
+        reference_next = None
+        for a in self._reference_starts_sorted:
+            if a > start:
+                reference_next = a
+                break
+
+        reference_implied_end = (reference_next - 1) if reference_next is not None else None
+        end_delta = (end - reference_implied_end) if reference_implied_end is not None else None
+
+        TOL = 16
+
+        if not start_match:
+            verdict = "silent"
+            tooltip = f"reference has no FUN_{start:08X}"
+        elif end_delta is None:
+            verdict = "agrees"
+            tooltip = f"reference start matches; no reference successor (last fn)"
+        elif abs(end_delta) <= TOL:
+            verdict = "agrees"
+            tooltip = (
+                f"reference FUN_{start:08X} → next FUN_{reference_next:08X}; "
+                f"our end {end_delta:+d} bytes vs reference implied end "
+                f"0x{reference_implied_end:08X}"
+            )
+        else:
+            verdict = "disagrees"
+            if end_delta > 0:
+                tooltip = (
+                    f"reference thinks function is shorter by {end_delta} bytes "
+                    f"(reference next FUN_{reference_next:08X} → implied end "
+                    f"0x{reference_implied_end:08X})"
+                )
+            else:
+                tooltip = (
+                    f"reference thinks function is longer by {-end_delta} bytes "
+                    f"(reference next FUN_{reference_next:08X} → implied end "
+                    f"0x{reference_implied_end:08X})"
+                )
+
+        return ReferenceAgreement(
+            verdict=verdict,
+            start_match=start_match,
+            reference_next=reference_next,
+            reference_implied_end=reference_implied_end,
+            end_delta=end_delta,
+            tooltip=tooltip,
+        )
+
+    def _compute_evidence_and_midpoints(self, start: int, end: int):
+        """Build the function's evidence (caller + runtime counts at
+        start) and its midpoints (reference FUN starts strictly inside
+        (start, end] with their own evidence).
+
+        Returns (FunctionEvidence, list[Midpoint]).
+        Mirrors eval_server._compute_candidate_evidence.
+        """
+        sc = self.static_callers
+        cm = self.cross_module_callers
+        rh = self.runtime_hits
+
+        midpoints = []
+        for a in self._reference_starts_sorted:
+            if a <= start:
+                continue
+            if a > end:
+                break  # sorted list — no more candidates beyond end
+            # a is in (start, end]
+            midpoints.append(Midpoint(
+                addr=a,
+                static_callers=sc.get(a, 0),
+                cross_module_callers=cm.get(a, 0),
+                runtime_hits=rh.get(a, 0),
+            ))
+
+        evidence = FunctionEvidence(
+            static_callers=sc.get(start, 0),
+            cross_module_callers=cm.get(start, 0),
+            runtime_hits=rh.get(start, 0),
+        )
+        return evidence, midpoints
+
+    @staticmethod
+    def _compute_phantom_hint(evidence: FunctionEvidence, yellow_flags: list) -> bool:
+        """Detect the 'cross-module phantom caller' pattern: a candidate
+        supported ONLY by sibling hot-swap module references (physically
+        impossible at runtime), with no same-module caller and no
+        prologue register pushes.  Strongly suggests the address isn't a
+        real function entry in this binary.
+
+        Mirrors eval_server._build_candidate_payload's inline check.
+        """
+        has_cross = evidence.cross_module_callers > 0
+        has_same = evidence.static_callers > 0
+        no_prologue = any("no prologue register pushes" in f for f in yellow_flags)
+        return has_cross and not has_same and no_prologue
 
     @staticmethod
     def _load_runtime_hits(runtime_hits_dirs: Optional[list]) -> dict:
