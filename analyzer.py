@@ -1376,6 +1376,64 @@ def _compute_indent_depths(binary, vram, fn_start, fn_end, branches):
     return addr_depths
 
 
+# ----- Forward-sweep helpers (phase 5) --------------------------------------
+
+def _scan_for_next_prologue(binary, vram, start_addr, max_addr,
+                            reference_starts=None, static_callers=None,
+                            cross_module_callers=None):
+    """Walk forward from start_addr looking for the next function entry.
+
+    Four signals, any of which makes us propose `addr` as the next candidate:
+      1. static_callers[addr] > 0  — somebody in this binary's reference
+         bsr/jsrs to this address; definitively a function entry.
+      2. addr in reference_starts    — reference labeled it FUN_<addr>; less
+         decisive (reference has Ghidra hallucinations) but a real signal.
+      3. cross_module_callers[addr] > 0  — same-name reference in a sibling
+         hot-swap module bsr/jsrs to this address.  Can't physically resolve
+         to this binary at runtime, but worth surfacing as a candidate so
+         the human can quickly judge + reject rather than having us silently
+         skip over 30 phantoms in a row.  The candidate-evaluator tags it
+         with a yellow flag so it's loud in the banner.
+      4. _looks_like_fn_start(...) — first instruction matches a register-
+         push pattern.  Misses non-ABI helper functions that have no
+         prologue (e.g. FUN_0602A818, which starts with `mov.l @r6, r6`
+         and is called 4× via bsr).
+
+    Returns the EARLIEST matching address, or None if nothing matches.
+    """
+    reference_starts = reference_starts or set()
+    static_callers = static_callers or {}
+    cross_module_callers = cross_module_callers or {}
+    addr = (start_addr + 1) & ~1
+    while addr <= max_addr:
+        if static_callers.get(addr, 0) > 0:
+            return addr
+        if addr in reference_starts:
+            return addr
+        if cross_module_callers.get(addr, 0) > 0:
+            return addr
+        off = addr - vram
+        if off + 1 >= len(binary):
+            return None
+        opcode = (binary[off] << 8) | binary[off + 1]
+        mnem, _ = _decode_sh2(opcode, addr)
+        if _looks_like_fn_start(mnem):
+            return addr
+        addr += 2
+    return None
+
+
+def _coerce_addr(v):
+    """Accept either '0x06029E8F' / '06029E8F' (hex string) or 100833423 (int).
+
+    Used by SweepState when parsing ai_override values (which may come
+    from either JSON int literals or hex strings written by the AI).
+    """
+    if isinstance(v, str):
+        return int(v, 16)
+    return int(v)
+
+
 # ----- Indirect-target resolution -------------------------------------------
 
 def _resolve_indirect_target(binary, vram, reachable, fn_start, addr, mnem):
@@ -2170,39 +2228,266 @@ class SweepState:
     poll (the BinaryModel is the expensive bit, reused across polls).
 
     Phase plan:
-      Phase 5: next_candidate / gaps / progress
+      Phase 5: next_candidate / gaps / progress      ← DONE
       Phase 6: listing (per-pane)
       Phase 7: aligned_listings (split-view diff)
     """
-
-    model: BinaryModel
-    verified: list                       # list[VerifiedSubseg], sorted by start
-    tus: list                             # raw TU dicts (start/end/name)
 
     def __init__(self,
                  model: BinaryModel,
                  yaml_cfg: dict,
                  ai_override: Optional[dict] = None,
                  ):
-        # IMPLEMENTATION LANDS IN PHASE 5.
-        raise NotImplementedError("phase 5 not yet implemented")
+        self.model = model
+        self.yaml_cfg = yaml_cfg
+        self.ai_override = dict(ai_override or {})
+
+        # Parse verified code subsegs into typed records.  Sort by start
+        # so forward-sweep gets deterministic predecessor order.
+        self.verified = [
+            VerifiedSubseg(
+                start=s["start"],
+                end=s["end"],
+                type=s.get("type", "code"),
+                file=s.get("file", ""),
+            )
+            for s in (yaml_cfg.get("subsegments") or [])
+            if s.get("type") == "code"
+        ]
+        self.verified.sort(key=lambda s: s.start)
+
+        # Translation units (file boundaries) — used to cap analyze_function's
+        # hint_end so the CFG walk doesn't run off into the next TU when a
+        # branch goes there.
+        self.tus = list(yaml_cfg.get("tus") or [])
+
+    # ------------------------------------------------------------------
+    # Public — candidate selection
+    # ------------------------------------------------------------------
 
     def next_candidate(self) -> Optional[NextCandidate]:
-        # IMPLEMENTATION LANDS IN PHASE 5.
-        raise NotImplementedError("phase 5 not yet implemented")
+        """Return the candidate the UI should show.  If ai_override is
+        active, honor it; otherwise forward-sweep from the latest
+        verified subseg.
+
+        Mirrors eval_server._compute_current(ignore_override=False).
+        """
+        if self.ai_override.get("candidate_start"):
+            return self._override_candidate()
+        return self._forward_sweep_candidate()
 
     def natural_candidate(self) -> Optional[NextCandidate]:
-        """Same as next_candidate but ignores ai_override — used to build
-        the 'ORACLE NATURAL' pane in split view."""
-        raise NotImplementedError("phase 5 not yet implemented")
+        """Same as next_candidate but ignores ai_override — used by the
+        split-view 'ORACLE NATURAL' pane.
+
+        Mirrors eval_server._compute_current(ignore_override=True).
+        """
+        return self._forward_sweep_candidate()
+
+    # ------------------------------------------------------------------
+    # Public — gap detection + progress
+    # ------------------------------------------------------------------
 
     def gaps(self, proposed_start: Optional[int] = None) -> list:
-        # IMPLEMENTATION LANDS IN PHASE 5.
-        raise NotImplementedError("phase 5 not yet implemented")
+        """Find every uncovered byte range BETWEEN consecutive verified
+        code subsegs PLUS the pending gap between the latest verified
+        subseg and the currently-proposed candidate (if any).
+
+        Why include the pending gap: when forward-sweep can't find a real
+        function in a zone (no reference label, no prologue, no callers),
+        it skips over to the next function it CAN find — leaving a
+        would-be gap that the user will create the instant they approve.
+        We catch this state pre-emptively rather than waiting for the
+        approval to fire the banner.
+
+        The actual tail (after the proposed candidate's end) is still
+        excluded — that's the unswept frontier ahead of forward-sweep,
+        not a gap.
+
+        Returns list[Gap].  Each `pending` field:
+          False = gap already exists in the yaml (a real bug to backfill)
+          True  = gap is between latest-stamped and current proposal
+                  (would be created on approval)
+        """
+        gaps = []
+        prev = None
+        for s in self.verified:
+            if prev is not None and s.start > prev.end + 1:
+                gap_start = prev.end + 1
+                gap_end = s.start - 1
+                gaps.append(Gap(
+                    start=gap_start,
+                    end=gap_end,
+                    size=gap_end - gap_start + 1,
+                    preceding_start=prev.start,
+                    preceding_name=f"FUN_{prev.start:08X}",
+                    pending=False,
+                ))
+            prev = s
+
+        # Pending gap between latest verified and the proposed candidate.
+        if proposed_start is not None and prev is not None:
+            if proposed_start > prev.end + 1:
+                gap_start = prev.end + 1
+                gap_end = proposed_start - 1
+                gaps.append(Gap(
+                    start=gap_start,
+                    end=gap_end,
+                    size=gap_end - gap_start + 1,
+                    preceding_start=prev.start,
+                    preceding_name=f"FUN_{prev.start:08X}",
+                    pending=True,
+                ))
+        return gaps
 
     def progress(self) -> Progress:
-        # IMPLEMENTATION LANDS IN PHASE 5.
-        raise NotImplementedError("phase 5 not yet implemented")
+        """Sum verified code subseg bytes vs total binary size.
+
+        Mirrors eval_server._compute_progress.
+        """
+        verified_bytes = sum(s.end - s.start + 1 for s in self.verified)
+        total_bytes = len(self.model.binary)
+        pct = (verified_bytes / total_bytes * 100.0) if total_bytes else 0.0
+        return Progress(
+            verified_bytes=verified_bytes,
+            total_bytes=total_bytes,
+            pct=pct,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal — forward-sweep + override resolution
+    # ------------------------------------------------------------------
+
+    def _forward_sweep_candidate(self) -> Optional[NextCandidate]:
+        """Forward-sweep candidate generation.
+
+        Sorts verified subsegs by start.  For each, scans the bytes
+        immediately after `end` looking for the next function-start
+        pattern.  Returns the FIRST such candidate that isn't already
+        a verified subseg.
+
+        Mirrors oracle.find_next_forward_sweep_candidate, but pulls
+        binary/vram/pool_priors/reference_starts/static_callers/
+        cross_module_callers from self.model (single source of truth).
+        """
+        model = self.model
+        binary = model.binary
+        vram = model.vram
+        binary_end = vram + len(binary) - 1
+
+        pool_priors = model.pool_priors_dict()
+        reference_starts = model.reference_starts
+        static_callers = model.static_callers
+        cross_module_callers = model.cross_module_callers
+
+        def _covered_by_existing(addr):
+            """True if addr falls inside any verified subseg's [start, end]
+            range — not just at a start.  Catches the case where forward
+            sweep latches on a prologue inside a function that was
+            ai_overridden to start a few bytes earlier."""
+            for s in self.verified:
+                if s.start <= addr <= s.end:
+                    return True
+            return False
+
+        # Head-of-binary case: if the binary's first address isn't covered
+        # by any declared subseg, look for a function there first.  Handles
+        # both the bootstrap case (no anchors yet) and re-review of the
+        # very first function after an /unstamp at the binary head.
+        if not self.verified or self.verified[0].start > vram:
+            next_start = _scan_for_next_prologue(
+                binary, vram, vram, binary_end,
+                reference_starts=reference_starts,
+                static_callers=static_callers,
+                cross_module_callers=cross_module_callers,
+            )
+            if next_start is not None and not _covered_by_existing(next_start):
+                tu = next((t for t in self.tus if t["start"] <= next_start <= t["end"]), None)
+                hint_end = tu["end"] if tu else None
+                fa = model.analyze_function(next_start, hint_end=hint_end)
+                return NextCandidate(previous=None, function=fa)
+
+        for prev in self.verified:
+            next_start = _scan_for_next_prologue(
+                binary, vram, prev.end + 1, binary_end,
+                reference_starts=reference_starts,
+                static_callers=static_callers,
+                cross_module_callers=cross_module_callers,
+            )
+            if next_start is None:
+                continue
+            if _covered_by_existing(next_start):
+                # Already inside an existing verified subseg — keep iterating.
+                continue
+            # Pick the ACTUAL immediately-preceding subseg, not the iteration's
+            # `prev`.  The scan can walk past an unsignaled-but-verified subseg
+            # (e.g. a 4-byte alternate-entry stub with no callers + no reference
+            # FUN_<addr>: declaration) and land on a candidate further out.  In
+            # that case the `prev` we're iterating from is stale — the real
+            # previous-verified-subseg is the one that hugs next_start.
+            actual_prev = max(
+                (s for s in self.verified if s.end < next_start),
+                key=lambda s: s.end,
+                default=prev,
+            )
+            tu = next((t for t in self.tus if t["start"] <= next_start <= t["end"]), None)
+            hint_end = tu["end"] if tu else None
+            fa = model.analyze_function(next_start, hint_end=hint_end)
+            return NextCandidate(previous=actual_prev, function=fa)
+
+        return None
+
+    def _override_candidate(self) -> Optional[NextCandidate]:
+        """Apply ai_override to produce the displayed candidate.
+
+        The override pins candidate_start (and optionally candidate_end).
+        When candidate_end is pinned, it's used as the analyze_function
+        hint_end AND the displayed end (analyzer may report a shorter
+        end if a clean exit is found earlier; we override that for
+        display since the AI explicitly asked for the longer range).
+
+        Mirrors eval_server._compute_current's override branch.
+        """
+        ov = self.ai_override
+        model = self.model
+
+        start = _coerce_addr(ov["candidate_start"])
+        tu = next((t for t in self.tus if t["start"] <= start <= t["end"]), None)
+
+        # AI may also pin the END explicitly (one-off boundary correction
+        # the oracle's heuristics can't reach).  When pinned, use it as
+        # hint_end so the ENTIRE analysis (CFG walk, epilogue search,
+        # prologue/epilogue mirror, verdict) runs against the override
+        # boundary — not against TU end with a post-hoc end mutation,
+        # which leaves the verdict reflecting whichever epilogue
+        # analyzer's natural walk happened to land on (often a different
+        # function's rts past the real end).
+        end_override_raw = ov.get("candidate_end")
+        if end_override_raw is not None:
+            hint_end = _coerce_addr(end_override_raw)
+        else:
+            hint_end = tu["end"] if tu else None
+
+        fa = model.analyze_function(start, hint_end=hint_end)
+        if end_override_raw is not None:
+            # analyze_function may have chosen an end < hint_end (a clean
+            # exit was found before reaching the cap).  Force the
+            # displayed/written boundary to match the AI's pin regardless,
+            # so the listing reflects what's been requested.
+            fa.end = _coerce_addr(end_override_raw)
+
+        # previous_subseg in override is optional — when present, it's the
+        # raw yaml subseg dict shape (start/end accept int or hex string).
+        prev_raw = ov.get("previous_subseg")
+        prev = None
+        if prev_raw:
+            prev = VerifiedSubseg(
+                start=_coerce_addr(prev_raw["start"]),
+                end=_coerce_addr(prev_raw["end"]),
+                type=prev_raw.get("type", "code"),
+                file=prev_raw.get("file", ""),
+            )
+        return NextCandidate(previous=prev, function=fa)
 
     def listing(self,
                 candidate: FunctionAnalysis,

@@ -697,6 +697,224 @@ def run_phase4_parity(yaml_path: Path, project_root: Path) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Phase 5 parity: SweepState (forward-sweep / gaps / progress) vs the
+# behavior eval_server currently produces inline via oracle's
+# find_next_forward_sweep_candidate + _detect_internal_gaps +
+# _compute_progress.
+#
+# Three checks:
+#   A. natural_candidate() on current yaml  == oracle.find_next_forward_sweep_candidate
+#   B. gaps() / progress() == eval_server._detect_internal_gaps / _compute_progress
+#   C. Forward-sweep regression: remove each verified subseg from yaml,
+#      run sweep, expect it to propose the removed subseg's start.
+# ---------------------------------------------------------------------------
+
+def _candidate_start_end(result):
+    """Project either eval_server (prev_dict, FunctionEvidence) tuple or
+    analyzer.NextCandidate to a comparable (prev_start, start, end) tuple."""
+    if result is None:
+        return None
+    if isinstance(result, tuple):
+        prev_dict, ev = result
+        prev_start = prev_dict["start"] if prev_dict else None
+        return (prev_start, ev.start, ev.end)
+    # analyzer.NextCandidate
+    prev_start = result.previous.start if result.previous else None
+    return (prev_start, result.function.start, result.function.end)
+
+
+def _gap_to_tuple(g):
+    """Project either eval_server gap dict or analyzer.Gap to comparable shape."""
+    if isinstance(g, dict):
+        return (g["start"], g["end"], g["size"], g["preceding_start"], g["pending"])
+    return (g.start, g.end, g.size, g.preceding_start, g.pending)
+
+
+def run_phase5_parity(yaml_path: Path, project_root: Path) -> dict:
+    model, ctx = _build_analyzer_model(yaml_path, project_root)
+    sweep = analyzer.SweepState(model, ctx["cfg"], ai_override=None)
+
+    # -- A. natural_candidate (no override) vs oracle.find_next_forward_sweep_candidate
+    expected_next = oracle.find_next_forward_sweep_candidate(
+        ctx["cfg"], ctx["binary"],
+        pool_priors=ctx["pool_priors"],
+        reference_starts=ctx["reference_starts"],
+        static_callers=ctx["static_callers"],
+        cross_module_callers=ctx["cross_module_callers"],
+    )
+    actual_next = sweep.natural_candidate()
+    natural_match = (
+        _candidate_start_end(expected_next) == _candidate_start_end(actual_next)
+    )
+
+    # -- B. gaps + progress
+    expected_gaps_raw = eval_server._detect_internal_gaps(proposed_start=None)
+    expected_gaps = [_gap_to_tuple(g) for g in expected_gaps_raw]
+    actual_gaps = [_gap_to_tuple(g) for g in sweep.gaps(proposed_start=None)]
+    gaps_match = expected_gaps == actual_gaps
+
+    expected_progress = eval_server._compute_progress()
+    actual_progress = sweep.progress()
+    progress_match = (
+        expected_progress["verified_bytes"] == actual_progress.verified_bytes
+        and expected_progress["total_bytes"] == actual_progress.total_bytes
+        and abs(expected_progress["pct"] - actual_progress.pct) < 1e-9
+    )
+
+    # -- C. Forward-sweep discoverability (INFORMATIONAL, not a parity check).
+    # Remove each verified subseg, run sweep, see what it proposes.  Three
+    # buckets:
+    #   FOUND:   sweep proposes the removed subseg's start → naturally
+    #              discoverable, the human could have stamped this without
+    #              AI assistance.
+    #   SKIPPED: sweep proposes a DIFFERENT verified subseg's start (a later
+    #              one in the modified yaml) → sweep couldn't find the
+    #              removed addr naturally and moved on to the next signal it
+    #              could find.  Almost always means the removed stamp was
+    #              originally landed via ai_override (no prologue, no
+    #              caller signal, no reference label).  This is expected
+    #              behavior — sweep is just doing its job.
+    #   ANOMALY: sweep proposes a non-verified addr, or returns None →
+    #              worth investigating; means sweep would land on an
+    #              unstamped address (or nothing) where the human had
+    #              previously stamped.
+    cfg = ctx["cfg"]
+    subsegs = sorted(
+        [s for s in cfg.get("subsegments", []) if s.get("type") == "code"],
+        key=lambda s: s["start"],
+    )
+    verified_starts = {s["start"] for s in subsegs}
+    last_stamp_end = max(s["end"] for s in subsegs) if subsegs else None
+    found = 0
+    inside_removed = []         # sweep found a prologue INSIDE the removed function's original range
+    skipped_to_verified = []    # sweep proposed a later verified subseg's start
+    past_frontier = []          # sweep walked into unstamped territory (past last_stamp_end)
+    anomalies = []
+    for s in subsegs:
+        modified = dict(cfg)
+        modified["subsegments"] = [x for x in cfg.get("subsegments", []) if x is not s]
+        sub_sweep = analyzer.SweepState(model, modified, ai_override=None)
+        nc = sub_sweep.natural_candidate()
+        if nc is None:
+            anomalies.append({
+                "removed": f"0x{s['start']:08X}",
+                "result": "sweep returned None",
+            })
+            continue
+        proposed = nc.function.start
+        if proposed == s["start"]:
+            found += 1
+        elif s["start"] < proposed <= s["end"]:
+            # Sweep snapped to a prologue-shaped pattern INSIDE the removed
+            # function.  Common case: the human's stamp landed via
+            # ai_override at a pre-prologue address (e.g. setup code before
+            # the canonical sts.l pr push); without that hint, sweep finds
+            # the natural prologue further in.
+            inside_removed.append({
+                "removed": f"0x{s['start']:08X}",
+                "proposed": f"0x{proposed:08X}",
+                "offset": proposed - s["start"],
+            })
+        elif proposed in verified_starts and proposed > s["start"]:
+            skipped_to_verified.append({
+                "removed": f"0x{s['start']:08X}",
+                "sweep_jumped_to": f"0x{proposed:08X}",
+            })
+        elif last_stamp_end is not None and proposed > last_stamp_end:
+            # Sweep walked past every stamp and landed on the first
+            # unstamped-territory function.  Means no signal was findable
+            # in stamped territory after the removed subseg — typical for
+            # ai_override stamps near the end of the verified region.
+            past_frontier.append({
+                "removed": f"0x{s['start']:08X}",
+                "proposed": f"0x{proposed:08X}",
+            })
+        else:
+            anomalies.append({
+                "removed": f"0x{s['start']:08X}",
+                "proposed": f"0x{proposed:08X}",
+                "proposed_is_verified": proposed in verified_starts,
+            })
+
+    return {
+        "natural_match": natural_match,
+        "expected_next": _candidate_start_end(expected_next),
+        "actual_next": _candidate_start_end(actual_next),
+        "gaps_match": gaps_match,
+        "expected_gaps_count": len(expected_gaps),
+        "actual_gaps_count": len(actual_gaps),
+        "progress_match": progress_match,
+        "expected_progress": expected_progress,
+        "actual_progress": {
+            "verified_bytes": actual_progress.verified_bytes,
+            "total_bytes": actual_progress.total_bytes,
+            "pct": actual_progress.pct,
+        },
+        "sweep_found": found,
+        "sweep_inside_removed": inside_removed,
+        "sweep_skipped_to_verified": skipped_to_verified,
+        "sweep_past_frontier": past_frontier,
+        "sweep_anomalies": anomalies,
+        "sweep_total": len(subsegs),
+        # Parity = A + B + (no real anomalies in C).  Inside-removed /
+        # skipped-to-verified / past-frontier are all expected sweep
+        # behaviors when stamps were originally landed via ai_override.
+        "match": (
+            natural_match and gaps_match and progress_match
+            and not anomalies
+        ),
+    }
+
+
+def _print_phase5(result: dict):
+    print()
+    print(f"PHASE 5 PARITY - SweepState (forward-sweep / gaps / progress)")
+    a_status = "PASS" if result["natural_match"] else "FAIL"
+    print(f"  {a_status}  natural_candidate vs oracle.find_next_forward_sweep_candidate")
+    if not result["natural_match"]:
+        print(f"        expected: {result['expected_next']}")
+        print(f"        actual:   {result['actual_next']}")
+    b1 = "PASS" if result["gaps_match"] else "FAIL"
+    print(f"  {b1}  gaps() vs eval_server._detect_internal_gaps  ({result['expected_gaps_count']} expected, {result['actual_gaps_count']} actual)")
+    b2 = "PASS" if result["progress_match"] else "FAIL"
+    print(f"  {b2}  progress() vs eval_server._compute_progress  "
+          f"({result['actual_progress']['verified_bytes']}/{result['actual_progress']['total_bytes']} bytes, "
+          f"{result['actual_progress']['pct']:.4f}%)")
+    sp = result["sweep_found"]
+    st = result["sweep_total"]
+    inside = len(result["sweep_inside_removed"])
+    skipped = len(result["sweep_skipped_to_verified"])
+    frontier = len(result["sweep_past_frontier"])
+    an = len(result["sweep_anomalies"])
+    c_status = "PASS" if an == 0 else "FAIL"
+    print(f"  {c_status}  forward-sweep discoverability:  {sp}/{st} naturally found, "
+          f"{inside} snap-to-inside-prologue, {skipped} skip-to-next-verified, "
+          f"{frontier} walk-to-unstamped, {an} anomalies")
+    if result["sweep_inside_removed"]:
+        print(f"        INSIDE_REMOVED ({inside}) - sweep landed on a prologue inside the removed function's range:")
+        for d in result["sweep_inside_removed"][:5]:
+            print(f"          removed {d['removed']} -> proposed {d['proposed']}  (+{d['offset']} bytes)")
+        if inside > 5:
+            print(f"          ... and {inside - 5} more")
+    if result["sweep_past_frontier"]:
+        print(f"        PAST_FRONTIER ({frontier}) - sweep walked past all stamps into unstamped territory:")
+        for d in result["sweep_past_frontier"][:5]:
+            print(f"          removed {d['removed']} -> proposed {d['proposed']}")
+        if frontier > 5:
+            print(f"          ... and {frontier - 5} more")
+    if result["sweep_skipped_to_verified"]:
+        print(f"        SKIPPED_TO_VERIFIED ({skipped}) - sweep moved past these to the next verified subseg:")
+        for d in result["sweep_skipped_to_verified"][:5]:
+            print(f"          removed {d['removed']} -> sweep proposed {d['sweep_jumped_to']}")
+        if skipped > 5:
+            print(f"          ... and {skipped - 5} more")
+    if result["sweep_anomalies"]:
+        print(f"        ANOMALIES ({an}):")
+        for d in result["sweep_anomalies"][:5]:
+            print(f"          {d}")
+
+
 def _print_phase4(result: dict):
     print()
     print(f"PHASE 4 PARITY - per-function enrichment (indent / indirect / reference / evidence / midpoints / phantom)")
@@ -805,7 +1023,7 @@ def main():
     p.add_argument("--baseline", help="write full per-subseg baseline JSON here (current oracle only)")
     p.add_argument("--show", action="append", default=[], help="show full detail for category (END_DISAGREE / LOW_VERDICT / etc.)")
     p.add_argument("--verbose", action="store_true", help="show all rows + yellow flags")
-    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "all"], default="baseline",
+    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "all"], default="baseline",
                    help="which parity check to run (default: baseline)")
     args = p.parse_args()
 
@@ -848,6 +1066,12 @@ def main():
     if args.phase in ("phase4", "all"):
         result = run_phase4_parity(yaml_path, project_root)
         _print_phase4(result)
+        if not result["match"]:
+            sys.exit(1)
+
+    if args.phase in ("phase5", "all"):
+        result = run_phase5_parity(yaml_path, project_root)
+        _print_phase5(result)
         if not result["match"]:
             sys.exit(1)
 
