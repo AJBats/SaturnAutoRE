@@ -1093,40 +1093,57 @@ def _load_binary_pool_targets():
     @(disp,PC),r0`, records the target address with the right size
     (4 for mov.l/mova, 2 for mov.w).
 
-    Returns {addr: size}.  Used as an additional pool-detection source
-    by `_emit_raw_bytes` so trailing-zone bytes that other functions
-    load as pool words render as `.4byte`/`.2byte` instead of being
-    mis-decoded as instructions (the data-as-code trap).
+    Two-pass to avoid the data-as-code trap: bytes INSIDE a pool word
+    can themselves bit-align as a valid `mov.l @(disp,PC)` opcode and
+    produce a phantom pool target.  E.g. pool word 0x25C0D100 at
+    0x06032AAC has bytes D1 00 at offset +2, which decode as
+    `mov.l @(0x06032AB0), r1` → marks 0x06032AB0 as pool.  But
+    0x06032AB0 is actually the next function's prologue `mov.l r14,
+    @-r15`.  Pass 1 builds the naive pool set (with false positives),
+    pass 2 re-scans skipping bytes inside pass-1 pool words.
     """
     binary = STATE["binary_cache"]
     vram = STATE["vram_cache"]
-    pool_sizes = {}
     end_addr = vram + len(binary) - 1
-    for addr in range(vram, end_addr, 2):
-        off = addr - vram
-        op = (binary[off] << 8) | binary[off + 1]
-        hi = (op >> 12) & 0xF
-        if hi == 0xD:
-            # mov.l @(disp,PC), Rn — 4-byte aligned target
-            disp = op & 0xFF
-            tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
-            if vram <= tgt <= end_addr:
-                pool_sizes[tgt] = 4
-        elif hi == 0x9:
-            # mov.w @(disp,PC), Rn — 2-byte target; don't downgrade if
-            # mov.l already claimed it (same address can be loaded both
-            # ways, but mov.l implies 4-byte semantics for rendering).
-            disp = op & 0xFF
-            tgt = addr + 4 + disp * 2
-            if vram <= tgt <= end_addr and tgt not in pool_sizes:
-                pool_sizes[tgt] = 2
-        elif hi == 0xC and ((op >> 8) & 0xF) == 7:
-            # mova @(disp,PC), r0 — 4-byte aligned target (jump table head)
-            disp = op & 0xFF
-            tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
-            if vram <= tgt <= end_addr:
-                pool_sizes[tgt] = 4
-    return pool_sizes
+
+    def scan(skip_addrs):
+        pool_sizes = {}
+        for addr in range(vram, end_addr, 2):
+            if addr in skip_addrs:
+                continue
+            off = addr - vram
+            op = (binary[off] << 8) | binary[off + 1]
+            hi = (op >> 12) & 0xF
+            if hi == 0xD:
+                # mov.l @(disp,PC), Rn — 4-byte aligned target
+                disp = op & 0xFF
+                tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
+                if vram <= tgt <= end_addr:
+                    pool_sizes[tgt] = 4
+            elif hi == 0x9:
+                # mov.w @(disp,PC), Rn — 2-byte target; don't downgrade if
+                # mov.l already claimed it (same address can be loaded both
+                # ways, but mov.l implies 4-byte semantics for rendering).
+                disp = op & 0xFF
+                tgt = addr + 4 + disp * 2
+                if vram <= tgt <= end_addr and tgt not in pool_sizes:
+                    pool_sizes[tgt] = 2
+            elif hi == 0xC and ((op >> 8) & 0xF) == 7:
+                # mova @(disp,PC), r0 — 4-byte aligned target (jump table head)
+                disp = op & 0xFF
+                tgt = (addr & 0xFFFFFFFC) + 4 + disp * 4
+                if vram <= tgt <= end_addr:
+                    pool_sizes[tgt] = 4
+        return pool_sizes
+
+    # Pass 1: naive scan, no skips
+    pass1 = scan(set())
+    # Pass 2: skip every 2-byte address inside a pass-1 pool word
+    pool_data_addrs = set()
+    for tgt, size in pass1.items():
+        for i in range(0, size, 2):
+            pool_data_addrs.add(tgt + i)
+    return scan(pool_data_addrs)
 
 
 def _resolved_dir_option(key):
