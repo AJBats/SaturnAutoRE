@@ -697,10 +697,25 @@ def main():
     STATE["project_root"] = project_root
     STATE["session_path"] = yaml_path.parent / (yaml_path.stem + ".session.json")
     # Eagerly build the model so the first /state poll is cheap.
-    _build_or_get_model(_load_yaml_cfg())
+    cfg = _load_yaml_cfg()
+    model = _build_or_get_model(cfg)
+    # Pre-warm analyze_function for every verified subseg.  SweepState's
+    # listing() iterates these as siblings on every /state poll (to find
+    # cross-function pool references landing in the candidate's range),
+    # and an un-warmed cache means N analyze_function calls on the first
+    # poll.  Warm here once so all polls — including the first — are
+    # fast.  Process-lifetime cache; Flask reload re-runs this.
+    is_reloader_child = bool(os.environ.get("WERKZEUG_RUN_MAIN"))
+    if not is_reloader_child:
+        print(f"  Pre-warming analyze_function cache ...", end=" ", flush=True)
+    t0 = time.time()
+    subsegs = [s for s in (cfg.get("subsegments") or []) if s.get("type") == "code"]
+    for s in subsegs:
+        model.analyze_function(s["start"], hint_end=s["end"])
+    if not is_reloader_child:
+        print(f"{len(subsegs)} functions cached in {time.time() - t0:.2f}s")
 
     url = f"http://localhost:{args.port}"
-    is_reloader_child = bool(os.environ.get("WERKZEUG_RUN_MAIN"))
 
     if not is_reloader_child:
         print()

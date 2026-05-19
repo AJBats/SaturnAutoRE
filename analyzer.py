@@ -24,7 +24,7 @@ are filled in phase by phase per the refactor plan.  See:
 from __future__ import annotations
 
 import sys as _sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dc_replace
 from enum import Enum
 from pathlib import Path
 from typing import Optional
@@ -1636,6 +1636,20 @@ class BinaryModel:
         self.instructions: dict = {}         # {addr: Instruction}
         self.indirect_resolutions: dict = {} # {addr: resolved_target}
 
+        # analyze_function result cache.  Key: (start, hint_end).  Pure
+        # over BinaryModel inputs, so process-lifetime caching is safe.
+        # `analyze_function` returns a `dataclasses.replace`-copy on each
+        # access so the (int-only) `end` field can be safely mutated by
+        # callers (e.g. SweepState honoring a yaml end-override on the
+        # prev section) without polluting the cached version.
+        #
+        # The big win is avoiding repeated phase-4 enrichment work
+        # (`_compute_indent_depths` in particular is O(blocks^2) per
+        # function and dominates per-poll cost when SweepState's
+        # listing() iterates ~N siblings to compute cross-function
+        # pool references.
+        self._analyze_cache: dict = {}
+
         # ----- Phase 1: pool detection -----
         # Union of (a) reference-derived priors from the .pool_priors.txt
         # sidecar AND (b) whole-binary PC-relative load target scan
@@ -1714,6 +1728,27 @@ class BinaryModel:
                          start: int,
                          hint_end: Optional[int] = None,
                          ) -> FunctionAnalysis:
+        """Cached analyze_function.  Returns a copy of the cached
+        FunctionAnalysis so callers can safely mutate `end` (the only
+        field SweepState mutates post-analysis) without polluting the
+        cache.  Cache key is (start, hint_end)."""
+        key = (start, hint_end)
+        cached = self._analyze_cache.get(key)
+        if cached is None:
+            cached = self._analyze_function_uncached(start, hint_end)
+            self._analyze_cache[key] = cached
+        # `_dc_replace` makes a new FunctionAnalysis with the SAME field
+        # values.  Primitive fields (start, end, prologue_stack, etc.)
+        # are copied by value; container fields (branches, reachable,
+        # indent_depths, ...) are shared by reference — safe because no
+        # code mutates them post-analysis (verified by inspection of
+        # SweepState's call sites: only `.end` gets mutated).
+        return _dc_replace(cached)
+
+    def _analyze_function_uncached(self,
+                                    start: int,
+                                    hint_end: Optional[int] = None,
+                                    ) -> FunctionAnalysis:
         """Phase 3b: produces FunctionAnalysis using inlined helpers.
 
         Mirrors oracle.analyze_candidate's flow exactly:
