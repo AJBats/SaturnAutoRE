@@ -315,6 +315,7 @@ class ListingRow:
     # ----- Categorization (drives CSS .cat-* classes)
     category: Optional[InstructionCategory] = None
     is_tail_call: bool = False           # external uncond branch — loudest red
+    is_indirect_branch: bool = False     # jmp @rN / braf rN — adds .uncond-indirect on top of cat-uncond
 
     # ----- Indent depth (capped for display in renderer)
     indent: int = 0
@@ -391,6 +392,20 @@ _DELAYED_BRANCH   = {"bra", "bsr", "bf/s", "bt/s", "jmp", "jsr", "braf", "bsrf",
 _UNCONDITIONAL_EXIT = {"bra", "jmp", "rts", "rte"}
 _EPI_HARD_STOPS = ("rts", "rte", "bra", "bsr", "bf", "bt", "bf/s", "bt/s",
                     "jmp", "jsr", "braf", "bsrf")
+
+# Listing category sets (mirror eval_server's grouping for parity).
+_RETURN_HEADS  = {"rts", "rte"}
+_CALL_HEADS    = {"jsr", "bsr", "bsrf"}
+_UNCOND_HEADS  = {"bra", "jmp", "braf"}
+_COND_HEADS    = {"bf", "bt", "bf/s", "bt/s"}
+_COMPARE_HEADS = {"tst", "cmp/eq", "cmp/ge", "cmp/gt", "cmp/hi", "cmp/hs",
+                  "cmp/pl", "cmp/pz", "cmp/str"}
+
+# Listing layout constants (moved from eval_server in phase 6).  Indent
+# cap keeps deep switch-dispatch chains scannable; trailing window is the
+# bytes-after-candidate zone the UI shows for context.
+MAX_DISPLAY_INDENT = 4
+TRAILING_BYTES = 200
 
 # Function-start signals — patterns that strongly suggest "a function begins
 # at this address."  Used by forward sweep to scan past pool/data zones.
@@ -1434,6 +1449,68 @@ def _coerce_addr(v):
     return int(v)
 
 
+# ----- Listing helpers (phase 6) --------------------------------------------
+
+def _classify_mnem_to_category(mnem) -> Optional[InstructionCategory]:
+    """Map a decoded mnem string to its InstructionCategory.
+
+    Mirrors eval_server._classify_mnem.  Returns None for instructions
+    that don't get a category class (which is the catchall — most ALU
+    ops, loads, stores, etc.).
+    """
+    if not mnem:
+        return None
+    head = mnem.split()[0]
+    if head in _RETURN_HEADS:  return InstructionCategory.RETURN
+    if head in _CALL_HEADS:    return InstructionCategory.CALL
+    if head in _UNCOND_HEADS:  return InstructionCategory.UNCOND_BRANCH
+    if head in _COND_HEADS:    return InstructionCategory.COND_BRANCH
+    if "@(0x" in mnem and head in ("mov.l", "mov.w", "mova"):
+        return InstructionCategory.POOL_LOAD
+    if head in _COMPARE_HEADS:
+        return InstructionCategory.COMPARE
+    if mnem.startswith(".byte") or mnem.startswith(".4byte") or mnem.startswith(".2byte"):
+        return InstructionCategory.OTHER  # eval_server uses 'cat-data' here; mapped via the OTHER bucket
+    return None
+
+
+def _symbolize_mnem(mnem, pool4, pool2, mova, branch_targets) -> str:
+    """Replace inline addresses in `mnem` with symbolic labels.
+
+    Two transformations:
+      - `mov.l @(0xADDR, PC), Rn` → `mov.l .L_pool_ADDR, Rn`
+        (and same for mov.w / mova) when ADDR is in the pool sets.
+      - `bra 0xADDR` / `bf 0xADDR` / etc. → `bra .L_ADDR` when ADDR is
+        an internal branch target.
+
+    Mirrors eval_server._symbolize.  Returns the rewritten string.
+    """
+    parts = mnem.split(None, 1)
+    if not parts:
+        return mnem
+    head = parts[0]
+    tail = parts[1] if len(parts) > 1 else ""
+
+    if "@(0x" in tail and head in ("mov.l", "mov.w", "mova"):
+        before, _, after = tail.partition("@(0x")
+        hex_str, _, rest = after.partition(")")
+        try:
+            addr = int(hex_str, 16)
+            if addr in pool4 or addr in pool2 or addr in mova:
+                return f"{head} {before}.L_pool_{addr:08X}{rest}".strip()
+        except ValueError:
+            pass
+
+    if head in _BRANCH_MNEMONICS:
+        try:
+            target = int(tail.rstrip(","), 16)
+            if target in branch_targets:
+                return f"{head} .L_{target:08X}"
+        except ValueError:
+            pass
+    return mnem
+
+
 # ----- Indirect-target resolution -------------------------------------------
 
 def _resolve_indirect_target(binary, vram, reachable, fn_start, addr, mnem):
@@ -2261,6 +2338,17 @@ class SweepState:
         # branch goes there.
         self.tus = list(yaml_cfg.get("tus") or [])
 
+        # Sibling-pool cache: per-subseg reachable sets are expensive to
+        # build (each requires a full analyze_function), so cache and
+        # reuse.  Keyed by subseg start; invalidated implicitly because
+        # SweepState is rebuilt per /state poll.
+        self._sibling_pool_cache: dict = {}
+
+        # Verified-starts set for fast membership tests during listing
+        # symbolization (indirect-target resolution renders "FUN_<addr>"
+        # vs "0x<addr>" based on whether the resolved target is stamped).
+        self._verified_starts = {s.start for s in self.verified}
+
     # ------------------------------------------------------------------
     # Public — candidate selection
     # ------------------------------------------------------------------
@@ -2437,6 +2525,537 @@ class SweepState:
 
         return None
 
+    # ------------------------------------------------------------------
+    # Phase 6 — listing model
+    # ------------------------------------------------------------------
+
+    def listing(self,
+                candidate: FunctionAnalysis,
+                previous: Optional[VerifiedSubseg],
+                attn: Optional[list] = None,
+                ) -> list:
+        """Build the four-section row list for one pane.
+
+        Sections: prev (verified) / intermediate (between prev end and
+        candidate start) / current (candidate) / trailing (TRAILING_BYTES
+        bytes after candidate).
+
+        Decorations applied per row:
+          - section, kind, indent (capped at MAX_DISPLAY_INDENT)
+          - prologue / epilogue / final_rts / cond_rts / unreachable
+          - category + is_tail_call + is_indirect_branch
+          - branch_target / direction / type for arc rendering
+          - attn / midpoint / ref_end (precedence: attn > midpoint > ref_end)
+          - indirect_resolved_label inline annotation
+          - pin_action: PIN_START above candidate, PIN_END at/below
+          - unpin_action on section headers when override active
+
+        Mirrors eval_server.render_listing + _emit_function_lines +
+        _emit_raw_bytes + _emit_section_header.
+        """
+        attn_set = set(attn or [])
+
+        rows = []
+        row_id = [0]  # mutable counter so _emit_* can bump it
+
+        def next_id():
+            i = row_id[0]
+            row_id[0] += 1
+            return i
+
+        # ----- 1. Previous section (if a prev subseg is provided) -----
+        if previous is not None:
+            # Analyze prev with hint_end = yaml's stamped end so the
+            # analysis honors the human's recorded boundary.  Then force
+            # .end to the yaml end so the displayed range matches what
+            # the splitter will emit (analyzer's CFG-walk may stop short
+            # at a delay slot, but the eval_tool's display must reflect
+            # what race.s shows, not what oracle's heuristic considers
+            # "reachable code only").
+            prev_fa = self.model.analyze_function(
+                previous.start, hint_end=previous.end,
+            )
+            prev_fa.end = previous.end
+
+            size = previous.end - previous.start + 1
+            self._emit_section_header(
+                rows, next_id, Section.PREV,
+                f"VERIFIED  FUN_{previous.start:08X}  "
+                f"0x{previous.start:08X} → 0x{previous.end:08X}  ({size} bytes)",
+                anchor_addr=previous.start,
+            )
+            self._emit_function_rows(rows, next_id, prev_fa, Section.PREV, attn_set, candidate)
+
+            # ----- 2. Intermediate section (gap between prev end and candidate start) -----
+            if previous.end + 1 < candidate.start:
+                gap_start = previous.end + 1
+                gap_end = candidate.start - 1
+                self._emit_section_header(
+                    rows, next_id, Section.INTERMEDIATE,
+                    f"INTERMEDIATE  0x{gap_start:08X} → 0x{gap_end:08X}  "
+                    f"({candidate.start - previous.end - 1} bytes, likely pool/padding)",
+                    anchor_addr=gap_start,
+                )
+                self._emit_raw_rows(rows, next_id, gap_start, gap_end, Section.INTERMEDIATE)
+
+        # ----- 3. Current section (the candidate) -----
+        size = candidate.end - candidate.start + 1
+        self._emit_section_header(
+            rows, next_id, Section.CURRENT,
+            f"PROPOSED  FUN_{candidate.start:08X}  "
+            f"0x{candidate.start:08X} → 0x{candidate.end:08X}  ({size} bytes)  "
+            f"verdict: {candidate.verdict.value}",
+            anchor_addr=candidate.start,
+        )
+        self._emit_function_rows(rows, next_id, candidate, Section.CURRENT, attn_set, candidate)
+
+        # ----- 4. Trailing section (TRAILING_BYTES past candidate end) -----
+        trailing_start = candidate.end + 1
+        trailing_end = candidate.end + TRAILING_BYTES
+        binary_end = self.model.end_addr
+        if trailing_start <= binary_end:
+            actual_end = min(trailing_end, binary_end)
+            self._emit_section_header(
+                rows, next_id, Section.TRAILING,
+                f"TRAILING  0x{trailing_start:08X} → 0x{actual_end:08X}  "
+                f"({actual_end - trailing_start + 1} bytes after candidate)",
+                anchor_addr=trailing_start,
+            )
+            self._emit_raw_rows(rows, next_id, trailing_start, actual_end, Section.TRAILING)
+
+        return rows
+
+    # ----- Section / row emitters --------------------------------------
+
+    def _emit_section_header(self, rows, next_id, section, label, anchor_addr=None):
+        """Emit a section header row.  Anchor_addr used by split-view
+        diff alignment to pair headers across panes."""
+        # Unpin action: only the PROPOSED (current) and TRAILING headers
+        # in the primary pane get [unpin] buttons, and only when an
+        # ai_override is active.  Eval_server's keys.js gates the buttons
+        # on `showUnpinAll` / `showUnpinEnd` flags — analyzer encodes the
+        # same semantics structurally.
+        unpin = UnpinAction.NONE
+        if self.ai_override.get("candidate_start"):
+            if section is Section.CURRENT:
+                unpin = UnpinAction.UNPIN_ALL
+            elif section is Section.TRAILING and self.ai_override.get("candidate_end") is not None:
+                unpin = UnpinAction.UNPIN_END
+        rows.append(ListingRow(
+            row_id=next_id(),
+            kind=RowKind.SECTION_HEADER,
+            section=section,
+            addr=None,
+            anchor_addr=anchor_addr,
+            label=label,
+            unpin_action=unpin,
+        ))
+
+    def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate):
+        """Emit ListingRow per address in [fa.start, fa.end].
+
+        `candidate` is the CURRENT candidate (used to decide pin_action
+        per row: above candidate.start → PIN_START; on/below → PIN_END).
+        For the prev-section emission, this is still the current
+        candidate — pin clicks always refer to it.
+
+        Decorations applied here, NOT downstream:
+          - prologue/epilogue tinting, final_rts/cond_rts/unreachable
+          - category + tail-call + indirect-branch flags
+          - branch metadata (for arc rendering)
+          - attn/midpoint/ref_end with precedence resolved
+          - indirect_resolved_label inline annotation
+        """
+        binary = self.model.binary
+        vram = self.model.vram
+
+        # Per-function pool view: pool4/pool2/mova sets + internal branch targets.
+        pool4, pool2, mova, branch_targets = self._build_per_function_pool_view(fa)
+
+        prologue_lo, prologue_hi = fa.prologue_range
+        epi_lo, epi_hi = fa.epilogue_range if fa.epilogue_range else (None, None)
+        branches_at = {b.src: b for b in fa.branches}
+
+        # Decoration sets: midpoints and ref-end derived from this
+        # function's analysis (NOT the displayed candidate's), so prev-
+        # section midpoints land on prev's rows.  attn applies to all
+        # rows regardless of section (it's a user-set address list).
+        midpoint_set = {m.addr for m in fa.midpoints}
+        ref_end_addr = None
+        if fa.reference is not None and fa.reference.reference_next is not None:
+            ref_end_addr = fa.reference.reference_next
+
+        addr = fa.start
+        while addr <= fa.end:
+            depth = min(fa.indent_depths.get(addr, 0), MAX_DISPLAY_INDENT)
+
+            # Decoration precedence: attn > midpoint > ref_end.  Each row
+            # gets AT MOST one of these flags set true.
+            is_attn = addr in attn_set
+            is_mid  = (not is_attn) and (addr in midpoint_set)
+            is_ref_end = (not is_attn) and (not is_mid) and (addr == ref_end_addr)
+
+            # Pin action: above candidate.start → pin_start (clicking +
+            # nudges candidate start back to this addr); at/below →
+            # pin_end (clicking + pins candidate end to addr-1, "next
+            # function starts here").
+            if addr < candidate.start:
+                pin = PinAction.PIN_START
+            else:
+                pin = PinAction.PIN_END
+
+            # ----- Pool4 row?
+            if addr in pool4:
+                off = addr - vram
+                v = (binary[off] << 24) | (binary[off+1] << 16) | (binary[off+2] << 8) | binary[off+3]
+                row = ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.POOL4,
+                    section=section,
+                    addr=addr,
+                    bytes_hex=" ".join(f"{binary[off+i]:02X}" for i in range(4)),
+                    text=f".4byte 0x{v:08X}",
+                    label=f".L_pool_{addr:08X}",
+                    indent=0,  # pool data doesn't participate in CFG indent
+                    is_attn=is_attn,
+                    is_midpoint=is_mid,
+                    is_ref_end=is_ref_end,
+                    pin_action=pin,
+                )
+                # Branch arc on a pool row — rare auto-disassembler edge
+                # case where a `.4byte` actually decodes to a branch.
+                b = branches_at.get(addr)
+                if b is not None and b.target is not None and b.internal:
+                    row.branch_target = b.target
+                    row.branch_direction = b.direction
+                    row.branch_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
+                rows.append(row)
+                addr += 4
+                continue
+
+            # ----- Pool2 row?
+            if addr in pool2:
+                off = addr - vram
+                v = (binary[off] << 8) | binary[off+1]
+                row = ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.POOL2,
+                    section=section,
+                    addr=addr,
+                    bytes_hex=" ".join(f"{binary[off+i]:02X}" for i in range(2)),
+                    text=f".2byte 0x{v:04X}",
+                    label=f".L_pool_{addr:08X}",
+                    indent=0,
+                    is_attn=is_attn,
+                    is_midpoint=is_mid,
+                    is_ref_end=is_ref_end,
+                    pin_action=pin,
+                )
+                b = branches_at.get(addr)
+                if b is not None and b.target is not None and b.internal:
+                    row.branch_target = b.target
+                    row.branch_direction = b.direction
+                    row.branch_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
+                rows.append(row)
+                addr += 2
+                continue
+
+            # ----- Branch-target label row?  (.L_<addr>: marker)
+            if addr in branch_targets and addr != fa.start:
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label=f".L_{addr:08X}:",
+                    indent=min(fa.indent_depths.get(addr, 0), MAX_DISPLAY_INDENT),
+                    is_attn=is_attn,
+                    is_midpoint=is_mid,
+                    is_ref_end=is_ref_end,
+                    pin_action=pin,
+                ))
+                # Fall through — emit the instruction row at the same addr too.
+
+            # ----- Instruction row
+            off = addr - vram
+            if off + 1 >= len(binary):
+                break
+            op = (binary[off] << 8) | binary[off+1]
+            mnem, _ = _decode_sh2(op, addr)
+            if mnem is None:
+                mnem = f".byte 0x{binary[off]:02X}, 0x{binary[off+1]:02X}"
+            symbolized = _symbolize_mnem(mnem, pool4, pool2, mova, branch_targets)
+            head = mnem.split()[0] if mnem else ""
+            category = _classify_mnem_to_category(mnem)
+
+            row = ListingRow(
+                row_id=next_id(),
+                kind=RowKind.INSTRUCTION,
+                section=section,
+                addr=addr,
+                bytes_hex=f"{binary[off]:02X} {binary[off+1]:02X}",
+                text=symbolized,
+                indent=depth,
+                category=category,
+                is_attn=is_attn,
+                is_midpoint=is_mid,
+                is_ref_end=is_ref_end,
+                pin_action=pin,
+            )
+
+            # Prologue / epilogue tinting (only meaningful in current
+            # section visually, but flagged for ALL sections so the
+            # template can decide).
+            if prologue_lo is not None and prologue_lo <= addr <= prologue_hi:
+                row.is_prologue = True
+            if epi_lo is not None and epi_lo <= addr <= epi_hi:
+                row.is_epilogue = True
+            if addr == fa.final_exit:
+                row.is_final_rts = True
+            if addr in fa.conditional_returns:
+                row.is_conditional_rts = True
+
+            # Unreachable: bytes decoded as instructions but unreachable
+            # from the function entry.  Pool/data handled above; what
+            # remains here is genuine dead-or-data that decode_sh2
+            # happened to spell as a valid mnemonic.  Zero indent so it
+            # doesn't appear nested under live code.
+            if addr not in fa.reachable:
+                row.is_unreachable = True
+                row.indent = 0
+                row.tag = "unreach"
+
+            # Branch / direction / arc metadata.
+            b = branches_at.get(addr)
+            if b is not None and b.target is not None:
+                row.branch_target = b.target
+                row.branch_direction = b.direction
+                if b.internal:
+                    row.branch_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
+                if b.internal:
+                    row.margin = "↓" if b.target > b.src else "↑"
+                else:
+                    # External target: tail-call (uncond) or external
+                    # conditional exit.
+                    row.margin = "→"
+                    if head in _UNCOND_HEADS:
+                        row.is_tail_call = True
+                        row.tag = "⇒ TAIL?"
+                    elif head in _COND_HEADS:
+                        row.is_tail_call = True
+                        row.tag = "↗ external"
+
+            # Indirect calls (jsr @rN / bsrf rN): control returns.  Subtle tag.
+            if head in _CALL_HEADS:
+                if not row.tag:
+                    row.tag = "↩ ret"
+
+            # Indirect unconditional jumps (jmp @rN, braf rN): control gone.
+            if head in ("jmp", "braf"):
+                row.is_indirect_branch = True
+                if not row.tag:
+                    row.tag = "⇒ exits"
+
+            # Indirect-branch target resolution annotation (inline).
+            # `FUN_<addr>` if target is a verified subseg start, else `0x<addr>`.
+            if head in ("jmp", "braf", "jsr", "bsrf"):
+                resolved = fa.indirect_resolutions.get(addr)
+                if resolved is not None:
+                    if resolved in self._verified_starts:
+                        sym = f"FUN_{resolved:08X}"
+                    else:
+                        sym = f"0x{resolved:08X}"
+                    row.text = f"{symbolized}   ⇒ {sym}"
+                    row.indirect_resolved_label = sym
+
+            # Direct unconditional jump with internal target — quiet tag.
+            if head == "bra" and b is not None and b.internal:
+                if not row.tag:
+                    row.tag = "⇒"
+
+            # Returns — explicit EXIT tag.
+            if head in _RETURN_HEADS:
+                row.tag = "⇒ EXIT"
+
+            rows.append(row)
+            addr += 2
+
+    def _emit_raw_rows(self, rows, next_id, start, end, section):
+        """Emit raw-byte rows for intermediate / trailing zones.
+
+        Uses model.byte_kind (which is the union of file priors + binary
+        pool target scan) to decide pool-vs-instruction per address.
+        Anything not classified as pool gets a best-effort instruction
+        decode — this is the screenshot-bug zone where pool bytes that
+        happened to bit-align as branch opcodes get spuriously decoded.
+        Fix lives in extending byte_kind, not in changing emission here.
+        """
+        binary = self.model.binary
+        vram = self.model.vram
+        binary_end = self.model.end_addr
+        end = min(end, binary_end)
+        addr = start
+        while addr <= end:
+            off = addr - vram
+            if off + 1 >= len(binary):
+                break
+
+            kind = self.model.byte_kind.get(addr)
+            if kind is ByteKind.POOL4 and addr + 3 <= end and off + 3 < len(binary):
+                value = (binary[off] << 24) | (binary[off+1] << 16) | (binary[off+2] << 8) | binary[off+3]
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.POOL4,
+                    section=section,
+                    addr=addr,
+                    bytes_hex=" ".join(f"{binary[off+i]:02X}" for i in range(4)),
+                    text=f".4byte 0x{value:08X}",
+                    label=f".L_pool_{addr:08X}",
+                ))
+                addr += 4
+                continue
+            if kind is ByteKind.POOL2 and addr + 1 <= end and off + 1 < len(binary):
+                value = (binary[off] << 8) | binary[off+1]
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.POOL2,
+                    section=section,
+                    addr=addr,
+                    bytes_hex=" ".join(f"{binary[off+i]:02X}" for i in range(2)),
+                    text=f".2byte 0x{value:04X}",
+                    label=f".L_pool_{addr:08X}",
+                ))
+                addr += 2
+                continue
+
+            # Otherwise decode as instruction (best-effort).
+            op = (binary[off] << 8) | binary[off+1]
+            mnem, _ = _decode_sh2(op, addr)
+            if mnem is None:
+                mnem = f".byte 0x{binary[off]:02X}, 0x{binary[off+1]:02X}"
+            category = _classify_mnem_to_category(mnem)
+            rows.append(ListingRow(
+                row_id=next_id(),
+                kind=RowKind.RAW,
+                section=section,
+                addr=addr,
+                bytes_hex=f"{binary[off]:02X} {binary[off+1]:02X}",
+                text=mnem,
+                category=category,
+            ))
+            addr += 2
+
+    # ----- Per-function pool view (with sibling pool refs) -------------
+
+    def _build_per_function_pool_view(self, fa: FunctionAnalysis):
+        """Compute pool4/pool2/mova sets + branch_targets for the given
+        function.  Three sources for the pool sets:
+
+          1. PC-relative load targets WITHIN fa.reachable (function-internal).
+          2. Sibling pool refs landing INSIDE fa's range (cross-function
+             refs into this function's address range — common Saturn-era
+             pattern where pool constants cluster between functions).
+          3. Reference-derived pool priors that fall inside fa's range AND
+             are NOT in fa.reachable (trust analyzer's CFG walk over
+             reference's pool prior when they disagree).
+
+        Returns (pool4_set, pool2_set, mova_set, branch_targets_dict).
+
+        Mirrors eval_server._pools_and_branches.
+        """
+        binary = self.model.binary
+        vram = self.model.vram
+        pool4, pool2, mova = set(), set(), set()
+
+        # Source 1: pool refs FROM fa to any target.
+        for addr in fa.reachable:
+            off = addr - vram
+            if off + 1 >= len(binary):
+                continue
+            op = (binary[off] << 8) | binary[off + 1]
+            mnem, tgt = _decode_sh2(op, addr)
+            if tgt is None or mnem is None:
+                continue
+            if mnem.startswith("mov.l @(0x"):
+                pool4.add(tgt)
+            elif mnem.startswith("mov.w @(0x"):
+                pool2.add(tgt)
+            elif mnem.startswith("mova @(0x"):
+                mova.add(tgt)
+
+        # Source 2: sibling pool refs landing in fa's range.
+        sp4, sp2, spm = self._sibling_pool_targets(fa.start, fa.end)
+        pool4 |= sp4
+        pool2 |= sp2
+        mova  |= spm
+
+        # Source 3: reference priors falling in fa's range AND not in
+        # reachable.  Skip addrs analyzer's CFG walk reached as code:
+        # auto-disassemblers will sometimes wrap a real branch in a
+        # `.4byte` literal, but oracle's in-binary decoding is the
+        # ground truth — trust it over the prior.
+        for addr, pw in self.model.pool_words.items():
+            if fa.start <= addr <= fa.end and addr not in fa.reachable:
+                if pw.size == 4:
+                    pool4.add(addr)
+                elif pw.size == 2:
+                    pool2.add(addr)
+
+        branch_targets = {}
+        for b in fa.branches:
+            if b.internal and b.target is not None:
+                branch_targets[b.target] = True
+        return pool4, pool2, mova, branch_targets
+
+    def _sibling_pool_targets(self, candidate_start: int, candidate_end: int):
+        """For all verified code subsegs (excluding any at candidate_start
+        itself), find PC-relative load targets that land INSIDE
+        [candidate_start, candidate_end].
+
+        Catches pool entries that physically live in the candidate's
+        address range but are referenced from sibling functions in the
+        same TU — a common Saturn-era compiler/linker pattern.
+
+        Returns (pool4, pool2, mova) sets of addresses.  Cached on
+        self._sibling_pool_cache.
+
+        Mirrors eval_server._sibling_pool_targets.
+        """
+        binary = self.model.binary
+        vram = self.model.vram
+        p4, p2, pm = set(), set(), set()
+
+        for sub in self.verified:
+            if sub.start == candidate_start:
+                continue  # skip the candidate itself
+
+            key = sub.start
+            if key not in self._sibling_pool_cache:
+                # Compute reachable set for this sibling.  Expensive but
+                # once per sibling per SweepState lifetime.
+                sib_fa = self.model.analyze_function(sub.start, hint_end=sub.end)
+                self._sibling_pool_cache[key] = sib_fa.reachable
+
+            sib_reachable = self._sibling_pool_cache[key]
+            for addr in sib_reachable:
+                off = addr - vram
+                if off + 1 >= len(binary):
+                    continue
+                op = (binary[off] << 8) | binary[off + 1]
+                mnem, tgt = _decode_sh2(op, addr)
+                if tgt is None or mnem is None:
+                    continue
+                if not (candidate_start <= tgt <= candidate_end):
+                    continue
+                if mnem.startswith("mov.l @(0x"):
+                    p4.add(tgt)
+                elif mnem.startswith("mov.w @(0x"):
+                    p2.add(tgt)
+                elif mnem.startswith("mova @(0x"):
+                    pm.add(tgt)
+
+        return p4, p2, pm
+
     def _override_candidate(self) -> Optional[NextCandidate]:
         """Apply ai_override to produce the displayed candidate.
 
@@ -2488,27 +3107,6 @@ class SweepState:
                 file=prev_raw.get("file", ""),
             )
         return NextCandidate(previous=prev, function=fa)
-
-    def listing(self,
-                candidate: FunctionAnalysis,
-                previous: Optional[VerifiedSubseg],
-                attn: Optional[list] = None,
-                ) -> list:
-        """Build the rich row list for one pane.  Emits four sections
-        (prev / intermediate / current / trailing) with all decorations
-        pre-applied.  Eval_server's only job is HTML templating.
-
-        Phase 6 implementation will:
-          - Look up model.byte_kind for every address — single source of truth
-          - Emit section headers with anchor_addr for diff alignment
-          - Apply prologue/epilogue/final_rts/cond_rts/unreachable flags
-          - Resolve attn/midpoint/ref_end precedence per row (attn > mid > ref_end)
-          - Set pin_action per row (above start → PIN_START; on/below → PIN_END)
-          - Set unpin_action on section-current and section-trailing headers
-            when an override is active in this state
-          - Compose tag column from category + flags + indirect_resolved
-        """
-        raise NotImplementedError("phase 6 not yet implemented")
 
     def aligned_listings(self,
                          primary: FunctionAnalysis,

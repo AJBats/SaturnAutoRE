@@ -698,6 +698,236 @@ def run_phase4_parity(yaml_path: Path, project_root: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Phase 6 parity: SweepState.listing rows vs eval_server.render_listing rows.
+#
+# For each verified subseg, treat it as the "current" candidate, find the
+# previous verified subseg, then compare row-by-row.  Both sides get
+# projected to a canonical dict shape so order-insensitive fields (class
+# lists) can be compared as sorted tuples.
+# ---------------------------------------------------------------------------
+
+# Map analyzer RowKind to eval_server's 'kind' string.
+_ROWKIND_TO_EVAL_KIND = {
+    "SECTION_HEADER": "section",
+    "LABEL": "label",
+    "INSTRUCTION": "instr",
+    "POOL4": "pool",
+    "POOL2": "pool",
+    "PADDING": "raw",
+    "RAW": "raw",
+}
+
+# Map analyzer InstructionCategory to eval_server's CSS class suffix.
+_CATEGORY_TO_CSS = {
+    "RETURN": "cat-return",
+    "CALL": "cat-call",
+    "UNCOND_BRANCH": "cat-uncond",
+    "COND_BRANCH": "cat-cond",
+    "POOL_LOAD": "cat-pool",
+    "COMPARE": "cat-compare",
+    "OTHER": "cat-data",   # eval_server uses cat-data for .byte/.4byte/.2byte
+}
+
+
+def _analyzer_row_to_comparable(row):
+    """Project an analyzer ListingRow to a canonical comparable dict."""
+    classes = []
+
+    section_name = row.section.value if row.section else None
+    if row.kind.name == "SECTION_HEADER":
+        if section_name:
+            classes.append(f"section-{section_name}-header")
+    elif section_name:
+        classes.append(f"section-{section_name}")
+
+    if row.kind.name == "LABEL":
+        classes.append("label")
+    if row.kind.name in ("POOL4", "POOL2"):
+        classes.append("pool")
+    if row.is_prologue:        classes.append("prologue")
+    if row.is_epilogue:        classes.append("epilogue")
+    if row.is_final_rts:       classes.append("final-rts")
+    if row.is_conditional_rts: classes.append("cond-rts")
+    if row.is_unreachable:     classes.append("unreachable")
+    if row.is_tail_call:       classes.append("tail-call")
+    if row.is_indirect_branch: classes.append("uncond-indirect")
+    if row.category is not None:
+        cat_cls = _CATEGORY_TO_CSS.get(row.category.name)
+        if cat_cls:
+            classes.append(cat_cls)
+
+    branch = None
+    if row.branch_target is not None and row.branch_type is not None:
+        branch = {
+            "target": row.branch_target,
+            "type": row.branch_type,
+            "direction": row.branch_direction,
+        }
+
+    # eval_server doesn't set addr_str on SECTION/LABEL rows
+    if row.kind.name in ("SECTION_HEADER", "LABEL"):
+        addr_str = ""
+    elif row.addr is not None:
+        addr_str = f"{row.addr:08X}"
+    else:
+        addr_str = ""
+
+    # Section headers carry their title in label; pool rows carry .L_pool_X
+    # in label; label rows carry .L_X: in label; instruction rows carry ""
+    # (label string is populated only for the row kinds that own one).
+    label_field = row.label
+
+    return {
+        "kind": _ROWKIND_TO_EVAL_KIND[row.kind.name],
+        "addr": row.addr,
+        "addr_str": addr_str,
+        "bytes": row.bytes_hex,
+        "mnem": row.text,
+        "label": label_field,
+        "margin": row.margin,
+        "tag": row.tag,
+        "indent": row.indent,
+        "classes": tuple(sorted(set(classes))),
+        "branch": branch,
+        "anchor_addr": row.anchor_addr if row.kind.name == "SECTION_HEADER" else None,
+    }
+
+
+def _eval_server_row_to_comparable(d):
+    """Project an eval_server row dict to the same canonical shape."""
+    branch = d.get("branch")
+    # Normalize: only keep target/type/direction (some impls may attach extras)
+    if branch is not None:
+        branch = {
+            "target": branch.get("target"),
+            "type": branch.get("type"),
+            "direction": branch.get("direction"),
+        }
+    return {
+        "kind": d.get("kind"),
+        "addr": d.get("addr"),
+        "addr_str": d.get("addr_str", ""),
+        "bytes": d.get("bytes", ""),
+        "mnem": d.get("mnem", ""),
+        "label": d.get("label", ""),
+        "margin": d.get("margin", ""),
+        "tag": d.get("tag", ""),
+        "indent": d.get("indent", 0),
+        "classes": tuple(sorted(set(d.get("classes", [])))),
+        "branch": branch,
+        "anchor_addr": d.get("anchor_addr"),
+    }
+
+
+def run_phase6_parity(yaml_path: Path, project_root: Path) -> dict:
+    """For each verified subseg, build analyzer's listing rows and
+    eval_server's listing rows for the same (candidate, prev) pair.
+    Compare row counts and per-row content."""
+    model, ctx = _build_analyzer_model(yaml_path, project_root)
+    sweep = analyzer.SweepState(model, ctx["cfg"], ai_override=None)
+    subsegs = sorted(
+        [s for s in ctx["cfg"].get("subsegments", []) if s.get("type") == "code"],
+        key=lambda s: s["start"],
+    )
+
+    divergences = []
+    checked = 0
+    row_count_mismatches = 0
+    row_content_mismatches = 0
+
+    for i, s in enumerate(subsegs):
+        start = s["start"]
+        prev_subseg_dict = subsegs[i - 1] if i > 0 else None
+        prev_subseg_typed = (
+            analyzer.VerifiedSubseg(
+                start=prev_subseg_dict["start"],
+                end=prev_subseg_dict["end"],
+                type=prev_subseg_dict.get("type", "code"),
+                file=prev_subseg_dict.get("file", ""),
+            ) if prev_subseg_dict else None
+        )
+        tu = next((t for t in ctx["cfg"].get("tus", []) if t["start"] <= start <= t["end"]), None)
+        hint_end = tu["end"] if tu else None
+
+        # Eval_server side
+        ev = oracle.analyze_candidate(
+            ctx["binary"], ctx["vram"], start,
+            hint_end=hint_end,
+            pool_priors=ctx["pool_priors"],
+        )
+        es_rows_raw = eval_server.render_listing(ev, prev_subseg_dict)
+        es_rows = [_eval_server_row_to_comparable(r) for r in es_rows_raw]
+
+        # Analyzer side
+        fa = model.analyze_function(start, hint_end=hint_end)
+        an_rows_raw = sweep.listing(fa, previous=prev_subseg_typed, attn=None)
+        an_rows = [_analyzer_row_to_comparable(r) for r in an_rows_raw]
+
+        checked += 1
+
+        # Compare row counts first
+        if len(es_rows) != len(an_rows):
+            row_count_mismatches += 1
+            divergences.append({
+                "subseg_start": f"0x{start:08X}",
+                "count_mismatch": True,
+                "eval_server_rows": len(es_rows),
+                "analyzer_rows": len(an_rows),
+            })
+            continue
+
+        # Compare row content
+        first_diff = None
+        for idx, (es, an) in enumerate(zip(es_rows, an_rows)):
+            if es != an:
+                # Find which fields differ
+                diff_fields = {k: {"eval_server": es.get(k), "analyzer": an.get(k)}
+                               for k in es if es.get(k) != an.get(k)}
+                first_diff = {
+                    "row_idx": idx,
+                    "diff_fields": diff_fields,
+                }
+                break
+        if first_diff:
+            row_content_mismatches += 1
+            divergences.append({
+                "subseg_start": f"0x{start:08X}",
+                **first_diff,
+            })
+
+    return {
+        "subsegs_checked": checked,
+        "row_count_mismatches": row_count_mismatches,
+        "row_content_mismatches": row_content_mismatches,
+        "divergences": divergences,
+        "match": not divergences,
+    }
+
+
+def _print_phase6(result: dict):
+    print()
+    print(f"PHASE 6 PARITY - SweepState.listing rows vs eval_server.render_listing rows")
+    print(f"  Subsegs checked: {result['subsegs_checked']}")
+    if result["match"]:
+        print(f"  PASS  every row matches eval_server byte-for-byte")
+    else:
+        d = result["divergences"]
+        print(f"  FAIL  {result['row_count_mismatches']} subsegs have row-count mismatches, "
+              f"{result['row_content_mismatches']} have content mismatches")
+        for entry in d[:5]:
+            if entry.get("count_mismatch"):
+                print(f"    {entry['subseg_start']}  COUNT  eval_server={entry['eval_server_rows']}, analyzer={entry['analyzer_rows']}")
+            else:
+                print(f"    {entry['subseg_start']}  row {entry['row_idx']}  fields: {list(entry['diff_fields'].keys())}")
+                for k, v in list(entry["diff_fields"].items())[:3]:
+                    print(f"      {k}:")
+                    print(f"        eval_server: {v['eval_server']!r}")
+                    print(f"        analyzer:    {v['analyzer']!r}")
+        if len(d) > 5:
+            print(f"    ... and {len(d) - 5} more")
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 parity: SweepState (forward-sweep / gaps / progress) vs the
 # behavior eval_server currently produces inline via oracle's
 # find_next_forward_sweep_candidate + _detect_internal_gaps +
@@ -1023,7 +1253,7 @@ def main():
     p.add_argument("--baseline", help="write full per-subseg baseline JSON here (current oracle only)")
     p.add_argument("--show", action="append", default=[], help="show full detail for category (END_DISAGREE / LOW_VERDICT / etc.)")
     p.add_argument("--verbose", action="store_true", help="show all rows + yellow flags")
-    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "all"], default="baseline",
+    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "all"], default="baseline",
                    help="which parity check to run (default: baseline)")
     args = p.parse_args()
 
@@ -1072,6 +1302,12 @@ def main():
     if args.phase in ("phase5", "all"):
         result = run_phase5_parity(yaml_path, project_root)
         _print_phase5(result)
+        if not result["match"]:
+            sys.exit(1)
+
+    if args.phase in ("phase6", "all"):
+        result = run_phase6_parity(yaml_path, project_root)
+        _print_phase6(result)
         if not result["match"]:
             sys.exit(1)
 
