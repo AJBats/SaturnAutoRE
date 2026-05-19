@@ -3116,8 +3116,89 @@ class SweepState:
                          attn: Optional[list] = None,
                          ) -> tuple:
         """For split-view rendering: produce two equal-length row lists
-        aligned by anchor address.  Replaces keys.js `alignLines()`.
+        aligned by anchor address.  Port of keys.js's alignLines.
 
-        Phase 7 will interleave by anchor_addr with BLANK placeholders on
-        the missing side."""
-        raise NotImplementedError("phase 7 not yet implemented")
+        Builds each pane's listing via `listing()`, then interleaves the
+        two row sequences so rows for the same VRAM anchor address sit
+        at the same index.  When one side has a row at an address the
+        other doesn't, a BLANK row goes on the missing side.
+
+        Section-header / label / instruction ordering at the same anchor
+        is preserved (kindRank: section < label < instr/pool/raw), so a
+        side missing the section-header still aligns its instruction
+        with the other side's instruction at the same address.
+
+        Returns (primary_aligned, natural_aligned) — equal-length lists.
+        """
+        primary_rows = self.listing(primary, previous=primary_previous, attn=attn)
+        natural_rows = self.listing(natural, previous=natural_previous, attn=attn)
+        return self._align_row_lists(primary_rows, natural_rows)
+
+    @staticmethod
+    def _align_row_lists(left_rows: list, right_rows: list):
+        """Two-pointer interleave by anchor address.  Pure function over
+        ListingRow lists; no side effects.  Mirrors keys.js alignLines.
+        """
+        def anchor(row):
+            if row is None:
+                return None
+            if row.kind is RowKind.SECTION_HEADER:
+                return row.anchor_addr
+            # Treat addr=0 as no-anchor to match keys.js (`line.addr !== 0`)
+            if row.addr is not None and row.addr != 0:
+                return row.addr
+            return None
+
+        def kind_rank(row):
+            if row.kind is RowKind.SECTION_HEADER:
+                return 0
+            if row.kind is RowKind.LABEL:
+                return 1
+            return 2  # instruction / pool / raw
+
+        def blank():
+            # row_id=-1 marks BLANK as a placeholder; eval_server2 templates
+            # render it as an empty row of matching height.
+            return ListingRow(row_id=-1, kind=RowKind.BLANK, section=None)
+
+        out_left, out_right = [], []
+        li = ri = 0
+        L, R = left_rows, right_rows
+        while li < len(L) or ri < len(R):
+            l = L[li] if li < len(L) else None
+            r = R[ri] if ri < len(R) else None
+            if l is None:
+                out_left.append(blank())
+                out_right.append(r)
+                ri += 1
+                continue
+            if r is None:
+                out_left.append(l)
+                out_right.append(blank())
+                li += 1
+                continue
+            la = anchor(l)
+            ra = anchor(r)
+            # Lines without anchor addresses (rare — shouldn't happen with
+            # the current emitter since section headers carry anchor_addr)
+            # just pass through unaligned.
+            if la is None and ra is None:
+                out_left.append(l); out_right.append(r); li += 1; ri += 1; continue
+            if la is None:
+                out_left.append(l); out_right.append(blank()); li += 1; continue
+            if ra is None:
+                out_left.append(blank()); out_right.append(r); ri += 1; continue
+            if la == ra:
+                lk = kind_rank(l)
+                rk = kind_rank(r)
+                if lk == rk:
+                    out_left.append(l); out_right.append(r); li += 1; ri += 1
+                elif lk < rk:
+                    out_left.append(l); out_right.append(blank()); li += 1
+                else:
+                    out_left.append(blank()); out_right.append(r); ri += 1
+            elif la < ra:
+                out_left.append(l); out_right.append(blank()); li += 1
+            else:
+                out_left.append(blank()); out_right.append(r); ri += 1
+        return out_left, out_right

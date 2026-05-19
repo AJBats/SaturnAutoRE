@@ -928,6 +928,167 @@ def _print_phase6(result: dict):
 
 
 # ---------------------------------------------------------------------------
+# Phase 7 parity: SweepState.aligned_listings / _align_row_lists.
+#
+# Invariant-based testing (no separate reference port — algorithm is short
+# enough that the invariants are the spec):
+#   1. Identity: align(rows, rows) returns (rows, rows) verbatim, no BLANKs.
+#   2. Equal output lengths on every align.
+#   3. Content preservation: every non-BLANK output row was a member of the
+#      corresponding input list, and the non-BLANK output sequence equals
+#      the input sequence (i.e. only BLANKs are inserted, no reordering).
+#   4. Anchor monotonicity: anchor addresses (where present) only increase
+#      down the output.
+#   5. Same-anchor kind-rank ordering: when both sides are non-BLANK at the
+#      same anchor, kind ranks are consistent.
+# ---------------------------------------------------------------------------
+
+def _anchor_of(row):
+    if row is None or row.kind.name == "BLANK":
+        return None
+    if row.kind.name == "SECTION_HEADER":
+        return row.anchor_addr
+    if row.addr is not None and row.addr != 0:
+        return row.addr
+    return None
+
+
+def _check_align_invariants(left_in, right_in, left_out, right_out):
+    """Return list of invariant violations (empty = clean)."""
+    violations = []
+
+    # 1+2. Equal lengths.
+    if len(left_out) != len(right_out):
+        violations.append(f"output lengths differ: left={len(left_out)} right={len(right_out)}")
+        return violations  # short-circuit; nothing else meaningful to check
+
+    # 3. Content preservation per side.
+    for side_name, side_in, side_out in (("left", left_in, left_out), ("right", right_in, right_out)):
+        non_blank_out = [r for r in side_out if r.kind.name != "BLANK"]
+        if len(non_blank_out) != len(side_in):
+            violations.append(
+                f"{side_name}: {len(non_blank_out)} non-BLANK output rows vs {len(side_in)} input rows"
+            )
+            continue
+        for i, (a, b) in enumerate(zip(non_blank_out, side_in)):
+            if a is not b:
+                violations.append(
+                    f"{side_name} row {i}: non-BLANK output is not the same object as input"
+                )
+                break
+
+    # 4. Anchor monotonicity (allow ties for same-anchor multi-row groups).
+    last_anchor = None
+    for i in range(len(left_out)):
+        l_a = _anchor_of(left_out[i])
+        r_a = _anchor_of(right_out[i])
+        # Effective anchor at this row = non-None value (preferring left,
+        # but both should match when both are non-None).
+        if l_a is not None and r_a is not None and l_a != r_a:
+            violations.append(f"row {i}: left anchor {l_a:#x} != right anchor {r_a:#x}")
+        cur = l_a if l_a is not None else r_a
+        if cur is not None and last_anchor is not None and cur < last_anchor:
+            violations.append(f"row {i}: anchor {cur:#x} < previous {last_anchor:#x}")
+        if cur is not None:
+            last_anchor = cur
+
+    return violations
+
+
+def run_phase7_parity(yaml_path: Path, project_root: Path) -> dict:
+    """For each verified subseg, exercise aligned_listings two ways:
+      A. Identity — align(rows, rows): output should equal (rows, rows).
+      B. Pair — align(subseg_N rows, subseg_N+1 rows).
+    Verify alignment invariants on every case."""
+    model, ctx = _build_analyzer_model(yaml_path, project_root)
+    sweep = analyzer.SweepState(model, ctx["cfg"], ai_override=None)
+    subsegs = sorted(
+        [s for s in ctx["cfg"].get("subsegments", []) if s.get("type") == "code"],
+        key=lambda s: s["start"],
+    )
+
+    # Build listings once per subseg (so the pair scenario doesn't redo work).
+    listings = []
+    for i, s in enumerate(subsegs):
+        prev_dict = subsegs[i - 1] if i > 0 else None
+        prev_typed = (
+            analyzer.VerifiedSubseg(
+                start=prev_dict["start"], end=prev_dict["end"],
+                type=prev_dict.get("type", "code"), file=prev_dict.get("file", ""),
+            ) if prev_dict else None
+        )
+        tu = next((t for t in ctx["cfg"].get("tus", []) if t["start"] <= s["start"] <= t["end"]), None)
+        hint_end = tu["end"] if tu else None
+        fa = model.analyze_function(s["start"], hint_end=hint_end)
+        rows = sweep.listing(fa, previous=prev_typed, attn=None)
+        listings.append(rows)
+
+    identity_pass = 0
+    identity_fail = []
+    pair_pass = 0
+    pair_fail = []
+
+    for i, rows in enumerate(listings):
+        # A. Identity
+        L_out, R_out = sweep._align_row_lists(rows, rows)
+        # Identity = output rows are the SAME OBJECTS as inputs, no BLANKs
+        if (len(L_out) == len(rows) and len(R_out) == len(rows)
+                and all(L_out[j] is rows[j] for j in range(len(rows)))
+                and all(R_out[j] is rows[j] for j in range(len(rows)))
+                and all(r.kind.name != "BLANK" for r in L_out)):
+            identity_pass += 1
+        else:
+            blanks_in_left = sum(1 for r in L_out if r.kind.name == "BLANK")
+            identity_fail.append({
+                "subseg_start": f"0x{subsegs[i]['start']:08X}",
+                "len_in": len(rows), "len_out_L": len(L_out), "len_out_R": len(R_out),
+                "blanks_in_left": blanks_in_left,
+            })
+
+        # B. Pair with next subseg
+        if i + 1 < len(listings):
+            other = listings[i + 1]
+            L_out, R_out = sweep._align_row_lists(rows, other)
+            violations = _check_align_invariants(rows, other, L_out, R_out)
+            if not violations:
+                pair_pass += 1
+            else:
+                pair_fail.append({
+                    "left": f"0x{subsegs[i]['start']:08X}",
+                    "right": f"0x{subsegs[i+1]['start']:08X}",
+                    "violations": violations[:3],
+                })
+
+    return {
+        "subseg_count": len(subsegs),
+        "identity_pass": identity_pass,
+        "identity_total": len(subsegs),
+        "identity_fail": identity_fail,
+        "pair_pass": pair_pass,
+        "pair_total": max(0, len(subsegs) - 1),
+        "pair_fail": pair_fail,
+        "match": (not identity_fail) and (not pair_fail),
+    }
+
+
+def _print_phase7(result: dict):
+    print()
+    print(f"PHASE 7 PARITY - aligned_listings (split-view diff alignment)")
+    ip = result["identity_pass"]; it = result["identity_total"]
+    pp = result["pair_pass"]; pt = result["pair_total"]
+    ipass = "PASS" if ip == it else "FAIL"
+    ppass = "PASS" if pp == pt else "FAIL"
+    print(f"  {ipass}  identity (align(rows, rows) returns rows verbatim, no BLANKs):  {ip}/{it}")
+    if result["identity_fail"]:
+        for f in result["identity_fail"][:5]:
+            print(f"        {f}")
+    print(f"  {ppass}  pair (align(subseg_N rows, subseg_N+1 rows) satisfies invariants):  {pp}/{pt}")
+    if result["pair_fail"]:
+        for f in result["pair_fail"][:5]:
+            print(f"        L={f['left']} R={f['right']}  violations: {f['violations']}")
+
+
+# ---------------------------------------------------------------------------
 # Phase 5 parity: SweepState (forward-sweep / gaps / progress) vs the
 # behavior eval_server currently produces inline via oracle's
 # find_next_forward_sweep_candidate + _detect_internal_gaps +
@@ -1253,7 +1414,7 @@ def main():
     p.add_argument("--baseline", help="write full per-subseg baseline JSON here (current oracle only)")
     p.add_argument("--show", action="append", default=[], help="show full detail for category (END_DISAGREE / LOW_VERDICT / etc.)")
     p.add_argument("--verbose", action="store_true", help="show all rows + yellow flags")
-    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "all"], default="baseline",
+    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "all"], default="baseline",
                    help="which parity check to run (default: baseline)")
     args = p.parse_args()
 
@@ -1308,6 +1469,12 @@ def main():
     if args.phase in ("phase6", "all"):
         result = run_phase6_parity(yaml_path, project_root)
         _print_phase6(result)
+        if not result["match"]:
+            sys.exit(1)
+
+    if args.phase in ("phase7", "all"):
+        result = run_phase7_parity(yaml_path, project_root)
+        _print_phase7(result)
         if not result["match"]:
             sys.exit(1)
 
