@@ -1690,22 +1690,6 @@ class BinaryModel:
         )
         self.runtime_hits = self._load_runtime_hits(runtime_hits_dirs)
 
-        # ----- Pass E: orphan pool inference -----
-        # Contiguous UNKNOWN runs bracketed by POOL on BOTH sides AND
-        # containing no function-entry signals (no static caller, no
-        # reference FUN_ label, no cross-module reference) → classify
-        # as POOL2.
-        #
-        # The entry-signal interruption is what keeps Pass E from
-        # mis-classifying unstamped code as pool: any address that
-        # something CALLS is a known function entry; its body bytes
-        # following it shouldn't be touched.  We avoid Pass C-style
-        # transitive CFG reachability (which is unreliable here —
-        # walkers chain through pool bytes that bit-align as bra/bsr
-        # opcodes) and rely instead on the binary-extracted callgraph
-        # plus reference's FUN_ labels.
-        self._classify_orphan_pool()
-
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -2191,101 +2175,6 @@ class BinaryModel:
                     if a in reference_starts:
                         cross[a] = cross.get(a, 0) + 1
         return cross
-
-    # ------------------------------------------------------------------
-    # Pass E internals — byte_kind refinement at construction
-    # ------------------------------------------------------------------
-
-    def _classify_orphan_pool(self) -> None:
-        """Pass E: orphan pool inference.
-
-        For each contiguous run of UNKNOWN 2-byte-aligned addresses
-        (neither already-classified in byte_kind nor sitting inside a
-        multi-byte pool word), classify the run as POOL2 if:
-          (1) the addr immediately before the run is POOL or
-              pool-internal,
-          (2) the addr immediately after the run is POOL or
-              pool-internal,
-          (3) no address in the run carries a function-entry signal:
-              static caller > 0, reference FUN_ label, or cross-module
-              caller > 0.
-
-        Condition (3) is the safeguard.  Without it, unstamped code
-        whose start sits between pool zones would be wrongly classified
-        as data.  Any address something CALLS is a real function
-        entry; its body must not be classified by this pass.
-        """
-        binary = self.binary
-        vram = self.vram
-        binary_end = self.end_addr
-
-        # Pool-internal byte set: every byte INSIDE a multi-byte pool
-        # word.  byte_kind only stores the start-of-word address.
-        pool_internal: set = set()
-        for addr, pw in self.pool_words.items():
-            for i in range(2, pw.size, 2):
-                pool_internal.add(addr + i)
-
-        def _is_pool_anchor(a: int) -> bool:
-            kind = self.byte_kind.get(a)
-            if kind in (ByteKind.POOL2, ByteKind.POOL4):
-                return True
-            return a in pool_internal
-
-        def _is_unknown(a: int) -> bool:
-            return (a not in self.byte_kind) and (a not in pool_internal)
-
-        def _has_fn_entry_signal(a: int) -> bool:
-            if a in self.reference_starts:
-                return True
-            if self.static_callers.get(a, 0) > 0:
-                return True
-            if self.cross_module_callers.get(a, 0) > 0:
-                return True
-            return False
-
-        # Linear walk in 2-byte steps.  Track current UNKNOWN run and
-        # whether it contains any function-entry signal.  Classify on
-        # run-end if and only if all three conditions hold.
-        addr = vram
-        run_start: Optional[int] = None
-        run_has_signal = False
-        while addr + 1 <= binary_end:
-            if _is_unknown(addr):
-                if run_start is None:
-                    run_start = addr
-                    run_has_signal = False
-                if _has_fn_entry_signal(addr):
-                    run_has_signal = True
-                addr += 2
-                continue
-
-            # Classified address — close any open run.
-            if run_start is not None:
-                run_end = addr - 2
-                before = run_start - 2
-                after = addr
-                bracketed = (
-                    before >= vram
-                    and _is_pool_anchor(before)
-                    and _is_pool_anchor(after)
-                )
-                if bracketed and not run_has_signal:
-                    a = run_start
-                    while a <= run_end:
-                        off = a - vram
-                        if off + 1 >= len(binary):
-                            break
-                        value = (binary[off] << 8) | binary[off + 1]
-                        self.byte_kind[a] = ByteKind.POOL2
-                        self.pool_words[a] = PoolWord(
-                            addr=a, size=2, value=value, loaded_from=[],
-                        )
-                        a += 2
-                run_start = None
-                run_has_signal = False
-
-            addr += 2
 
     # ------------------------------------------------------------------
     # Phase 4 internals — per-function enrichment
