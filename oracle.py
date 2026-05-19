@@ -1067,11 +1067,22 @@ def find_next_forward_sweep_candidate(yaml_cfg, binary, pool_priors=None,
         if _covered_by_existing(next_start):
             # Already inside an existing verified subseg — keep iterating.
             continue
+        # Pick the ACTUAL immediately-preceding subseg, not the iteration's
+        # `prev`.  The scan can walk past an unsignaled-but-verified subseg
+        # (e.g. a 4-byte alternate-entry stub with no callers + no reference
+        # FUN_<addr>: declaration) and land on a candidate further out.  In
+        # that case the `prev` we're iterating from is stale — the real
+        # previous-verified-subseg is the one that hugs next_start.
+        actual_prev = max(
+            (s for s in declared_code if s["end"] < next_start),
+            key=lambda s: s["end"],
+            default=prev,
+        )
         # Hint analysis bounds to the TU containing the candidate
         tu = next((t for t in tus if t["start"] <= next_start <= t["end"]), None)
         hint_end = tu["end"] if tu else None
         ev = analyze_candidate(binary, vram, next_start, hint_end, pool_priors=pool_priors)
-        return (prev, ev)
+        return (actual_prev, ev)
 
     return None
 
