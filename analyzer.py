@@ -1631,6 +1631,13 @@ class BinaryModel:
         self.reference_starts: set = set()   # set of int addrs
         self.reference_nexts: dict = {}      # {ref_start: next_ref_start}
         self.runtime_hits: dict = {}         # {addr: int}
+        # Switch-dispatch case targets found by scanning the binary for
+        # the `mov.l @(disp,PC), rN; ...; mov.l @rN, rN; jmp @rN` pattern
+        # and walking the 4-byte jump table it loads from.  Treated as a
+        # fourth function-entry signal by Pass E — switch case bodies
+        # are real code entries even though nothing bsr/bra's them
+        # directly.
+        self.switch_targets: set = set()     # set of int addrs
 
         # Phase 3 outputs
         self.instructions: dict = {}         # {addr: Instruction}
@@ -1689,6 +1696,21 @@ class BinaryModel:
             reference_scan_dir, reference_dir,
         )
         self.runtime_hits = self._load_runtime_hits(runtime_hits_dirs)
+
+        # ----- Switch-dispatch target detection -----
+        # Scan the binary for `mov.l @(disp,PC), rN; ...; mov.l @rN, rN;
+        # jmp @rN` switch idioms.  Each detected dispatch contributes
+        # its case body addresses to switch_targets.  Pass E uses them
+        # as function-entry signals so it doesn't classify case bodies
+        # as orphan pool.
+        self.switch_targets = self._scan_all_switch_targets()
+
+        # ----- Pass E: orphan pool inference -----
+        # Contiguous UNKNOWN runs bracketed by POOL on BOTH sides AND
+        # containing no function-entry signals (static caller, reference
+        # FUN_ label, cross-module caller, switch-dispatch target)
+        # → classify as POOL2.
+        self._classify_orphan_pool()
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -2175,6 +2197,211 @@ class BinaryModel:
                     if a in reference_starts:
                         cross[a] = cross.get(a, 0) + 1
         return cross
+
+    # ------------------------------------------------------------------
+    # Switch-dispatch target detection + Pass E (orphan pool)
+    # ------------------------------------------------------------------
+
+    def _scan_all_switch_targets(self) -> set:
+        """Walk the binary at 2-byte stride; for every `jmp @rN` that
+        matches the GCC switch-dispatch idiom, harvest the jump-table
+        case body addresses into a set.
+
+        Pattern (within ~8 instructions before the jmp):
+            mov.l @(disp,PC), rN     ; rN = *pool — the table start addr
+            ...                       ; (shll2 / add / etc.)
+            mov.l @rN, rN             ; rN = *rN  — case body at table[index]
+            jmp @rN                   ; transfer
+
+        The pool word's VALUE is the table start.  The table is a run
+        of 4-byte case body addresses; we walk forward stopping at the
+        first entry whose value isn't a valid 2-byte-aligned vram-range
+        address.
+        """
+        binary = self.binary
+        vram = self.vram
+        binary_end = self.end_addr
+
+        targets: set = set()
+        for jmp_pc in range(vram, binary_end, 2):
+            tgts = self._detect_mov_l_jmp_switch_targets(jmp_pc)
+            for t in tgts:
+                targets.add(t)
+        return targets
+
+    def _detect_mov_l_jmp_switch_targets(self, jmp_pc: int) -> list:
+        """Detect the mov.l + jmp @rN switch idiom anchored at jmp_pc.
+
+        Returns a (possibly empty) list of in-range case body addresses.
+        """
+        binary = self.binary
+        vram = self.vram
+        binary_end = self.end_addr
+
+        jmp_op = _read_opcode(binary, vram, jmp_pc)
+        # jmp @rN: encoding 0100 NNNN 0010 1011  (0x402B with N in bits 11-8)
+        if jmp_op is None or (jmp_op & 0xF0FF) != 0x402B:
+            return []
+        reg = (jmp_op >> 8) & 0xF
+
+        # Scan back up to 8 instructions (16 bytes) for the pattern.
+        # We need to see BOTH `mov.l @rN, rN` (the indirection through
+        # rN) AND `mov.l @(disp,PC), rN` (the pool load that supplied
+        # the table start).
+        mov_l_via_rn_seen = False
+        pool_addr = None
+        for back in range(2, 18, 2):
+            addr = jmp_pc - back
+            if addr < vram:
+                break
+            op = _read_opcode(binary, vram, addr)
+            if op is None:
+                continue
+
+            # mov.l @rM, rN: 0110 NNNN MMMM 0010 — looking for src==dst==reg
+            if (op & 0xF00F) == 0x6002:
+                src = (op >> 4) & 0xF
+                dst = (op >> 8) & 0xF
+                if src == reg and dst == reg:
+                    mov_l_via_rn_seen = True
+                    continue
+
+            # mov.l @(disp,PC), rN: 1101 NNNN dddd dddd
+            if (op & 0xF000) == 0xD000 and ((op >> 8) & 0xF) == reg:
+                disp = op & 0xFF
+                pool_addr = ((addr + 4) & 0xFFFFFFFC) + disp * 4
+                break
+
+        if not mov_l_via_rn_seen or pool_addr is None:
+            return []
+        if not (vram <= pool_addr <= binary_end):
+            return []
+
+        # Read the pool word — that's the table START address.
+        poff = pool_addr - vram
+        if poff + 3 >= len(binary):
+            return []
+        table_start = (
+            (binary[poff] << 24) | (binary[poff + 1] << 16)
+            | (binary[poff + 2] << 8) | binary[poff + 3]
+        )
+        if not (vram <= table_start <= binary_end):
+            return []
+        if table_start & 1:
+            return []  # not 2-byte aligned, can't be a code addr
+
+        # Walk the table forward.  Each entry is a 4-byte case body addr.
+        # Stop at the first entry whose value is out of vram range or odd.
+        targets = []
+        t = table_start
+        while t + 3 <= binary_end:
+            toff = t - vram
+            if toff + 3 >= len(binary):
+                break
+            value = (
+                (binary[toff] << 24) | (binary[toff + 1] << 16)
+                | (binary[toff + 2] << 8) | binary[toff + 3]
+            )
+            if not (vram <= value <= binary_end):
+                break
+            if value & 1:
+                break
+            targets.append(value)
+            t += 4
+
+        return targets
+
+    def _classify_orphan_pool(self) -> None:
+        """Pass E: orphan pool inference.
+
+        For each contiguous run of UNKNOWN 2-byte-aligned addresses
+        (neither already-classified in byte_kind nor inside a multi-byte
+        pool word), classify the run as POOL2 if:
+          (1) the address immediately before the run is POOL or
+              pool-internal,
+          (2) the address immediately after the run is POOL or
+              pool-internal,
+          (3) no address in the run carries a function-entry signal:
+              static_caller > 0, reference FUN_ label, cross-module
+              caller > 0, OR a switch-dispatch case target.
+
+        Condition (3) is the safeguard.  Without the switch-target
+        check, case bodies sitting between pool zones (like
+        FUN_060352FA's switch cases at 0x06035314, 0x0603533C, ...)
+        would be wrongly classified as data because no direct
+        bsr/bra/reference points to them — they're reached only via
+        the dispatcher's `jmp @rN` through the jump table.
+        """
+        binary = self.binary
+        vram = self.vram
+        binary_end = self.end_addr
+
+        # Pool-internal byte set: every byte INSIDE a multi-byte pool
+        # word.  byte_kind only stores the start-of-word address.
+        pool_internal: set = set()
+        for addr, pw in self.pool_words.items():
+            for i in range(2, pw.size, 2):
+                pool_internal.add(addr + i)
+
+        def _is_pool_anchor(a: int) -> bool:
+            kind = self.byte_kind.get(a)
+            if kind in (ByteKind.POOL2, ByteKind.POOL4):
+                return True
+            return a in pool_internal
+
+        def _is_unknown(a: int) -> bool:
+            return (a not in self.byte_kind) and (a not in pool_internal)
+
+        def _has_fn_entry_signal(a: int) -> bool:
+            if a in self.reference_starts:
+                return True
+            if self.static_callers.get(a, 0) > 0:
+                return True
+            if self.cross_module_callers.get(a, 0) > 0:
+                return True
+            if a in self.switch_targets:
+                return True
+            return False
+
+        addr = vram
+        run_start: Optional[int] = None
+        run_has_signal = False
+        while addr + 1 <= binary_end:
+            if _is_unknown(addr):
+                if run_start is None:
+                    run_start = addr
+                    run_has_signal = False
+                if _has_fn_entry_signal(addr):
+                    run_has_signal = True
+                addr += 2
+                continue
+
+            # Classified address — close any open run.
+            if run_start is not None:
+                run_end = addr - 2
+                before = run_start - 2
+                after = addr
+                bracketed = (
+                    before >= vram
+                    and _is_pool_anchor(before)
+                    and _is_pool_anchor(after)
+                )
+                if bracketed and not run_has_signal:
+                    a = run_start
+                    while a <= run_end:
+                        off = a - vram
+                        if off + 1 >= len(binary):
+                            break
+                        value = (binary[off] << 8) | binary[off + 1]
+                        self.byte_kind[a] = ByteKind.POOL2
+                        self.pool_words[a] = PoolWord(
+                            addr=a, size=2, value=value, loaded_from=[],
+                        )
+                        a += 2
+                run_start = None
+                run_has_signal = False
+
+            addr += 2
 
     # ------------------------------------------------------------------
     # Phase 4 internals — per-function enrichment
