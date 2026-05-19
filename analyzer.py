@@ -2687,19 +2687,15 @@ class SweepState:
         ))
 
     def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate):
-        """Emit ListingRow per address in [fa.start, fa.end].
+        """Translate FunctionAnalysis + pool sets into ListingRows for [fa.start, fa.end].
 
-        `candidate` is the CURRENT candidate (used to decide pin_action
-        per row: above candidate.start → PIN_START; on/below → PIN_END).
-        For the prev-section emission, this is still the current
-        candidate — pin clicks always refer to it.
+        SINGLE RESPONSIBILITY: lookup, not decide.  Reads pre-decided
+        classifications (fa.reachable, fa.branches, fa.indirect_resolutions,
+        fa.indent_depths, pool sets) and translates to row records.
+        Doesn't re-derive any of them.
 
-        Decorations applied here, NOT downstream:
-          - prologue/epilogue tinting, final_rts/cond_rts/unreachable
-          - category + tail-call + indirect-branch flags
-          - branch metadata (for arc rendering)
-          - attn/midpoint/ref_end with precedence resolved
-          - indirect_resolved_label inline annotation
+        `candidate` is the CURRENT candidate — pin clicks always refer
+        to it (above candidate.start → PIN_START; on/below → PIN_END).
         """
         binary = self.model.binary
         vram = self.model.vram
@@ -2916,14 +2912,13 @@ class SweepState:
             addr += 2
 
     def _emit_raw_rows(self, rows, next_id, start, end, section):
-        """Emit raw-byte rows for intermediate / trailing zones.
+        """Translate `byte_kind` into ListingRows for intermediate / trailing sections.
 
-        Uses model.byte_kind (which is the union of file priors + binary
-        pool target scan) to decide pool-vs-instruction per address.
-        Anything not classified as pool gets a best-effort instruction
-        decode — this is the screenshot-bug zone where pool bytes that
-        happened to bit-align as branch opcodes get spuriously decoded.
-        Fix lives in extending byte_kind, not in changing emission here.
+        SINGLE RESPONSIBILITY: lookup, not decide.  Don't call
+        `_decode_sh2`; don't consult `static_callers`, `reference_starts`,
+        or `global_reachable` here.  UNKNOWN byte_kind is a bug upstream
+        in BinaryModel construction, not something this function patches
+        by sniffing.
         """
         binary = self.model.binary
         vram = self.model.vram
@@ -2983,18 +2978,17 @@ class SweepState:
     # ----- Per-function pool view (with sibling pool refs) -------------
 
     def _build_per_function_pool_view(self, fa: FunctionAnalysis):
-        """Compute pool4/pool2/mova sets + branch_targets for the given
-        function.  Three sources for the pool sets:
+        """Build per-function pool4/pool2/mova sets + branch_targets.
 
+        SINGLE RESPONSIBILITY: gather + filter pre-classified pool
+        addresses to fa's range.  (Tangent: source #1 still re-decodes
+        reachable to bucket by load width; should consume a typed
+        FunctionAnalysis field when one exists.)
+
+        Three sources:
           1. PC-relative load targets WITHIN fa.reachable (function-internal).
-          2. Sibling pool refs landing INSIDE fa's range (cross-function
-             refs into this function's address range — common Saturn-era
-             pattern where pool constants cluster between functions).
-          3. Reference-derived pool priors that fall inside fa's range AND
-             are NOT in fa.reachable (trust analyzer's CFG walk over
-             reference's pool prior when they disagree).
-
-        Returns (pool4_set, pool2_set, mova_set, branch_targets_dict).
+          2. Sibling pool refs landing INSIDE fa's range (cross-function).
+          3. Reference priors inside fa's range NOT in fa.reachable.
 
         Mirrors eval_server._pools_and_branches.
         """
