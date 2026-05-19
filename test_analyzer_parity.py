@@ -57,6 +57,7 @@ sys.path.insert(0, str(SCRIPT_DIR / "lib"))
 # any phase-4+ comparison that currently uses oracle/eval_server helpers
 # as the reference oracle.
 import eval_server
+import eval_server2
 import oracle
 import analyzer
 
@@ -928,6 +929,115 @@ def _print_phase6(result: dict):
 
 
 # ---------------------------------------------------------------------------
+# Phase 8 parity: eval_server2 /state JSON output vs eval_server /state.
+#
+# Both servers operate against the same yaml + session.  After analyzer
+# absorbed every code-intelligence decision, eval_server2's payload
+# building should produce a wire-equivalent /state response.
+# ---------------------------------------------------------------------------
+
+def _normalize_row_classes(payload):
+    """Deep-walk a JSON payload and normalize every row dict's `classes`
+    field to a sorted list.  Eval_server appends classes in a specific
+    order; eval_server2 sorts them.  Both produce the same SET; for
+    diff purposes we sort both sides."""
+    if isinstance(payload, dict):
+        for k, v in list(payload.items()):
+            if k == "classes" and isinstance(v, list):
+                payload[k] = sorted(v)
+            else:
+                _normalize_row_classes(v)
+    elif isinstance(payload, list):
+        for item in payload:
+            _normalize_row_classes(item)
+
+
+def _setup_eval_server2(yaml_path, project_root):
+    """Initialize eval_server2.STATE so its /state route can run."""
+    eval_server2.STATE["yaml_path"] = yaml_path
+    eval_server2.STATE["project_root"] = project_root
+    eval_server2.STATE["session_path"] = yaml_path.parent / (yaml_path.stem + ".session.json")
+    eval_server2.STATE["model"] = None  # force rebuild on first /state call
+
+
+def _fetch_state(app):
+    """GET /state via Flask test_client, return the parsed JSON."""
+    client = app.test_client()
+    resp = client.get("/state")
+    if resp.status_code != 200:
+        raise RuntimeError(f"/state returned {resp.status_code}: {resp.data!r}")
+    return resp.get_json()
+
+
+def _deep_diff(a, b, path=""):
+    """Return list of (path, a_value, b_value) for every leaf where a != b.
+    Treats lists as positional sequences."""
+    diffs = []
+    if isinstance(a, dict) and isinstance(b, dict):
+        keys = set(a.keys()) | set(b.keys())
+        for k in sorted(keys):
+            sub = f"{path}.{k}" if path else k
+            if k not in a:
+                diffs.append((sub, "<missing>", b[k]))
+            elif k not in b:
+                diffs.append((sub, a[k], "<missing>"))
+            else:
+                diffs.extend(_deep_diff(a[k], b[k], sub))
+    elif isinstance(a, list) and isinstance(b, list):
+        if len(a) != len(b):
+            diffs.append((f"{path}[len]", len(a), len(b)))
+        else:
+            for i, (x, y) in enumerate(zip(a, b)):
+                diffs.extend(_deep_diff(x, y, f"{path}[{i}]"))
+    else:
+        if a != b:
+            diffs.append((path, a, b))
+    return diffs
+
+
+def run_phase8_parity(yaml_path: Path, project_root: Path) -> dict:
+    """Hit /state on both servers, normalize, diff."""
+    # Set up eval_server (the baseline path)
+    ctx = _setup(yaml_path, project_root)
+    es_json = _fetch_state(eval_server.app)
+
+    # Set up eval_server2 (analyzer-driven)
+    _setup_eval_server2(yaml_path, project_root)
+    es2_json = _fetch_state(eval_server2.app)
+
+    # Normalize class ordering on both sides.
+    _normalize_row_classes(es_json)
+    _normalize_row_classes(es2_json)
+
+    diffs = _deep_diff(es_json, es2_json)
+
+    return {
+        "diffs": diffs,
+        "match": not diffs,
+        "es_keys": sorted(es_json.keys()),
+        "es2_keys": sorted(es2_json.keys()),
+    }
+
+
+def _print_phase8(result: dict):
+    print()
+    print(f"PHASE 8 PARITY - eval_server2 /state vs eval_server /state")
+    if result["match"]:
+        print(f"  PASS  /state JSON identical (modulo class-list ordering)")
+    else:
+        d = result["diffs"]
+        print(f"  FAIL  {len(d)} field diffs")
+        for path, a, b in d[:10]:
+            ra = repr(a)[:80]
+            rb = repr(b)[:80]
+            print(f"    {path}")
+            print(f"      eval_server:  {ra}")
+            print(f"      eval_server2: {rb}")
+        if len(d) > 10:
+            print(f"    ... and {len(d) - 10} more")
+
+
+# ---------------------------------------------------------------------------
 # Phase 7 parity: SweepState.aligned_listings / _align_row_lists.
 #
 # Invariant-based testing (no separate reference port — algorithm is short
@@ -1414,7 +1524,7 @@ def main():
     p.add_argument("--baseline", help="write full per-subseg baseline JSON here (current oracle only)")
     p.add_argument("--show", action="append", default=[], help="show full detail for category (END_DISAGREE / LOW_VERDICT / etc.)")
     p.add_argument("--verbose", action="store_true", help="show all rows + yellow flags")
-    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "all"], default="baseline",
+    p.add_argument("--phase", choices=["baseline", "phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7", "phase8", "all"], default="baseline",
                    help="which parity check to run (default: baseline)")
     args = p.parse_args()
 
@@ -1475,6 +1585,12 @@ def main():
     if args.phase in ("phase7", "all"):
         result = run_phase7_parity(yaml_path, project_root)
         _print_phase7(result)
+        if not result["match"]:
+            sys.exit(1)
+
+    if args.phase in ("phase8", "all"):
+        result = run_phase8_parity(yaml_path, project_root)
+        _print_phase8(result)
         if not result["match"]:
             sys.exit(1)
 
