@@ -2754,9 +2754,10 @@ class SweepState:
         # vs "0x<addr>" based on whether the resolved target is stamped).
         self._verified_starts = {s.start for s in self.verified}
 
-        # Lazy cache for the outstanding-case-targets map.  Built on
-        # first access via `outstanding_case_of`.
+        # Lazy caches for the per-listing hint maps.  Built on first
+        # access (see properties).
         self._outstanding_case_of_cache: Optional[dict] = None
+        self._call_sources_of_cache: Optional[dict] = None
 
     @property
     def outstanding_case_of(self) -> dict:
@@ -2808,6 +2809,72 @@ class SweepState:
                     result.setdefault(t, []).append((r_start, idx))
 
         self._outstanding_case_of_cache = result
+        return result
+
+    @property
+    def call_sources_of(self) -> dict:
+        """For every stamped (or analyze_mode block) function, collect
+        every address it transfers control to that lies OUTSIDE its own
+        range.  Covers all flavors of call/transfer:
+
+          - direct bra / bsr / bsrf with statically known target
+          - jsr @rN / jmp @rN / braf rN with target resolved via the
+            preceding mov.l @(disp,PC), rN load (or mova pattern)
+
+        Returns dict: target_addr -> dict {caller_fn_start: count}.
+
+        Used by the listing renderer to surface "Called from FUN_xxxxxxxx
+        (×N):" hints on any address that's a known transfer target from
+        one of our stamped functions.  Two concrete benefits:
+
+          1. Mid-function merge points (e.g. an address 8 bytes into
+             another function, where multiple call sites converge) are
+             surfaced as navigable anchors.
+          2. Transfers to addresses that AREN'T inside any stamped
+             function expose missing stamps — the hint appears in
+             unstamped territory and points at the function we forgot.
+        """
+        if hasattr(self, "_call_sources_of_cache") and self._call_sources_of_cache is not None:
+            return self._call_sources_of_cache
+
+        result: dict = {}
+
+        # Helper: walk one function's analysis, harvest external targets
+        # into `result` keyed by target -> {fn_start: count}.  Each call
+        # site (src_pc) is counted at most once: a single jmp@rN can be
+        # logged BOTH in fa.branches (added by the walker's single-target
+        # resolution) AND in fa.indirect_resolutions (added by the
+        # post-walk pass), and we don't want to double-count.
+        def _harvest(fn_start: int, fn_end: int):
+            try:
+                fa = self.model.analyze_function(fn_start, hint_end=fn_end)
+            except Exception:
+                return
+            seen_srcs: set = set()
+            for b in fa.branches:
+                if b.target is None or b.internal:
+                    continue
+                if b.src in seen_srcs:
+                    continue
+                seen_srcs.add(b.src)
+                tgt = b.target
+                result.setdefault(tgt, {}).setdefault(fn_start, 0)
+                result[tgt][fn_start] += 1
+            for src_pc, tgt in fa.indirect_resolutions.items():
+                if src_pc in seen_srcs:
+                    continue
+                if fa.start <= tgt <= fa.end:
+                    continue
+                seen_srcs.add(src_pc)
+                result.setdefault(tgt, {}).setdefault(fn_start, 0)
+                result[tgt][fn_start] += 1
+
+        for sub in self.verified:
+            _harvest(sub.start, sub.end)
+        for b in (self.analyze_mode.get("blocks") or []):
+            _harvest(int(b["start"]), int(b["end"]))
+
+        self._call_sources_of_cache = result
         return result
 
     # ------------------------------------------------------------------
@@ -3184,6 +3251,26 @@ class SweepState:
                     label="Possible " + "; ".join(parts) + ":",
                 ))
 
+            # ----- Call-source hint label
+            # When this address is a known transfer target FROM any of
+            # our stamped functions (or analyze-mode blocks), surface
+            # who calls/jumps here.  Useful for navigating into shared
+            # merge points AND for detecting missing stamps when the
+            # hint appears in unstamped territory.
+            call_src = self.call_sources_of.get(addr)
+            if call_src:
+                parts = []
+                for caller_start, count in sorted(call_src.items()):
+                    suffix = f" (×{count})" if count > 1 else ""
+                    parts.append(f"FUN_{caller_start:08X}{suffix}")
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Called from " + ", ".join(parts) + ":",
+                ))
+
             # ----- Pool4 row?
             if addr in pool4:
                 off = addr - vram
@@ -3404,7 +3491,14 @@ class SweepState:
         binary_end = self.model.end_addr
         end = min(end, binary_end)
         addr = start
-        case_hints = self.outstanding_case_of if section is Section.TRAILING else {}
+        # Hint maps used in trailing zone only (where they catch wrong
+        # boundary detection — "the analyzer ended the function here
+        # but downstream addresses are known case targets / call
+        # targets of our stamped functions").  Intermediate zones are
+        # pool/padding by definition and unlikely to host these signals.
+        emit_hints = section is Section.TRAILING
+        case_hints = self.outstanding_case_of if emit_hints else {}
+        call_hints = self.call_sources_of if emit_hints else {}
 
         while addr <= end:
             off = addr - vram
@@ -3418,7 +3512,6 @@ class SweepState:
             # case body of some already-stamped function.
             hint = case_hints.get(addr)
             if hint:
-                # Group by dispatcher; list case indices per dispatcher.
                 by_disp: dict = {}
                 for disp_start, case_idx in hint:
                     by_disp.setdefault(disp_start, []).append(case_idx)
@@ -3426,13 +3519,27 @@ class SweepState:
                 for disp_start, idxs in by_disp.items():
                     cases_str = ", ".join(str(i) for i in sorted(set(idxs)))
                     parts.append(f"case {cases_str} of FUN_{disp_start:08X}")
-                hint_text = "Possible " + "; ".join(parts) + ":"
                 rows.append(ListingRow(
                     row_id=next_id(),
                     kind=RowKind.LABEL,
                     section=section,
                     addr=addr,
-                    label=hint_text,
+                    label="Possible " + "; ".join(parts) + ":",
+                ))
+
+            # Trailing-zone call-source hint (same rationale).
+            csrc = call_hints.get(addr)
+            if csrc:
+                parts = []
+                for caller_start, count in sorted(csrc.items()):
+                    suffix = f" (×{count})" if count > 1 else ""
+                    parts.append(f"FUN_{caller_start:08X}{suffix}")
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Called from " + ", ".join(parts) + ":",
                 ))
 
             kind = self.model.byte_kind.get(addr)
