@@ -588,6 +588,45 @@ footer#footer {
 .verdict-row {
   display: flex; gap: 0.6em; align-items: center;
 }
+.verdict-row.hidden, .analyze-row.hidden { display: none; }
+.analyze-row {
+  display: flex; gap: 0.6em; align-items: center;
+}
+.analyze-row #btn-analyze-exit {
+  margin-left: auto;
+  border-color: #c93;
+  color: #fc8;
+}
+.analyze-row #btn-analyze-exit:hover {
+  background: #6a4520;
+  border-color: #fc8;
+}
+
+/* ANALYZE MODE banner — reuses .gap-alert's slot in the DOM but recolored
+   orange so it's visually distinct from the red INTERNAL-GAP banner. */
+.gap-alert.analyze-mode {
+  background: #4a3a1a;
+  color: #fed;
+  border-bottom: 2px solid #c93;
+}
+.gap-alert.analyze-mode .gap-alert-title { color: #fc8; }
+.gap-alert.analyze-mode .analyze-block-list {
+  margin: 0.3em 0 0 0;
+  padding-left: 1.4em;
+  font-size: 12px;
+  color: #fed;
+}
+.gap-alert.analyze-mode .analyze-block-list li { margin: 0.15em 0; }
+.gap-alert.analyze-mode .analyze-block-list li.active {
+  font-weight: bold;
+  color: #fc8;
+}
+.gap-alert.analyze-mode .analyze-block-list code {
+  background: #2a200a;
+  padding: 0 0.3em;
+  border-radius: 0.2em;
+  color: #fed;
+}
 footer button {
   background: #3c3c3c;
   color: #eee;

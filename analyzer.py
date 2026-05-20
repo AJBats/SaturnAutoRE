@@ -790,6 +790,104 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
 
 # ----- braf-switch jump-table detection -------------------------------------
 
+def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
+                                      func_start=None, hard_limit=None):
+    """Recognize the GCC SH-2 indirect switch-dispatch idiom around `jmp_pc`.
+
+    Idiom (within ~8 instructions before the jmp):
+        mov.l @(disp,PC), rN     ; rN = address of the jump table
+        ...                       ; (shll2 / add r_idx, rN / etc.)
+        mov.l @rN, rN             ; rN = table[idx]
+        jmp @rN                   ; transfer
+
+    The pool word's value is the table start.  The table is a run of
+    4-byte case body addresses; we walk forward stopping at the first
+    entry whose value isn't in vram range or isn't 2-byte aligned.
+
+    Returns list[int] of in-range case body addresses (filtered to
+    [func_start, hard_limit] if those are supplied).
+    """
+    if binary_end is None:
+        binary_end = vram + len(binary) - 1
+
+    jmp_op = _read_opcode(binary, vram, jmp_pc)
+    # jmp @rN: encoding 0100 NNNN 0010 1011  (0x402B with N in bits 11-8)
+    if jmp_op is None or (jmp_op & 0xF0FF) != 0x402B:
+        return []
+    reg = (jmp_op >> 8) & 0xF
+
+    # Scan back up to 8 instructions (16 bytes) for the pattern.
+    # We need both `mov.l @rN, rN` (indirection through rN) AND
+    # `mov.l @(disp,PC), rN` (the pool load that supplied the table start).
+    mov_l_via_rn_seen = False
+    pool_addr = None
+    for back in range(2, 18, 2):
+        addr = jmp_pc - back
+        if addr < vram:
+            break
+        op = _read_opcode(binary, vram, addr)
+        if op is None:
+            continue
+
+        # mov.l @rM, rN: 0110 NNNN MMMM 0010 — looking for src==dst==reg
+        if (op & 0xF00F) == 0x6002:
+            src = (op >> 4) & 0xF
+            dst = (op >> 8) & 0xF
+            if src == reg and dst == reg:
+                mov_l_via_rn_seen = True
+                continue
+
+        # mov.l @(disp,PC), rN: 1101 NNNN dddd dddd
+        if (op & 0xF000) == 0xD000 and ((op >> 8) & 0xF) == reg:
+            disp = op & 0xFF
+            pool_addr = ((addr + 4) & 0xFFFFFFFC) + disp * 4
+            break
+
+    if not mov_l_via_rn_seen or pool_addr is None:
+        return []
+    if not (vram <= pool_addr <= binary_end):
+        return []
+
+    # Read the pool word — that's the table START address.
+    poff = pool_addr - vram
+    if poff + 3 >= len(binary):
+        return []
+    table_start = (
+        (binary[poff] << 24) | (binary[poff + 1] << 16)
+        | (binary[poff + 2] << 8) | binary[poff + 3]
+    )
+    if not (vram <= table_start <= binary_end):
+        return []
+    if table_start & 1:
+        return []  # not 2-byte aligned, can't be a code addr
+
+    lo = func_start if func_start is not None else vram
+    hi = hard_limit if hard_limit is not None else binary_end
+
+    # Walk the table forward.  Each entry is a 4-byte case body addr.
+    # Stop at the first entry whose value is out of vram range or odd.
+    # Collect every in-range target; filter by [lo, hi] on return.
+    targets = []
+    t = table_start
+    while t + 3 <= binary_end:
+        toff = t - vram
+        if toff + 3 >= len(binary):
+            break
+        value = (
+            (binary[toff] << 24) | (binary[toff + 1] << 16)
+            | (binary[toff + 2] << 8) | binary[toff + 3]
+        )
+        if not (vram <= value <= binary_end):
+            break
+        if value & 1:
+            break
+        if lo <= value <= hi:
+            targets.append(value)
+        t += 4
+
+    return targets
+
+
 def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
                                  func_start=None, hard_limit=None):
     """Recognize the GCC SH-2 switch-dispatch idiom around `braf_pc`.
@@ -919,19 +1017,25 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
                 # Delay slot is reached
                 reachable.add(pc + 2)
                 if head in {"jmp", "braf"}:
-                    # braf: try the SH-2 switch-dispatch idiom — seed case
-                    # bodies as reachable so they don't render "unreach".
+                    # Try the SH-2 switch-dispatch idioms — seed case bodies
+                    # into the worklist so the dispatcher absorbs them into
+                    # its reachable set.
                     if head == "braf":
                         case_targets = _detect_braf_switch_targets(
                             binary, vram, pc, pool_priors,
                             func_start=start, hard_limit=hard_limit_addr,
                         )
-                        for tgt in case_targets:
-                            branches.append(Branch(
-                                src=pc, target=tgt, mnem="braf", internal=False,
-                            ))
-                            if tgt not in reachable:
-                                worklist.append(tgt)
+                    else:  # jmp
+                        case_targets = _detect_mov_l_jmp_switch_targets(
+                            binary, vram, pc,
+                            func_start=start, hard_limit=hard_limit_addr,
+                        )
+                    for tgt in case_targets:
+                        branches.append(Branch(
+                            src=pc, target=tgt, mnem=head, internal=False,
+                        ))
+                        if tgt not in reachable:
+                            worklist.append(tgt)
                     # unconditional — terminates THIS linear walk; targets
                     # (if any) continue via worklist
                     break
@@ -1175,7 +1279,11 @@ def _compute_indent_depths(binary, vram, fn_start, fn_end, branches):
         branches_by_src[b.src] = b
         block_starts.add(b.target)
         # Instruction after a branch (or its delay slot) begins a new block.
-        delay = 2 if b.mnem in {"bra", "bsr", "bf/s", "bt/s"} else 0
+        # All SH-2 unconditional and *-with-delay-slot branches carry a 2-byte
+        # delay slot.  Indirect branches (jmp, braf, jsr, bsrf) included so
+        # switch-detector-added Branch records don't mis-split the delay slot
+        # into a phantom basic block.
+        delay = 2 if b.mnem in {"bra", "bsr", "bf/s", "bt/s", "jmp", "braf", "jsr", "bsrf"} else 0
         after = b.src + 2 + delay
         if fn_start <= after <= fn_end:
             block_starts.add(after)
@@ -1746,6 +1854,72 @@ class BinaryModel:
         call this from /pin-start and /pin-end handlers."""
         return fn.start <= addr <= fn.end
 
+    def analyze_multi_block(self,
+                            blocks: list,
+                            active_block: int = 0,
+                            ) -> FunctionAnalysis:
+        """Synthesize a FunctionAnalysis for one block of a multi-block
+        function (e.g. a switch dispatcher whose case bodies live in
+        physically disjoint regions of the binary).
+
+        `blocks` is a list of dicts with int `start` and `end` keys.
+        `active_block` selects which block to materialize.  The result:
+
+          - walks from `block.start` with hint_end=`block.end` to get
+            the primary FunctionAnalysis
+          - finds every function-entry signal in (block.start, block.end]
+            (reference_starts, static_callers > 0, switch_targets) that
+            isn't already classified as pool data, walks from each, and
+            unions the resulting reachable + branches into the primary
+            so case bodies past the primary walker's natural end show
+            up as code (not as POOL from Pass E's mis-classification).
+          - forces `end` to `block.end` so the row emitter renders the
+            full block range even when the walker stopped short.
+
+        Filtering by pool data prevents the JT base address being walked
+        as code — `static_callers` can flag a JT base when some other
+        function loads it via pool, but it IS data and walking it
+        decodes the table entries as instructions.
+        """
+        if not blocks:
+            raise ValueError("analyze_multi_block: blocks must be non-empty")
+        idx = active_block % len(blocks)
+        blk = blocks[idx]
+        start = int(blk["start"])
+        end = int(blk["end"])
+
+        fa = self.analyze_function(start, hint_end=end)
+
+        pool_addrs = self.pool_words
+        extra_starts: set = set()
+        for a in self.reference_starts:
+            if start < a <= end and a not in pool_addrs:
+                extra_starts.add(a)
+        for a, n in self.static_callers.items():
+            if n > 0 and start < a <= end and a not in pool_addrs:
+                extra_starts.add(a)
+        for a in self.switch_targets:
+            if start < a <= end and a not in pool_addrs:
+                extra_starts.add(a)
+
+        if extra_starts:
+            merged_reachable = set(fa.reachable)
+            merged_branches = list(fa.branches)
+            for s in extra_starts:
+                sub = self.analyze_function(s, hint_end=end)
+                merged_reachable |= sub.reachable
+                merged_branches.extend(sub.branches)
+            fa = _dc_replace(
+                fa,
+                reachable=merged_reachable,
+                branches=merged_branches,
+            )
+
+        if fa.end != end:
+            fa = _dc_replace(fa, end=end)
+
+        return fa
+
     def analyze_function(self,
                          start: int,
                          hint_end: Optional[int] = None,
@@ -2230,86 +2404,15 @@ class BinaryModel:
         return targets
 
     def _detect_mov_l_jmp_switch_targets(self, jmp_pc: int) -> list:
-        """Detect the mov.l + jmp @rN switch idiom anchored at jmp_pc.
-
-        Returns a (possibly empty) list of in-range case body addresses.
+        """Binary-wide variant: returns ALL in-vram-range case targets at
+        jmp_pc (no func_start/hard_limit filter).  Used by the binary-wide
+        switch-target pre-scan that feeds Pass E.  Per-function callers
+        (the control-flow walker) use the module-level helper directly
+        with func_start/hard_limit filtering.
         """
-        binary = self.binary
-        vram = self.vram
-        binary_end = self.end_addr
-
-        jmp_op = _read_opcode(binary, vram, jmp_pc)
-        # jmp @rN: encoding 0100 NNNN 0010 1011  (0x402B with N in bits 11-8)
-        if jmp_op is None or (jmp_op & 0xF0FF) != 0x402B:
-            return []
-        reg = (jmp_op >> 8) & 0xF
-
-        # Scan back up to 8 instructions (16 bytes) for the pattern.
-        # We need to see BOTH `mov.l @rN, rN` (the indirection through
-        # rN) AND `mov.l @(disp,PC), rN` (the pool load that supplied
-        # the table start).
-        mov_l_via_rn_seen = False
-        pool_addr = None
-        for back in range(2, 18, 2):
-            addr = jmp_pc - back
-            if addr < vram:
-                break
-            op = _read_opcode(binary, vram, addr)
-            if op is None:
-                continue
-
-            # mov.l @rM, rN: 0110 NNNN MMMM 0010 — looking for src==dst==reg
-            if (op & 0xF00F) == 0x6002:
-                src = (op >> 4) & 0xF
-                dst = (op >> 8) & 0xF
-                if src == reg and dst == reg:
-                    mov_l_via_rn_seen = True
-                    continue
-
-            # mov.l @(disp,PC), rN: 1101 NNNN dddd dddd
-            if (op & 0xF000) == 0xD000 and ((op >> 8) & 0xF) == reg:
-                disp = op & 0xFF
-                pool_addr = ((addr + 4) & 0xFFFFFFFC) + disp * 4
-                break
-
-        if not mov_l_via_rn_seen or pool_addr is None:
-            return []
-        if not (vram <= pool_addr <= binary_end):
-            return []
-
-        # Read the pool word — that's the table START address.
-        poff = pool_addr - vram
-        if poff + 3 >= len(binary):
-            return []
-        table_start = (
-            (binary[poff] << 24) | (binary[poff + 1] << 16)
-            | (binary[poff + 2] << 8) | binary[poff + 3]
+        return _detect_mov_l_jmp_switch_targets(
+            self.binary, self.vram, jmp_pc, binary_end=self.end_addr,
         )
-        if not (vram <= table_start <= binary_end):
-            return []
-        if table_start & 1:
-            return []  # not 2-byte aligned, can't be a code addr
-
-        # Walk the table forward.  Each entry is a 4-byte case body addr.
-        # Stop at the first entry whose value is out of vram range or odd.
-        targets = []
-        t = table_start
-        while t + 3 <= binary_end:
-            toff = t - vram
-            if toff + 3 >= len(binary):
-                break
-            value = (
-                (binary[toff] << 24) | (binary[toff + 1] << 16)
-                | (binary[toff + 2] << 8) | binary[toff + 3]
-            )
-            if not (vram <= value <= binary_end):
-                break
-            if value & 1:
-                break
-            targets.append(value)
-            t += 4
-
-        return targets
 
     def _classify_orphan_pool(self) -> None:
         """Pass E: orphan pool inference.
@@ -3109,10 +3212,16 @@ class SweepState:
                     row.tag = "↩ ret"
 
             # Indirect unconditional jumps (jmp @rN, braf rN): control gone.
+            # Unless the switch-dispatch detector resolved an in-range
+            # case body — in that case it's a switch dispatch with an
+            # internal target (the arrow speaks; don't claim "exits").
             if head in ("jmp", "braf"):
                 row.is_indirect_branch = True
                 if not row.tag:
-                    row.tag = "⇒ exits"
+                    if b is not None and b.internal:
+                        row.tag = "⇒ switch"
+                    else:
+                        row.tag = "⇒ exits"
 
             # Indirect-branch target resolution annotation (inline).
             # `FUN_<addr>` if target is a verified subseg start, else `0x<addr>`.
@@ -3125,6 +3234,26 @@ class SweepState:
                         sym = f"0x{resolved:08X}"
                     row.text = f"{symbolized}   ⇒ {sym}"
                     row.indirect_resolved_label = sym
+
+            # Switch-dispatch detection: when this jmp/braf matches the
+            # SH-2 switch-table idiom, list ALL case destinations inline
+            # (including out-of-function ones the arrow can't reach).
+            # Lets the user see the full dispatch table from one row.
+            if head in ("jmp", "braf") and b is not None and b.internal:
+                binary_arg = self.model.binary
+                vram_arg = self.model.vram
+                if head == "jmp":
+                    all_targets = _detect_mov_l_jmp_switch_targets(
+                        binary_arg, vram_arg, addr,
+                    )
+                else:
+                    pool_priors = self.model.pool_priors_dict()
+                    all_targets = _detect_braf_switch_targets(
+                        binary_arg, vram_arg, addr, pool_priors,
+                    )
+                if all_targets:
+                    targets_str = ", ".join(f"0x{t:08X}" for t in all_targets)
+                    row.text = f"{symbolized}   ⇒ {targets_str}"
 
             # Direct unconditional jump with internal target — quiet tag.
             if head == "bra" and b is not None and b.internal:

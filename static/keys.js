@@ -84,9 +84,39 @@ function evidenceHtml(e) {
   return parts.join('');
 }
 
+// ANALYZE MODE banner — reuses the .gap-alert DOM slot but with orange
+// styling (.analyze-mode class).  Driven by /state.analyze_mode payload.
+function renderAnalyzeBanner(am) {
+  const el = document.getElementById('gap-alert');
+  if (!el) return;
+  if (!am) return;  // caller handles non-analyze-mode case
+  el.classList.remove('hidden');
+  el.classList.add('analyze-mode');
+  const blocks = am.blocks_summary || [];
+  const active = am.active_block || 0;
+  const items = blocks.map((b, i) => `
+    <li class="${i === active ? 'active' : ''}">
+      Block ${i + 1} of ${blocks.length}:
+      <code>0x${b.start_hex} - 0x${b.end_hex}</code>
+      <span class="gap-size">(${b.size} bytes)</span>
+      ${i === active ? ' &larr; viewing' : ''}
+    </li>
+  `).join('');
+  const label = am.label ? ` &mdash; ${escapeHtml(am.label)}` : '';
+  el.innerHTML = `
+    <div class="gap-alert-title">
+      ANALYZE MODE${label}
+    </div>
+    <ul class="analyze-block-list">${items}</ul>
+  `;
+}
+
 function renderGapAlert(gaps) {
   const el = document.getElementById('gap-alert');
   if (!el) return;
+  // Clear analyze-mode styling whenever we touch this element via the
+  // gap-alert renderer (analyze_mode is rendered via a sibling helper).
+  el.classList.remove('analyze-mode');
   if (!gaps || gaps.length === 0) {
     el.classList.add('hidden');
     el.innerHTML = '';
@@ -542,7 +572,20 @@ async function fetchState() {
     const s = await r.json();
 
     renderProgress(s);
-    renderGapAlert(s.internal_gaps);
+    if (s.analyze_mode) {
+      renderAnalyzeBanner(s.analyze_mode);
+    } else {
+      renderGapAlert(s.internal_gaps);
+    }
+    // Swap footer button rows based on mode.
+    document.getElementById('verdict-row').classList.toggle('hidden', !!s.analyze_mode);
+    document.getElementById('analyze-row').classList.toggle('hidden', !s.analyze_mode);
+    if (s.analyze_mode) {
+      const am = s.analyze_mode;
+      const cur = am.blocks_summary[am.active_block];
+      document.getElementById('analyze-status').textContent =
+        `block ${am.active_block + 1} of ${am.block_count} — 0x${cur.start_hex} → 0x${cur.end_hex}`;
+    }
 
     const primaryListing = document.getElementById('listing');
     const primaryBanner  = document.getElementById('banner-primary');
@@ -790,10 +833,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+    const analyzeRowVisible = !document.getElementById('analyze-row').classList.contains('hidden');
+    if (analyzeRowVisible) {
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); document.getElementById('btn-analyze-prev').click(); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); document.getElementById('btn-analyze-next').click(); }
+      // 1/2/3 stay disabled in analyze mode — server returns 409 anyway.
+      return;
+    }
     if (e.key === '1') { e.preventDefault(); document.getElementById('btn-approve').click(); }
     else if (e.key === '2') { e.preventDefault(); document.getElementById('btn-reject').click(); }
     else if (e.key === '3') { e.preventDefault(); document.getElementById('btn-unsure').click(); }
   });
+
+  // Analyze-mode button wiring.
+  async function analyzeCycle(direction) {
+    const r = await fetch('/analyze-mode/cycle', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({direction}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setStatus('analyze cycle rejected: ' + (data.error || 'unknown'));
+      return;
+    }
+    fetchState();
+  }
+  async function analyzeExit() {
+    const r = await fetch('/analyze-mode/clear', {method: 'POST'});
+    await r.json();
+    fetchState();
+  }
+  document.getElementById('btn-analyze-prev').addEventListener('click', () => analyzeCycle('prev'));
+  document.getElementById('btn-analyze-next').addEventListener('click', () => analyzeCycle('next'));
+  document.getElementById('btn-analyze-exit').addEventListener('click', analyzeExit);
 
   // Wire arc hover/click delegation once
   wireArcEvents();

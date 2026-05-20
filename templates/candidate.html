@@ -33,11 +33,17 @@
   </div>
 
   <footer id="footer">
-    <div class="verdict-row">
+    <div class="verdict-row" id="verdict-row">
       <button id="btn-approve" data-verdict="approved">1 approve</button>
       <button id="btn-reject"  data-verdict="rejected">2 reject</button>
       <button id="btn-unsure"  data-verdict="unsure">3 unsure</button>
       <span id="status" class="status">history: 0</span>
+    </div>
+    <div class="analyze-row hidden" id="analyze-row">
+      <button id="btn-analyze-prev" title="previous block (←)">← prev block</button>
+      <button id="btn-analyze-next" title="next block (→)">next block →</button>
+      <button id="btn-analyze-exit" title="exit ANALYZE MODE">✕ exit ANALYZE MODE</button>
+      <span id="analyze-status" class="status"></span>
     </div>
   </footer>
 

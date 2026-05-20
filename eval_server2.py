@@ -54,7 +54,7 @@ LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _empty_session():
-    return {"history": [], "ai_override": None}
+    return {"history": [], "ai_override": None, "analyze_mode": None}
 
 
 def load_session():
@@ -123,6 +123,26 @@ def _append_subseg_to_yaml(start_addr, end_addr, file_name):
         f.write(text + addition)
 
 
+def _find_overlapping_subsegs(new_start, new_end, exclude_start=None):
+    """Return [(start, end), ...] for code subsegs whose [start, end]
+    intersects [new_start, new_end].  When `exclude_start` is given,
+    a subseg with exactly that start is omitted (used to ignore the
+    candidate's own pre-existing entry when re-stamping).
+    """
+    cfg = _load_yaml_cfg()
+    overlaps = []
+    for sub in cfg.get("subsegments", []):
+        if sub.get("type") != "code":
+            continue
+        s = int(sub["start"])
+        e = int(sub["end"])
+        if exclude_start is not None and s == exclude_start:
+            continue
+        if s <= new_end and e >= new_start:
+            overlaps.append((s, e))
+    return overlaps
+
+
 # ---------------------------------------------------------------------------
 # Analyzer plumbing — build model once at startup, build SweepState per request.
 # ---------------------------------------------------------------------------
@@ -181,6 +201,61 @@ def _build_sweep(session):
     cfg = _load_yaml_cfg()
     model = _build_or_get_model(cfg)
     return cfg, model, analyzer.SweepState(model, cfg, ai_override=session.get("ai_override"))
+
+
+# ---------------------------------------------------------------------------
+# Analyze mode — non-mutating exploration view.  Defines a multi-block
+# function (e.g. a switch dispatcher + its disjoint case bodies) and lets
+# the user navigate between blocks with ← / → keys.  Approval is disabled
+# while active.  Mutually orthogonal to ai_override.
+# ---------------------------------------------------------------------------
+
+_ANALYZE_PREV_MAX_GAP = 512  # bytes — UI heuristic, not code intelligence
+
+
+def _analyze_mode_active_candidate(model, sweep, analyze_mode):
+    """Synthesize a NextCandidate from the active block.  Delegates the
+    actual analysis to `model.analyze_multi_block`; this function's
+    role is purely render-state shaping:
+
+      - Picks the visual "previous" anchor (closest preceding verified
+        subseg, dropped when more than _ANALYZE_PREV_MAX_GAP bytes away
+        — no useful anchor that far).
+    """
+    blocks = analyze_mode.get("blocks") or []
+    if not blocks:
+        return None
+    active = analyze_mode.get("active_block", 0) % len(blocks)
+    start = int(blocks[active]["start"])
+
+    fa = model.analyze_multi_block(blocks, active_block=active)
+
+    previous = None
+    for s in sweep.verified:
+        if s.end < start and (previous is None or s.end > previous.end):
+            previous = s
+    if previous is not None and (start - previous.end - 1) > _ANALYZE_PREV_MAX_GAP:
+        previous = None
+    return analyzer.NextCandidate(previous=previous, function=fa)
+
+
+def _analyze_mode_to_dict(analyze_mode):
+    """Project session.analyze_mode → wire dict for the frontend.  Only
+    called when analyze_mode is active (not None)."""
+    blocks = analyze_mode.get("blocks") or []
+    return {
+        "active_block": analyze_mode.get("active_block", 0) % max(len(blocks), 1),
+        "block_count": len(blocks),
+        "blocks_summary": [
+            {
+                "start_hex": f"{int(b['start']):08X}",
+                "end_hex":   f"{int(b['end']):08X}",
+                "size":      int(b["end"]) - int(b["start"]) + 1,
+            }
+            for b in blocks
+        ],
+        "label": analyze_mode.get("label", ""),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -418,7 +493,13 @@ def state():
             except (ValueError, TypeError):
                 pass
 
-        nxt = sweep.next_candidate()
+        analyze_mode = session.get("analyze_mode")
+        if analyze_mode:
+            nxt = _analyze_mode_active_candidate(model, sweep, analyze_mode)
+            if nxt is None:
+                return jsonify({"all_caught_up": False, "error": "analyze_mode has no blocks"}), 400
+        else:
+            nxt = sweep.next_candidate()
         progress = _progress_to_dict(sweep.progress())
 
         if nxt is None:
@@ -430,16 +511,22 @@ def state():
             })
 
         # Internal gaps with pending gap to proposed candidate surfaced too.
-        internal_gaps = [_gap_to_dict(g) for g in sweep.gaps(proposed_start=nxt.function.start)]
+        # Suppressed in analyze_mode (the ANALYZE MODE banner takes the slot).
+        if analyze_mode:
+            internal_gaps = []
+        else:
+            internal_gaps = [_gap_to_dict(g) for g in sweep.gaps(proposed_start=nxt.function.start)]
 
         primary_payload = _build_candidate_payload(
             sweep, nxt.function, nxt.previous, attn=attn_addrs,
         )
 
         # Natural pane (for split view) — only when override is active AND
-        # the natural candidate differs in start OR end.
+        # the natural candidate differs in start OR end.  Suppressed
+        # when analyze_mode is active (the user is exploring a synthetic
+        # multi-block candidate, not comparing against the sweep).
         natural_view = None
-        if session.get("ai_override"):
+        if session.get("ai_override") and not analyze_mode:
             nat = sweep.natural_candidate()
             if nat is not None and (
                 nat.function.start != nxt.function.start
@@ -472,6 +559,7 @@ def state():
             "history_count": len(history),
             "progress": progress,
             "internal_gaps": internal_gaps,
+            "analyze_mode": _analyze_mode_to_dict(analyze_mode) if analyze_mode else None,
         })
 
 
@@ -615,6 +703,71 @@ def unstamp():
     return jsonify({"ok": True, "unstamped": f"0x{addr:08X}"})
 
 
+@app.route("/analyze-mode/enter", methods=["POST"])
+def analyze_mode_enter():
+    """Enter ANALYZE MODE.  Defines a multi-block synthetic function
+    (e.g. switch dispatcher + disjoint case bodies).  No yaml mutation,
+    no history entries — pure exploration.  AI calls this once to set
+    up; the user drives ←/→ block navigation from the UI."""
+    data = request.get_json(force=True)
+    raw_blocks = data.get("blocks") or []
+    if not isinstance(raw_blocks, list) or not raw_blocks:
+        return jsonify({"ok": False, "error": "blocks must be a non-empty list"}), 400
+    blocks = []
+    for i, b in enumerate(raw_blocks):
+        try:
+            s = analyzer._coerce_addr(b.get("start"))
+            e = analyzer._coerce_addr(b.get("end"))
+        except (ValueError, TypeError, AttributeError):
+            return jsonify({"ok": False, "error": f"bad start/end on block {i}"}), 400
+        if e < s:
+            return jsonify({"ok": False, "error": f"block {i}: end < start"}), 400
+        blocks.append({"start": s, "end": e})
+    label = data.get("label") or ""
+    with LOCK:
+        session = load_session()
+        session["analyze_mode"] = {
+            "blocks": blocks,
+            "active_block": 0,
+            "label": str(label),
+        }
+        save_session(session)
+    return jsonify({"ok": True, "block_count": len(blocks)})
+
+
+@app.route("/analyze-mode/cycle", methods=["POST"])
+def analyze_mode_cycle():
+    """Cycle the active block in ANALYZE MODE.  Wired to ←/→ keyboard
+    keys and on-screen arrow buttons.  Wraps at boundaries."""
+    data = request.get_json(force=True)
+    direction = data.get("direction")
+    if direction not in ("next", "prev"):
+        return jsonify({"ok": False, "error": "direction must be 'next' or 'prev'"}), 400
+    with LOCK:
+        session = load_session()
+        am = session.get("analyze_mode")
+        if not am or not am.get("blocks"):
+            return jsonify({"ok": False, "error": "not in analyze_mode"}), 400
+        n = len(am["blocks"])
+        cur = am.get("active_block", 0) % n
+        am["active_block"] = (cur + (1 if direction == "next" else -1)) % n
+        session["analyze_mode"] = am
+        save_session(session)
+    return jsonify({"ok": True, "active_block": am["active_block"]})
+
+
+@app.route("/analyze-mode/clear", methods=["POST"])
+def analyze_mode_clear():
+    """Exit ANALYZE MODE — clears session["analyze_mode"].  Sweep
+    resumes wherever it was.  No side effects on the yaml or history."""
+    with LOCK:
+        session = load_session()
+        had = bool(session.get("analyze_mode"))
+        session["analyze_mode"] = None
+        save_session(session)
+    return jsonify({"ok": True, "was_active": had})
+
+
 @app.route("/verdict", methods=["POST"])
 def verdict():
     data = request.get_json(force=True)
@@ -624,6 +777,11 @@ def verdict():
 
     with LOCK:
         session = load_session()
+        if session.get("analyze_mode"):
+            return jsonify({
+                "ok": False,
+                "error": "analyze_mode is active — exit ANALYZE MODE before recording verdicts",
+            }), 409
         cfg, model, sweep = _build_sweep(session)
         nxt = sweep.next_candidate()
         if nxt is None:
@@ -667,13 +825,28 @@ def verdict():
                 "feedback": "",
                 "ts": time.time(),
             })
+        # Auto-unstamp any subsegs whose range overlaps the new one.
+        # When a dispatcher's switch absorption (or a manually pinned
+        # wider boundary) extends past stamps previously made for case
+        # bodies / fall-throughs, the new wider stamp transparently
+        # supersedes them — one click, no orphaned overlap.
+        absorbed = _find_overlapping_subsegs(
+            nxt.function.start, nxt.function.end,
+            exclude_start=nxt.function.start,
+        )
+        for ex_start, _ex_end in absorbed:
+            _remove_subseg_from_yaml(ex_start)
+
         # Find the containing TU for the file_name field.
         tus = cfg.get("tus") or []
         tu = next((t for t in tus if t["start"] <= nxt.function.start <= t["end"]), None)
         file_name = tu["name"] if tu else f"tu_{nxt.function.start:08X}"
         _append_subseg_to_yaml(nxt.function.start, nxt.function.end, file_name)
         save_session(session)
-        return jsonify({"ok": True})
+        return jsonify({
+            "ok": True,
+            "absorbed": [f"0x{s:08X}" for s, _ in absorbed],
+        })
 
 
 # ---------------------------------------------------------------------------
