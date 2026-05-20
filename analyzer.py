@@ -1030,12 +1030,31 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
                             binary, vram, pc,
                             func_start=start, hard_limit=hard_limit_addr,
                         )
-                    for tgt in case_targets:
-                        branches.append(Branch(
-                            src=pc, target=tgt, mnem=head, internal=False,
-                        ))
-                        if tgt not in reachable:
-                            worklist.append(tgt)
+                    if case_targets:
+                        for tgt in case_targets:
+                            branches.append(Branch(
+                                src=pc, target=tgt, mnem=head, internal=False,
+                            ))
+                            if tgt not in reachable:
+                                worklist.append(tgt)
+                    else:
+                        # No switch dispatch — try resolving as a simple
+                        # `mov.l @(disp,PC), rN ; jmp @rN` (single-target
+                        # indirect, common for tail calls / internal jumps
+                        # via pool).  When the load is in our in-progress
+                        # reachable set, we can statically resolve the
+                        # target and record it as a Branch so the listing
+                        # draws an arrow.
+                        resolved = _resolve_indirect_target(
+                            binary, vram, reachable, start, pc, mnem,
+                        )
+                        if resolved is not None:
+                            branches.append(Branch(
+                                src=pc, target=resolved, mnem=head, internal=False,
+                            ))
+                            if (start <= resolved <= hard_limit_addr
+                                    and resolved not in reachable):
+                                worklist.append(resolved)
                     # unconditional — terminates THIS linear walk; targets
                     # (if any) continue via worklist
                     break
@@ -1905,18 +1924,31 @@ class BinaryModel:
         if extra_starts:
             merged_reachable = set(fa.reachable)
             merged_branches = list(fa.branches)
+            merged_resolutions = dict(fa.indirect_resolutions)
             for s in extra_starts:
                 sub = self.analyze_function(s, hint_end=end)
                 merged_reachable |= sub.reachable
                 merged_branches.extend(sub.branches)
+                merged_resolutions.update(sub.indirect_resolutions)
             fa = _dc_replace(
                 fa,
                 reachable=merged_reachable,
                 branches=merged_branches,
+                indirect_resolutions=merged_resolutions,
             )
 
         if fa.end != end:
             fa = _dc_replace(fa, end=end)
+
+        # Re-classify branch internality against the full block range.
+        # Each sub-walk classified branches against its own narrow range
+        # (e.g., case 9's walk only knew [0x0604D570, ...]).  In the
+        # merged view the block's range is wider, so previously-external
+        # targets that land inside the block become internal arrows.
+        fa = _dc_replace(
+            fa,
+            branches=_classify_branch_internality(fa.branches, start, end),
+        )
 
         return fa
 
@@ -3298,20 +3330,13 @@ class SweepState:
                 if not row.tag:
                     row.tag = "↩ ret"
 
-            # Indirect unconditional jumps (jmp @rN, braf rN): control gone.
-            # Unless the switch-dispatch detector resolved an in-range
-            # case body — in that case it's a switch dispatch with an
-            # internal target (the arrow speaks; don't claim "exits").
             if head in ("jmp", "braf"):
                 row.is_indirect_branch = True
-                if not row.tag:
-                    if b is not None and b.internal:
-                        row.tag = "⇒ switch"
-                    else:
-                        row.tag = "⇒ exits"
 
             # Indirect-branch target resolution annotation (inline).
             # `FUN_<addr>` if target is a verified subseg start, else `0x<addr>`.
+            # For switch dispatches the all-targets listing below overrides
+            # this with the full case list.
             if head in ("jmp", "braf", "jsr", "bsrf"):
                 resolved = fa.indirect_resolutions.get(addr)
                 if resolved is not None:
@@ -3322,25 +3347,36 @@ class SweepState:
                     row.text = f"{symbolized}   ⇒ {sym}"
                     row.indirect_resolved_label = sym
 
-            # Switch-dispatch detection: when this jmp/braf matches the
-            # SH-2 switch-table idiom, list ALL case destinations inline
-            # (including out-of-function ones the arrow can't reach).
-            # Lets the user see the full dispatch table from one row.
-            if head in ("jmp", "braf") and b is not None and b.internal:
-                binary_arg = self.model.binary
-                vram_arg = self.model.vram
-                if head == "jmp":
-                    all_targets = _detect_mov_l_jmp_switch_targets(
-                        binary_arg, vram_arg, addr,
-                    )
-                else:
-                    pool_priors = self.model.pool_priors_dict()
-                    all_targets = _detect_braf_switch_targets(
-                        binary_arg, vram_arg, addr, pool_priors,
-                    )
-                if all_targets:
-                    targets_str = ", ".join(f"0x{t:08X}" for t in all_targets)
+            # Switch-dispatch detection + tag classification.  Runs the
+            # detector once and uses the result for both the all-targets
+            # text annotation AND the row tag (so we can tell switch
+            # dispatches apart from single-target indirect jumps).
+            if head in ("jmp", "braf"):
+                switch_targets = []
+                if b is not None and b.target is not None:
+                    binary_arg = self.model.binary
+                    vram_arg = self.model.vram
+                    if head == "jmp":
+                        switch_targets = _detect_mov_l_jmp_switch_targets(
+                            binary_arg, vram_arg, addr,
+                        )
+                    else:
+                        pool_priors = self.model.pool_priors_dict()
+                        switch_targets = _detect_braf_switch_targets(
+                            binary_arg, vram_arg, addr, pool_priors,
+                        )
+                if switch_targets:
+                    targets_str = ", ".join(f"0x{t:08X}" for t in switch_targets)
                     row.text = f"{symbolized}   ⇒ {targets_str}"
+                if not row.tag:
+                    if switch_targets:
+                        row.tag = "⇒ switch"
+                    elif b is not None and b.target is not None and b.internal:
+                        row.tag = "⇒"          # single-target internal — arrow speaks
+                    elif b is not None and b.target is not None:
+                        row.tag = "⇒ TAIL?"    # single-target external — tail call
+                    else:
+                        row.tag = "⇒ exits"    # truly indirect — couldn't resolve
 
             # Direct unconditional jump with internal target — quiet tag.
             if head == "bra" and b is not None and b.internal:
