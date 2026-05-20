@@ -2679,10 +2679,18 @@ class SweepState:
                  model: BinaryModel,
                  yaml_cfg: dict,
                  ai_override: Optional[dict] = None,
+                 analyze_mode: Optional[dict] = None,
                  ):
         self.model = model
         self.yaml_cfg = yaml_cfg
         self.ai_override = dict(ai_override or {})
+        # Analyze-mode blocks are treated as "virtual stamps" by the
+        # outstanding-case-target scan: their switch dispatchers feed
+        # into outstanding_case_of just like real verified subsegs do.
+        # Lets the user explore a multi-block hypothesis in analyze mode
+        # and see "Possible case N" hints fire as if each block were
+        # already approved.
+        self.analyze_mode = dict(analyze_mode or {})
 
         # Parse verified code subsegs into typed records.  Sort by start
         # so forward-sweep gets deterministic predecessor order.
@@ -2713,6 +2721,62 @@ class SweepState:
         # symbolization (indirect-target resolution renders "FUN_<addr>"
         # vs "0x<addr>" based on whether the resolved target is stamped).
         self._verified_starts = {s.start for s in self.verified}
+
+        # Lazy cache for the outstanding-case-targets map.  Built on
+        # first access via `outstanding_case_of`.
+        self._outstanding_case_of_cache: Optional[dict] = None
+
+    @property
+    def outstanding_case_of(self) -> dict:
+        """For every stamped code subseg, scan it for jmp@rN / braf switch
+        dispatchers.  For each case target that lands OUTSIDE the
+        dispatcher's own subseg, record it here.
+
+        Returns dict: target_addr -> list of (dispatcher_start, case_idx)
+        tuples (one address can be the target of multiple cases — both
+        across dispatchers AND within a single dispatcher's table when
+        duplicate slots share a handler).
+
+        Used by the listing renderer to hint "Possible case N of
+        FUN_xxxxxxxx" when a trailing-zone address coincides with a
+        known outstanding case target.  This is the canonical signal
+        for "the analyzer's suggested function boundary is probably too
+        short — the next address is actually a switch case body".
+        """
+        if self._outstanding_case_of_cache is not None:
+            return self._outstanding_case_of_cache
+
+        binary = self.model.binary
+        vram = self.model.vram
+        binary_max = vram + len(binary) - 1
+        pool_priors = self.model.pool_priors_dict()
+
+        # Union of real verified subsegs and analyze-mode "virtual" blocks.
+        # Both are scanned the same way: jmp@rN / braf inside their range,
+        # case targets that fall outside their range are "outstanding".
+        ranges = [(s.start, s.end) for s in self.verified]
+        for b in (self.analyze_mode.get("blocks") or []):
+            ranges.append((int(b["start"]), int(b["end"])))
+
+        result: dict = {}
+        for r_start, r_end in ranges:
+            for pc in range(r_start, r_end, 2):
+                # mov.l + jmp @rN switch
+                tgts = _detect_mov_l_jmp_switch_targets(
+                    binary, vram, pc, binary_end=binary_max,
+                )
+                if not tgts:
+                    # mova + braf switch (alt idiom)
+                    tgts = _detect_braf_switch_targets(
+                        binary, vram, pc, pool_priors,
+                    )
+                for idx, t in enumerate(tgts):
+                    if r_start <= t <= r_end:
+                        continue  # target lives inside the dispatcher itself
+                    result.setdefault(t, []).append((r_start, idx))
+
+        self._outstanding_case_of_cache = result
+        return result
 
     # ------------------------------------------------------------------
     # Public — candidate selection
@@ -3065,6 +3129,29 @@ class SweepState:
             else:
                 pin = PinAction.PIN_END
 
+            # ----- Outstanding switch-case-target hint label
+            # When this address is a known case target of an already-
+            # stamped (or analyze-mode-block) switch dispatcher, emit a
+            # suggestion label so the user knows where the address sits
+            # in the dispatch table — critical when the analyzer's
+            # boundary may be cutting through a case body.
+            case_hint = self.outstanding_case_of.get(addr)
+            if case_hint:
+                by_disp: dict = {}
+                for disp_start, case_idx in case_hint:
+                    by_disp.setdefault(disp_start, []).append(case_idx)
+                parts = []
+                for disp_start, idxs in by_disp.items():
+                    cases_str = ", ".join(str(i) for i in sorted(set(idxs)))
+                    parts.append(f"case {cases_str} of FUN_{disp_start:08X}")
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Possible " + "; ".join(parts) + ":",
+                ))
+
             # ----- Pool4 row?
             if addr in pool4:
                 off = addr - vram
@@ -3281,10 +3368,36 @@ class SweepState:
         binary_end = self.model.end_addr
         end = min(end, binary_end)
         addr = start
+        case_hints = self.outstanding_case_of if section is Section.TRAILING else {}
+
         while addr <= end:
             off = addr - vram
             if off + 1 >= len(binary):
                 break
+
+            # Trailing-zone case-target hint.  When this address is a
+            # known outstanding case target of a stamped dispatcher,
+            # emit a label suggesting the analyzer's boundary may be
+            # too short — the next instruction is actually a switch
+            # case body of some already-stamped function.
+            hint = case_hints.get(addr)
+            if hint:
+                # Group by dispatcher; list case indices per dispatcher.
+                by_disp: dict = {}
+                for disp_start, case_idx in hint:
+                    by_disp.setdefault(disp_start, []).append(case_idx)
+                parts = []
+                for disp_start, idxs in by_disp.items():
+                    cases_str = ", ".join(str(i) for i in sorted(set(idxs)))
+                    parts.append(f"case {cases_str} of FUN_{disp_start:08X}")
+                hint_text = "Possible " + "; ".join(parts) + ":"
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label=hint_text,
+                ))
 
             kind = self.model.byte_kind.get(addr)
             if kind is ByteKind.POOL4 and addr + 3 <= end and off + 3 < len(binary):

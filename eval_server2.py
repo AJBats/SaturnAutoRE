@@ -197,10 +197,15 @@ def _build_or_get_model(cfg):
 
 def _build_sweep(session):
     """Construct a fresh SweepState for this request, honoring the
-    current session.ai_override."""
+    current session.ai_override AND session.analyze_mode (the latter
+    drives the outstanding-case-target scan as virtual stamps)."""
     cfg = _load_yaml_cfg()
     model = _build_or_get_model(cfg)
-    return cfg, model, analyzer.SweepState(model, cfg, ai_override=session.get("ai_override"))
+    return cfg, model, analyzer.SweepState(
+        model, cfg,
+        ai_override=session.get("ai_override"),
+        analyze_mode=session.get("analyze_mode"),
+    )
 
 
 # ---------------------------------------------------------------------------
