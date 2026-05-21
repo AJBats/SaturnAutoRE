@@ -6,7 +6,7 @@ decision about "what these bytes mean": pool vs code, function boundaries,
 CFG reachability, branch internality, callgraph, reference agreement,
 midpoints, indent depths, indirect resolutions, sweep state.
 
-eval_server2.py is its only consumer.  Eval server NEVER asks "what is at
+eval_server.py is its only consumer.  Eval server NEVER asks "what is at
 address X" — it asks the analyzer for already-decorated ListingRow objects
 and templates them into HTML.
 
@@ -2015,8 +2015,9 @@ class BinaryModel:
         """Cheap membership check — used by eval_server to validate pin
         requests without re-analyzing.
 
-        RESERVED — no consumer today; phase 8 (eval_server2 routes) will
-        call this from /pin-start and /pin-end handlers."""
+        RESERVED — no consumer today; eval_server's /pin-start and
+        /pin-end handlers could use this to validate pin addresses
+        without re-analyzing."""
         return fn.start <= addr <= fn.end
 
     def analyze_multi_block(self,
@@ -2300,11 +2301,11 @@ class BinaryModel:
             verdict_enum = Verdict.UNKNOWN
 
         # ----- Phase 4: per-function enrichment -----
-        # All fields below were previously computed in eval_server and
-        # bolted onto FunctionEvidence after the fact.  Pulling them into
-        # FunctionAnalysis means eval_server2 just reads them.
+        # All fields below were previously computed in the v1 eval_server
+        # and bolted onto FunctionEvidence after the fact.  Pulling them
+        # into FunctionAnalysis means eval_server just reads them.
 
-        # CFG region depths.  Uses the same fn_start/fn_end as eval_server:
+        # CFG region depths.  Uses the same fn_start/fn_end as the v1 eval_server:
         # function start through last reachable instruction's end byte
         # (code_end, NOT the post-pool-extension `end`) so pool data
         # doesn't pollute the region graph.
@@ -4287,7 +4288,7 @@ class SweepState:
             return 2  # instruction / pool / raw
 
         def blank():
-            # row_id=-1 marks BLANK as a placeholder; eval_server2 templates
+            # row_id=-1 marks BLANK as a placeholder; eval_server templates
             # render it as an empty row of matching height.
             return ListingRow(row_id=-1, kind=RowKind.BLANK, section=None)
 

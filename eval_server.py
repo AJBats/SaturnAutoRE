@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
-"""eval_server2.py — UI-only Flask server.  Successor to eval_server.py.
+"""eval_server.py — UI-only Flask server.
 
 Consumes analyzer.py for every code-related question.  Owns only:
   - HTTP routes (Flask)
   - Session.json read/write (user verdict tracking + AI override)
   - Yaml read/write (verified subsegs)
   - Browser auto-open + Flask hot-reload integration
-  - Row/candidate → JSON projection (keys.js wire format, unchanged so
-    the existing frontend works as-is)
+  - Row/candidate → JSON projection (keys.js wire format)
 
 No decode_sh2 imports.  No pool detection.  No CFG walks.  No caller scans.
 Every "what is at address X" question goes through analyzer.
 
 Run from a project's root directory:
-    python <SaturnAutoRE>/eval_server2.py config/<binary>.yaml
+    python <SaturnAutoRE>/eval_server.py config/<binary>.yaml
 """
 
 import argparse
@@ -325,9 +324,7 @@ def _analyze_mode_to_dict(analyze_mode):
 
 
 # ---------------------------------------------------------------------------
-# Wire-format projections: analyzer types → eval_server's existing JSON shape.
-# Frontend keys.js is unchanged; eval_server2 just produces the same shape
-# from analyzer's output.
+# Wire-format projections: analyzer types → JSON shape consumed by keys.js.
 # ---------------------------------------------------------------------------
 
 _ROWKIND_TO_WIRE = {
@@ -1095,7 +1092,7 @@ def main():
 
     if not is_reloader_child:
         print()
-        print(f"  eval_server2 (analyzer-driven, UI-only)")
+        print(f"  eval_server (analyzer-driven, UI-only)")
         print(f"  Yaml:         {yaml_path}")
         print(f"  Project root: {project_root}")
         print(f"  Session:      {STATE['session_path']}")
