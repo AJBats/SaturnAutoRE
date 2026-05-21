@@ -211,9 +211,10 @@ class FunctionAnalysis:
     prologue_range: tuple                # (start, end_inclusive)
     prologue_saved: list                 # ['r14', 'r13', ..., 'pr', 'macl']
     prologue_stack: int                  # bytes reserved (negative add #-N, r15)
-    epilogue_range: tuple                # (start, end_inclusive) or (None, None)
-    final_exit: Optional[int]            # addr of rts/jmp/braf/bra whose delay slot is at end-1
-    delay_slot: Optional[int]            # addr of the delay-slot instruction
+    prologue_restored: list = field(default_factory=list)  # mirror of prologue_saved restored in epilogue
+    epilogue_range: tuple = (None, None) # (start, end_inclusive) or (None, None)
+    final_exit: Optional[int] = None     # addr of rts/jmp/braf/bra whose delay slot is at end-1
+    delay_slot: Optional[int] = None     # addr of the delay-slot instruction
 
     # ----- Control flow
     branches: list = field(default_factory=list)         # Branch[]
@@ -2137,6 +2138,7 @@ class BinaryModel:
             prologue_range=prologue_range,
             prologue_saved=saved,
             prologue_stack=stack_alloc,
+            prologue_restored=restored,
             epilogue_range=epilogue_range,
             final_exit=final_rts,
             delay_slot=delay_slot,
@@ -2760,6 +2762,126 @@ class SweepState:
         # access (see properties).
         self._outstanding_case_of_cache: Optional[dict] = None
         self._call_sources_of_cache: Optional[dict] = None
+
+    def suggested_partners(self, fa: FunctionAnalysis) -> list:
+        """Suggest partner addresses for `fa` based on stack imbalance +
+        transfer signals.
+
+        Returns list of dicts: [{addr, addr_hex, reason}, ...].  Two
+        analysis paths combine into the suggestion list:
+
+          1. SAVES WITHOUT RESTORES.  Prologue saved callee-saved regs
+             that the local epilogue never pops, AND the function has
+             unconditional external exits (bra/jmp/braf out-of-range).
+             Pattern: switch dispatchers, tail-call wrappers — control
+             leaves the function before the regs are restored, so the
+             jmp targets must be the partner block(s).  Targets are
+             clustered into contiguous regions; one suggestion per
+             cluster (the lowest addr in each cluster).
+
+          2. RESTORES WITHOUT SAVES.  Local epilogue pops regs that the
+             prologue never pushed.  Pattern: switch case bodies that
+             share a caller's stack frame.  Suggested partners come
+             from `call_sources_of` (who transfers control to this
+             function's start).
+
+        Empty list means the function is balanced — no partner needed.
+        """
+        saved = set(fa.prologue_saved or [])
+        restored = set(fa.prologue_restored or [])
+        saves_without_restores = saved - restored
+        restores_without_saves = restored - saved
+
+        suggestions: list = []
+        seen_addrs: set = set()
+
+        def _add(addr: int, reason: str):
+            if addr in seen_addrs or addr == fa.start:
+                return
+            seen_addrs.add(addr)
+            suggestions.append({
+                "addr": addr,
+                "addr_hex": f"{addr:08X}",
+                "reason": reason,
+            })
+
+        # Path 1: collect unconditional external exit destinations.
+        # Only count uncond-exit instructions (bra/jmp/braf) — jsr/bsrf
+        # are calls that return, so their targets aren't partners.
+        if saves_without_restores:
+            binary = self.model.binary
+            vram = self.model.vram
+            pool_priors = self.model.pool_priors_dict()
+            exit_targets: set = set()
+            for b in (fa.branches or []):
+                if b.target is None or b.internal:
+                    continue
+                if b.mnem in ("bra", "jmp", "braf"):
+                    exit_targets.add(b.target)
+            for src, tgt in (fa.indirect_resolutions or {}).items():
+                if fa.start <= tgt <= fa.end:
+                    continue
+                op = _read_opcode(binary, vram, src)
+                if op is None:
+                    continue
+                m, _ = _decode_sh2(op, src)
+                if m is None:
+                    continue
+                head = m.split()[0]
+                if head not in ("jmp", "braf"):
+                    continue   # jsr/bsrf — call returns, not an exit
+                exit_targets.add(tgt)
+            # Switch-dispatch case targets (full table, no range filter).
+            # The walker records only in-range targets in fa.branches; we
+            # need the out-of-range ones too — those are precisely the
+            # partner block(s) we're trying to find.
+            for ind_src in (fa.indirect_calls or []):
+                op = _read_opcode(binary, vram, ind_src)
+                if op is None:
+                    continue
+                m, _ = _decode_sh2(op, ind_src)
+                if m is None:
+                    continue
+                head = m.split()[0]
+                if head == "jmp":
+                    all_cases = _detect_mov_l_jmp_switch_targets(
+                        binary, vram, ind_src,
+                    )
+                elif head == "braf":
+                    all_cases = _detect_braf_switch_targets(
+                        binary, vram, ind_src, pool_priors,
+                    )
+                else:
+                    continue
+                for t in all_cases:
+                    if not (fa.start <= t <= fa.end):
+                        exit_targets.add(t)
+            if exit_targets:
+                sorted_tgts = sorted(exit_targets)
+                clusters = [[sorted_tgts[0]]]
+                for t in sorted_tgts[1:]:
+                    if t - clusters[-1][-1] <= 256:
+                        clusters[-1].append(t)
+                    else:
+                        clusters.append([t])
+                missing_str = ", ".join(sorted(saves_without_restores))
+                for cluster in clusters:
+                    _add(
+                        cluster[0],
+                        f"unconditional exit target — restores [{missing_str}] saved but not popped locally",
+                    )
+
+        # Path 2: who transfers control here?
+        if restores_without_saves:
+            callers = self.call_sources_of.get(fa.start, {})
+            missing_str = ", ".join(sorted(restores_without_saves))
+            for caller_start in sorted(callers.keys()):
+                _add(
+                    caller_start,
+                    f"transfers control here — pushed [{missing_str}] that this function pops",
+                )
+
+        return suggestions
 
     def _verified_for_hints(self) -> list:
         """Verified subsegs filtered for hint computation.

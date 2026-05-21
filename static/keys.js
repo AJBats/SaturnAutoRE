@@ -162,6 +162,30 @@ function renderProgress(s) {
 // Per-pane banner: full candidate metadata for one side of the diff.
 // `paneLabel` is "AI OVERRIDE" or "ORACLE NATURAL" (or empty when no
 // override is active and only the primary pane is shown).
+function renderPartnerButtons(candidate) {
+  const el = document.getElementById('partner-buttons');
+  if (!el) return;
+  if (!candidate) {
+    el.innerHTML = '';
+    return;
+  }
+  const suggestions = candidate.suggested_partners || [];
+  // Already-confirmed partners shouldn't re-render as suggestion buttons.
+  const confirmed = new Set((candidate.partners || []).map(p => p.addr));
+  // Queued partners get a "pressed" visual state — second click cancels.
+  const queued = new Set((candidate.pending_partners || []).map(p => p.addr));
+  const buttons = suggestions
+    .filter(s => !confirmed.has(s.addr))
+    .map(s => {
+      const isQueued = queued.has(s.addr);
+      const klass = isQueued ? 'partner-btn pressed' : 'partner-btn';
+      const tip = s.reason ? ` title="${escapeHtml(s.reason)}"` : '';
+      return `<button class="${klass}" data-partner="${s.addr}"${tip}>+ Partner FUN_${s.addr_hex}</button>`;
+    })
+    .join('');
+  el.innerHTML = buttons;
+}
+
 function partnersHtml(candidate) {
   const parts = [];
   if (candidate.partners && candidate.partners.length) {
@@ -600,6 +624,10 @@ async function fetchState() {
       document.getElementById('analyze-status').textContent =
         `block ${am.active_block + 1} of ${am.block_count} — 0x${cur.start_hex} → 0x${cur.end_hex}`;
     }
+    // Render "+ Partner FUN_X" buttons in the verdict row, one per
+    // suggestion.  Pressed state reflects whether the addr is already
+    // queued (so a second click acts as toggle/cancel).
+    renderPartnerButtons(s.candidate);
 
     const primaryListing = document.getElementById('listing');
     const primaryBanner  = document.getElementById('banner-primary');
@@ -756,6 +784,24 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-approve').addEventListener('click', () => submitVerdict('approved'));
   document.getElementById('btn-reject').addEventListener('click',  () => submitVerdict('rejected'));
   document.getElementById('btn-unsure').addEventListener('click',  () => submitVerdict('unsure'));
+
+  // Partner buttons (delegated — re-rendered on every state poll).
+  document.getElementById('partner-buttons').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.partner-btn');
+    if (!btn) return;
+    const addr = parseInt(btn.dataset.partner, 10);
+    const r = await fetch('/queue-partner', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({partner: '0x' + addr.toString(16).toUpperCase().padStart(8, '0')}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setStatus('queue-partner rejected: ' + (data.error || 'unknown'));
+      return;
+    }
+    fetchState();
+  });
 
   // Pin-zone clicks: + button in any line's leftmost margin → POST
   // /pin-end with that row's addr.  Server sets the current

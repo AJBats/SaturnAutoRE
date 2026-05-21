@@ -466,14 +466,17 @@ def _midpoint_to_dict(m):
     }
 
 
-def _candidate_to_dict(fa, partners=None, pending_partners=None):
+def _candidate_to_dict(fa, partners=None, pending_partners=None,
+                        suggested_partners=None):
     """Project analyzer.FunctionAnalysis to the candidate dict the
     banner renderer (keys.js renderCandidateBanner) consumes.
 
     `partners` is the list of int addrs from the yaml subseg's partners
     field (when this candidate is already stamped).  `pending_partners`
     is the session-queued list (added via /queue-partner before approval
-    and applied on next approve).
+    and applied on next approve).  `suggested_partners` is the
+    analyzer-derived list of likely partner addrs based on stack
+    imbalance signals — the UI renders one button per suggestion.
     """
     return {
         "start_hex": f"{fa.start:08X}",
@@ -495,6 +498,7 @@ def _candidate_to_dict(fa, partners=None, pending_partners=None):
         "pending_partners": [
             {"addr": p, "addr_hex": f"{p:08X}"} for p in (pending_partners or [])
         ],
+        "suggested_partners": list(suggested_partners or []),
     }
 
 
@@ -544,9 +548,13 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
         if s.start == candidate_fa.start:
             partners = list(s.partners or [])
             break
+    suggestions = sweep.suggested_partners(candidate_fa)
     return {
         "candidate": _candidate_to_dict(
-            candidate_fa, partners=partners, pending_partners=pending_partners,
+            candidate_fa,
+            partners=partners,
+            pending_partners=pending_partners,
+            suggested_partners=suggestions,
         ),
         "previous": _previous_to_dict(previous_typed),
         "lines": [_row_to_dict(r) for r in rows],

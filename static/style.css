@@ -605,6 +605,25 @@ footer#footer {
   display: flex; gap: 0.6em; align-items: center;
 }
 .verdict-row.hidden, .analyze-row.hidden { display: none; }
+.partner-buttons {
+  display: inline-flex; gap: 0.4em; margin-left: 0.4em;
+}
+.partner-btn {
+  background: #2a4a3a;
+  color: #9ed;
+  border: 1px solid #4a8a6a;
+  padding: 0.3em 0.7em;
+  border-radius: 0.2em;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.partner-btn:hover { background: #3a6a4a; }
+.partner-btn.pressed {
+  background: #5a7a3a;
+  color: #fff;
+  border-color: #9eb;
+}
 .analyze-row {
   display: flex; gap: 0.6em; align-items: center;
 }
