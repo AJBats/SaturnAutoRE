@@ -2091,9 +2091,17 @@ class BinaryModel:
         # (e.g., case 9's walk only knew [0x0604D570, ...]).  In the
         # merged view the block's range is wider, so previously-external
         # targets that land inside the block become internal arrows.
+        #
+        # CRITICAL: _classify_branch_internality mutates Branch.internal
+        # in place.  fa.branches contains Branch objects shared by
+        # reference with the BinaryModel's analyze_function cache —
+        # mutating them poisons later analyze_function() calls.  Copy
+        # each Branch first so the cache stays clean.
         fa = _dc_replace(
             fa,
-            branches=_classify_branch_internality(fa.branches, start, end),
+            branches=_classify_branch_internality(
+                [_dc_replace(b) for b in fa.branches], start, end,
+            ),
         )
 
         return fa
@@ -2642,11 +2650,21 @@ class BinaryModel:
         targets: set = set()
         self.switch_clusters = {}
         self.switch_dispatcher_of = {}
+        pool_priors = self.pool_priors_dict()
         for jmp_pc in range(vram, binary_end, 2):
+            # mov.l + jmp @rN idiom
             tgts = self._detect_mov_l_jmp_switch_targets(jmp_pc)
             if not tgts:
+                # mova + braf rN idiom (alt form)
+                tgts = _detect_braf_switch_targets(
+                    binary, vram, jmp_pc, pool_priors,
+                )
+            if not tgts:
                 continue
-            self.switch_clusters[jmp_pc] = sorted(set(tgts))
+            # Preserve table-order targets in switch_clusters; downstream
+            # consumers (renderer, partner suggestions) want the full
+            # ordered list, not just unique values.
+            self.switch_clusters[jmp_pc] = list(tgts)
             for idx, t in enumerate(tgts):
                 targets.add(t)
                 self.switch_dispatcher_of.setdefault(t, []).append((jmp_pc, idx))
@@ -3147,28 +3165,12 @@ class SweepState:
                     continue   # jsr/bsrf — call returns, not an exit
                 exit_targets.add(tgt)
             # Switch-dispatch case targets (full table, no range filter).
-            # The walker records only in-range targets in fa.branches; we
-            # need the out-of-range ones too — those are precisely the
-            # partner block(s) we're trying to find.
+            # The walker records only in-range targets in fa.branches;
+            # we need the out-of-range ones too — those are precisely
+            # the partner block(s) we're trying to find.  Look up the
+            # full table from the precomputed switch_clusters map.
             for ind_src in (fa.indirect_calls or []):
-                op = _read_opcode(binary, vram, ind_src)
-                if op is None:
-                    continue
-                m, _ = _decode_sh2(op, ind_src)
-                if m is None:
-                    continue
-                head = m.split()[0]
-                if head == "jmp":
-                    all_cases = _detect_mov_l_jmp_switch_targets(
-                        binary, vram, ind_src,
-                    )
-                elif head == "braf":
-                    all_cases = _detect_braf_switch_targets(
-                        binary, vram, ind_src, pool_priors,
-                    )
-                else:
-                    continue
-                for t in all_cases:
+                for t in self.model.switch_clusters.get(ind_src, []):
                     if not (fa.start <= t <= fa.end):
                         exit_targets.add(t)
             if exit_targets:
@@ -3230,29 +3232,22 @@ class SweepState:
 
         # Step 2: drop subsegs absorbed by another in `keep`.  A subseg
         # X is absorbed by Y when X.start ∈ Y.reachable AND X != Y.
-        # analyze_function is cached; this is one walk per surviving
-        # subseg amortized across the whole hint computation.
-        reachable_by_start = {}
-        for s in keep:
+        # Single pass: walk each Y once, mark any in-keep subseg whose
+        # start falls in Y.reachable.
+        keep_starts = {s.start for s in keep}
+        absorbed_starts: set = set()
+        for y in keep:
             try:
-                reachable_by_start[s.start] = self.model.analyze_function(
-                    s.start, hint_end=s.end,
+                y_reachable = self.model.analyze_function(
+                    y.start, hint_end=y.end,
                 ).reachable
             except Exception:
-                reachable_by_start[s.start] = set()
+                continue
+            for x_start in y_reachable & keep_starts:
+                if x_start != y.start:
+                    absorbed_starts.add(x_start)
 
-        out = []
-        for x in keep:
-            absorbed = False
-            for y in keep:
-                if y.start == x.start:
-                    continue
-                if x.start in reachable_by_start.get(y.start, ()):
-                    absorbed = True
-                    break
-            if not absorbed:
-                out.append(x)
-        return out
+        return [x for x in keep if x.start not in absorbed_starts]
 
     @property
     def outstanding_case_of(self) -> dict:
@@ -3274,35 +3269,28 @@ class SweepState:
         if self._outstanding_case_of_cache is not None:
             return self._outstanding_case_of_cache
 
-        binary = self.model.binary
-        vram = self.model.vram
-        binary_max = vram + len(binary) - 1
-        pool_priors = self.model.pool_priors_dict()
-
         # Union of real verified subsegs (filtered by analyze_mode) and
-        # analyze-mode "virtual" blocks.  Both are scanned the same way:
-        # jmp@rN / braf inside their range, case targets that fall
-        # outside their range are "outstanding".
+        # analyze-mode "virtual" blocks.  Read switch dispatchers from
+        # BinaryModel.switch_clusters (precomputed once at construction);
+        # no per-poll re-scan of every PC.
         ranges = [(s.start, s.end) for s in self._verified_for_hints()]
         for b in (self.analyze_mode.get("blocks") or []):
             ranges.append((int(b["start"]), int(b["end"])))
 
         result: dict = {}
-        for r_start, r_end in ranges:
-            for pc in range(r_start, r_end, 2):
-                # mov.l + jmp @rN switch
-                tgts = _detect_mov_l_jmp_switch_targets(
-                    binary, vram, pc, binary_end=binary_max,
-                )
-                if not tgts:
-                    # mova + braf switch (alt idiom)
-                    tgts = _detect_braf_switch_targets(
-                        binary, vram, pc, pool_priors,
-                    )
-                for idx, t in enumerate(tgts):
-                    if r_start <= t <= r_end:
-                        continue  # target lives inside the dispatcher itself
-                    result.setdefault(t, []).append((r_start, idx))
+        for dispatcher_pc, tgts in self.model.switch_clusters.items():
+            # Find the containing range (subseg or analyze_mode block).
+            r_start = next(
+                (rs for rs, re in ranges if rs <= dispatcher_pc <= re),
+                None,
+            )
+            if r_start is None:
+                continue
+            r_end = next(re for rs, re in ranges if rs == r_start)
+            for idx, t in enumerate(tgts):
+                if r_start <= t <= r_end:
+                    continue  # target lives inside the dispatcher itself
+                result.setdefault(t, []).append((r_start, idx))
 
         self._outstanding_case_of_cache = result
         return result
@@ -3368,25 +3356,9 @@ class SweepState:
             # ones in fa.branches.  Out-of-range case targets are the
             # interesting ones for cross-function call attribution
             # (e.g., a dispatcher's switch table points at case bodies
-            # in another TU).
-            binary = self.model.binary
-            vram = self.model.vram
-            pool_priors = self.model.pool_priors_dict()
+            # in another TU).  Look up the precomputed clusters.
             for ind_src in (fa.indirect_calls or []):
-                op = _read_opcode(binary, vram, ind_src)
-                if op is None:
-                    continue
-                m, _ = _decode_sh2(op, ind_src)
-                if m is None:
-                    continue
-                head = m.split()[0]
-                if head == "jmp":
-                    all_cases = _detect_mov_l_jmp_switch_targets(binary, vram, ind_src)
-                elif head == "braf":
-                    all_cases = _detect_braf_switch_targets(binary, vram, ind_src, pool_priors)
-                else:
-                    continue
-                for t in set(all_cases):
+                for t in set(self.model.switch_clusters.get(ind_src, [])):
                     if fa.start <= t <= fa.end:
                         continue
                     result.setdefault(t, {}).setdefault(fn_start, 0)
@@ -3962,24 +3934,13 @@ class SweepState:
                     row.text = f"{symbolized}   ⇒ {sym}"
                     row.indirect_resolved_label = sym
 
-            # Switch-dispatch detection + tag classification.  Runs the
-            # detector once and uses the result for both the all-targets
-            # text annotation AND the row tag (so we can tell switch
-            # dispatches apart from single-target indirect jumps).
+            # Switch-dispatch tag classification + all-targets text
+            # annotation.  Looks up the precomputed switch_clusters map
+            # on BinaryModel — populated once at construction by
+            # _scan_all_switch_targets.  Row emission stays pure
+            # lookup (no decoder calls per row).
             if head in ("jmp", "braf"):
-                switch_targets = []
-                if b is not None and b.target is not None:
-                    binary_arg = self.model.binary
-                    vram_arg = self.model.vram
-                    if head == "jmp":
-                        switch_targets = _detect_mov_l_jmp_switch_targets(
-                            binary_arg, vram_arg, addr,
-                        )
-                    else:
-                        pool_priors = self.model.pool_priors_dict()
-                        switch_targets = _detect_braf_switch_targets(
-                            binary_arg, vram_arg, addr, pool_priors,
-                        )
+                switch_targets = self.model.switch_clusters.get(addr, [])
                 if switch_targets:
                     targets_str = ", ".join(f"0x{t:08X}" for t in switch_targets)
                     row.text = f"{symbolized}   ⇒ {targets_str}"
