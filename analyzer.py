@@ -2759,6 +2759,62 @@ class SweepState:
         self._outstanding_case_of_cache: Optional[dict] = None
         self._call_sources_of_cache: Optional[dict] = None
 
+    def _verified_for_hints(self) -> list:
+        """Verified subsegs filtered for hint computation.
+
+        Drops two kinds of subseg as redundant:
+
+        1. Subsegs OVERLAPPED by an analyze_mode block.  The user is
+           hypothesizing a different (usually wider) function boundary
+           that contradicts the existing stamp.
+
+        2. Subsegs ABSORBED by another verified subseg's analyzed
+           reachable set.  When the analyzer walks subseg Y and the
+           walk reaches subseg X's start (e.g., via switch absorption
+           or fall-through), X is structurally part of Y in the
+           current analyzer's view.  Keeping X would double-count its
+           calls/cases under both X and Y; suppressing X attributes
+           everything to the absorbing function.
+        """
+        blocks = self.analyze_mode.get("blocks") or []
+        block_ranges = [(int(b["start"]), int(b["end"])) for b in blocks]
+
+        # Step 1: drop subsegs overlapping any analyze_mode block.
+        keep = []
+        for sub in self.verified:
+            overlapped = any(
+                br_start <= sub.end and br_end >= sub.start
+                for br_start, br_end in block_ranges
+            )
+            if not overlapped:
+                keep.append(sub)
+
+        # Step 2: drop subsegs absorbed by another in `keep`.  A subseg
+        # X is absorbed by Y when X.start ∈ Y.reachable AND X != Y.
+        # analyze_function is cached; this is one walk per surviving
+        # subseg amortized across the whole hint computation.
+        reachable_by_start = {}
+        for s in keep:
+            try:
+                reachable_by_start[s.start] = self.model.analyze_function(
+                    s.start, hint_end=s.end,
+                ).reachable
+            except Exception:
+                reachable_by_start[s.start] = set()
+
+        out = []
+        for x in keep:
+            absorbed = False
+            for y in keep:
+                if y.start == x.start:
+                    continue
+                if x.start in reachable_by_start.get(y.start, ()):
+                    absorbed = True
+                    break
+            if not absorbed:
+                out.append(x)
+        return out
+
     @property
     def outstanding_case_of(self) -> dict:
         """For every stamped code subseg, scan it for jmp@rN / braf switch
@@ -2784,10 +2840,11 @@ class SweepState:
         binary_max = vram + len(binary) - 1
         pool_priors = self.model.pool_priors_dict()
 
-        # Union of real verified subsegs and analyze-mode "virtual" blocks.
-        # Both are scanned the same way: jmp@rN / braf inside their range,
-        # case targets that fall outside their range are "outstanding".
-        ranges = [(s.start, s.end) for s in self.verified]
+        # Union of real verified subsegs (filtered by analyze_mode) and
+        # analyze-mode "virtual" blocks.  Both are scanned the same way:
+        # jmp@rN / braf inside their range, case targets that fall
+        # outside their range are "outstanding".
+        ranges = [(s.start, s.end) for s in self._verified_for_hints()]
         for b in (self.analyze_mode.get("blocks") or []):
             ranges.append((int(b["start"]), int(b["end"])))
 
@@ -2869,7 +2926,7 @@ class SweepState:
                 result.setdefault(tgt, {}).setdefault(fn_start, 0)
                 result[tgt][fn_start] += 1
 
-        for sub in self.verified:
+        for sub in self._verified_for_hints():
             _harvest(sub.start, sub.end)
         for b in (self.analyze_mode.get("blocks") or []):
             _harvest(int(b["start"]), int(b["end"]))
@@ -3329,18 +3386,23 @@ class SweepState:
 
             # ----- Branch-target label row?  (.L_<addr>: marker)
             if addr in branch_targets and addr != fa.start:
-                rows.append(ListingRow(
-                    row_id=next_id(),
-                    kind=RowKind.LABEL,
-                    section=section,
-                    addr=addr,
-                    label=f".L_{addr:08X}:",
-                    indent=min(fa.indent_depths.get(addr, 0), MAX_DISPLAY_INDENT),
-                    is_attn=is_attn,
-                    is_midpoint=is_mid,
-                    is_ref_end=is_ref_end,
-                    pin_action=pin,
-                ))
+                # Suppress the machine-generated .L_<addr>: label when
+                # a "Called from" label was emitted just above for the
+                # same addr — the call-source label conveys the same
+                # branch-target info plus identifies the caller.
+                if not self.call_sources_of.get(addr):
+                    rows.append(ListingRow(
+                        row_id=next_id(),
+                        kind=RowKind.LABEL,
+                        section=section,
+                        addr=addr,
+                        label=f".L_{addr:08X}:",
+                        indent=min(fa.indent_depths.get(addr, 0), MAX_DISPLAY_INDENT),
+                        is_attn=is_attn,
+                        is_midpoint=is_mid,
+                        is_ref_end=is_ref_end,
+                        pin_action=pin,
+                    ))
                 # Fall through — emit the instruction row at the same addr too.
 
             # ----- Instruction row
