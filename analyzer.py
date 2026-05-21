@@ -2975,11 +2975,6 @@ class SweepState:
         ]
         self.verified.sort(key=lambda s: s.start)
 
-        # Translation units (file boundaries) — used to cap analyze_function's
-        # hint_end so the CFG walk doesn't run off into the next TU when a
-        # branch goes there.
-        self.tus = list(yaml_cfg.get("tus") or [])
-
         # Sibling-pool cache: per-subseg reachable sets are expensive to
         # build (each requires a full analyze_function), so cache and
         # reuse.  Keyed by subseg start; invalidated implicitly because
@@ -3092,6 +3087,23 @@ class SweepState:
             verdict=new_verdict,
             partner_balanced=True,
         )
+
+    def _cap_from_next_stamp(self, start: int) -> Optional[int]:
+        """Sweep / override hint_end cap.  Returns the byte BEFORE the
+        next verified subseg's start (when one exists past `start`),
+        else None (= binary_max — walker walks until natural CFG
+        termination).
+
+        Replaces the old TU-end cap.  Bounds derived from the user's
+        own approvals rather than from invented translation-unit
+        boundaries — more authentic, and tracks the user's progress
+        as they stamp more functions.
+        """
+        next_start = min(
+            (s.start for s in self.verified if s.start > start),
+            default=None,
+        )
+        return None if next_start is None else next_start - 1
 
     def suggested_partners(self, fa: FunctionAnalysis) -> list:
         """Suggest partner addresses for `fa` based on stack imbalance +
@@ -3514,9 +3526,9 @@ class SweepState:
                 cross_module_callers=cross_module_callers,
             )
             if next_start is not None and not _covered_by_existing(next_start):
-                tu = next((t for t in self.tus if t["start"] <= next_start <= t["end"]), None)
-                hint_end = tu["end"] if tu else None
-                fa = model.analyze_function(next_start, hint_end=hint_end)
+                fa = model.analyze_function(
+                    next_start, hint_end=self._cap_from_next_stamp(next_start),
+                )
                 return NextCandidate(previous=None, function=fa)
 
         for prev in self.verified:
@@ -3542,9 +3554,9 @@ class SweepState:
                 key=lambda s: s.end,
                 default=prev,
             )
-            tu = next((t for t in self.tus if t["start"] <= next_start <= t["end"]), None)
-            hint_end = tu["end"] if tu else None
-            fa = model.analyze_function(next_start, hint_end=hint_end)
+            fa = model.analyze_function(
+                next_start, hint_end=self._cap_from_next_stamp(next_start),
+            )
             return NextCandidate(previous=actual_prev, function=fa)
 
         return None
@@ -4202,21 +4214,20 @@ class SweepState:
         model = self.model
 
         start = _coerce_addr(ov["candidate_start"])
-        tu = next((t for t in self.tus if t["start"] <= start <= t["end"]), None)
 
         # AI may also pin the END explicitly (one-off boundary correction
         # the oracle's heuristics can't reach).  When pinned, use it as
         # hint_end so the ENTIRE analysis (CFG walk, epilogue search,
         # prologue/epilogue mirror, verdict) runs against the override
-        # boundary — not against TU end with a post-hoc end mutation,
-        # which leaves the verdict reflecting whichever epilogue
-        # analyzer's natural walk happened to land on (often a different
-        # function's rts past the real end).
+        # boundary — not with a post-hoc end mutation, which leaves the
+        # verdict reflecting whichever epilogue analyzer's natural walk
+        # happened to land on (often a different function's rts past
+        # the real end).
         end_override_raw = ov.get("candidate_end")
         if end_override_raw is not None:
             hint_end = _coerce_addr(end_override_raw)
         else:
-            hint_end = tu["end"] if tu else None
+            hint_end = self._cap_from_next_stamp(start)
 
         fa = model.analyze_function(start, hint_end=hint_end)
         if end_override_raw is not None:

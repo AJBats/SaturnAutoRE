@@ -1012,9 +1012,10 @@ def verdict():
             _remove_subseg_from_yaml(ex_start)
 
         # Find the containing TU for the file_name field.
-        tus = cfg.get("tus") or []
-        tu = next((t for t in tus if t["start"] <= nxt.function.start <= t["end"]), None)
-        file_name = tu["name"] if tu else f"tu_{nxt.function.start:08X}"
+        # Synthetic per-subseg `file:` field.  Cosmetic only — nothing
+        # analytical reads it.  TUs were retired (binary is one logical
+        # code block).
+        file_name = f"tu_{nxt.function.start:08X}"
 
         # Partners come from two sources, unioned:
         #   1. pending_partners staged via /queue-partner before approval
