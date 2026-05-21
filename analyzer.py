@@ -2763,6 +2763,57 @@ class SweepState:
         self._outstanding_case_of_cache: Optional[dict] = None
         self._call_sources_of_cache: Optional[dict] = None
 
+    def apply_partner_awareness(self, fa: FunctionAnalysis) -> FunctionAnalysis:
+        """When `fa`'s yaml subseg declares partners, compute the
+        UNION of saved/restored registers across the function and all
+        its partners.  If the combined frame is balanced (saved set ==
+        restored set), the local imbalance yellow flag is suppressed
+        and the verdict is bumped from MEDIUM to HIGH (if MEDIUM was
+        solely caused by the imbalance).
+
+        Partners that aren't stamped yet (or can't be analyzed) are
+        silently skipped — the flag stays in that case so the user
+        still sees the issue until the other half is stamped too.
+
+        Returns a fresh FunctionAnalysis (via _dc_replace) when changes
+        apply, else returns `fa` unchanged.
+        """
+        own = next((s for s in self.verified if s.start == fa.start), None)
+        if own is None or not own.partners:
+            return fa
+
+        combined_saved = set(fa.prologue_saved or [])
+        combined_restored = set(fa.prologue_restored or [])
+        for p in own.partners:
+            partner_sub = next((s for s in self.verified if s.start == p), None)
+            if partner_sub is None:
+                continue   # partner not stamped yet
+            try:
+                partner_fa = self.model.analyze_function(p, hint_end=partner_sub.end)
+            except Exception:
+                continue
+            combined_saved |= set(partner_fa.prologue_saved or [])
+            combined_restored |= set(partner_fa.prologue_restored or [])
+
+        if combined_saved != combined_restored:
+            return fa   # partners declared but combined frame still imbalanced
+
+        # Filter the local imbalance flags out.
+        IMBALANCE_MARKERS = (
+            "prologue/epilogue register order mismatch",
+            "critical: prologue pushed",
+        )
+        new_flags = [
+            f for f in fa.yellow_flags
+            if not any(m in f for m in IMBALANCE_MARKERS)
+        ]
+        new_verdict = fa.verdict
+        # Bump MEDIUM → HIGH when no flags remain after suppression
+        # (the imbalance was the only thing dragging the verdict down).
+        if fa.verdict == Verdict.MEDIUM and not new_flags:
+            new_verdict = Verdict.HIGH
+        return _dc_replace(fa, yellow_flags=new_flags, verdict=new_verdict)
+
     def suggested_partners(self, fa: FunctionAnalysis) -> list:
         """Suggest partner addresses for `fa` based on stack imbalance +
         transfer signals.

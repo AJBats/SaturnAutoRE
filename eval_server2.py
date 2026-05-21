@@ -549,6 +549,11 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
             partners = list(s.partners or [])
             break
     suggestions = sweep.suggested_partners(candidate_fa)
+    # Apply partner-aware verdict: suppress imbalance flags when the
+    # combined stack frame across this function + its partners is
+    # balanced.  Happens AFTER listing emission (listing doesn't use
+    # verdict/flags so the order is safe).
+    candidate_fa = sweep.apply_partner_awareness(candidate_fa)
     return {
         "candidate": _candidate_to_dict(
             candidate_fa,
