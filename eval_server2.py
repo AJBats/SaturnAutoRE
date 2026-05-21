@@ -17,6 +17,7 @@ Run from a project's root directory:
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
@@ -550,6 +551,15 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
             partners = list(s.partners or [])
             break
     suggestions = sweep.suggested_partners(candidate_fa)
+    # Trailing-zone warnings: surface a yellow flag when the candidate
+    # ends right before case targets of an existing stamped dispatcher
+    # — strong signal that the boundary is too short.
+    trailing_flags = sweep.check_trailing_zone_case_targets(candidate_fa)
+    if trailing_flags:
+        candidate_fa = dataclasses.replace(
+            candidate_fa,
+            yellow_flags=list(candidate_fa.yellow_flags) + trailing_flags,
+        )
     # Apply partner-aware verdict: suppress imbalance flags when the
     # combined stack frame across this function + its partners is
     # balanced.  Happens AFTER listing emission (listing doesn't use

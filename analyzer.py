@@ -1864,6 +1864,8 @@ class BinaryModel:
         # are real code entries even though nothing bsr/bra's them
         # directly.
         self.switch_targets: set = set()     # set of int addrs
+        self.switch_clusters: dict = {}      # dispatcher_pc -> sorted unique case targets
+        self.switch_dispatcher_of: dict = {} # case_addr -> [(dispatcher_pc, case_idx)]
 
         # Phase 3 outputs
         self.instructions: dict = {}         # {addr: Instruction}
@@ -1963,6 +1965,51 @@ class BinaryModel:
             elif kind is ByteKind.POOL2:
                 out[addr] = 2
         return out
+
+    def _sibling_case_bodies(self, start: int, max_reachable: int,
+                              hard_limit: int, max_gap: int = 64) -> list:
+        """When `start` is a switch case target, return sibling case
+        targets in the same dispatch table that are physically
+        contiguous (gap ≤ max_gap from the current end-of-walk).
+
+        Iterates outward: each absorbed sibling extends the walk's end,
+        which may then bring the NEXT sibling into contiguous range.
+        Stops at the first sibling that's too far away (≥ max_gap
+        bytes past current end) — physically distant case bodies are
+        a different cluster and shouldn't be merged.
+        """
+        if start not in self.switch_dispatcher_of:
+            return []
+        # Collect all sibling targets from EVERY dispatcher that hits
+        # `start` (rare: same addr hit by multiple dispatchers, but
+        # union'ed for safety).  Filter to siblings AFTER `start`.
+        all_siblings: set = set()
+        for disp_pc, _idx in self.switch_dispatcher_of[start]:
+            for t in self.switch_clusters.get(disp_pc, []):
+                if t > start and t <= hard_limit:
+                    all_siblings.add(t)
+        if not all_siblings:
+            return []
+
+        # Walk siblings in address order, absorbing each that's
+        # contiguous with the current walk end.  Stop on the first gap.
+        ordered = sorted(all_siblings)
+        absorbed: list = []
+        cur_end = max_reachable
+        for sib in ordered:
+            if sib - cur_end > max_gap:
+                break
+            absorbed.append(sib)
+            # Quick peek: walk this sibling to figure out where IT ends.
+            # We can't reuse analyze_function (risk of recursion through
+            # _sibling_case_bodies); do a stripped control_flow_walk
+            # locally.
+            sub_reach, sub_max, _b, _i = _control_flow_walk(
+                self.binary, self.vram, sib, hard_limit,
+                pool_priors=self.pool_priors_dict(),
+            )
+            cur_end = max(cur_end, sub_max)
+        return absorbed
 
     def is_address_in_function(self, addr: int, fn: FunctionAnalysis) -> bool:
         """Cheap membership check — used by eval_server to validate pin
@@ -2111,6 +2158,24 @@ class BinaryModel:
             binary, vram, start, hard_limit, pool_priors=pool_priors,
         )
 
+        # 2b. Switch-cluster sibling absorption.  When `start` is a
+        # known case body of a switch dispatcher, the other case
+        # bodies in the same dispatch table that are PHYSICALLY
+        # CONTIGUOUS form one logical entity (they share the
+        # dispatcher's stack frame).  Walk each contiguous sibling
+        # and merge its reachable + branches.  Without this, a pin to
+        # case 1 would only get case 1's body, leaving cases 2-N
+        # rendered in the trailing zone as "next functions".
+        sibling_walks = self._sibling_case_bodies(start, max_reachable, hard_limit)
+        for sib_start in sibling_walks:
+            sub_reach, sub_max, sub_branches, sub_indirect = _control_flow_walk(
+                binary, vram, sib_start, hard_limit, pool_priors=pool_priors,
+            )
+            reachable |= sub_reach
+            max_reachable = max(max_reachable, sub_max)
+            branches.extend(sub_branches)
+            indirect.extend(sub_indirect)
+
         # Last byte of the function is the last byte of the last reachable
         # instruction.  For rts/rte/bra with delay slots, the delay slot's
         # 2nd byte is the end.
@@ -2128,8 +2193,31 @@ class BinaryModel:
         # push because they unwind the CALLER's stack frame).  Used by
         # partner-aware verdict to detect frames balanced across a
         # multi-block function pair.
-        all_pops = _walk_epilogue_pops_all(binary, vram, code_end)
-        restored_extras = [r for r in all_pops if r not in set(restored)]
+        #
+        # For multi-block functions (e.g., switch case clusters
+        # absorbed via _sibling_case_bodies), each absorbed sibling
+        # has its OWN epilogue.  Sample ALL exits (rts/rte/jmp/braf/
+        # bra in reachable) and union their pops — otherwise sampling
+        # only `code_end` (the final exit) would miss the pops carried
+        # by other case bodies' epilogues.
+        all_pops_union: set = set()
+        for a in sorted(reachable):
+            op = _read_opcode(binary, vram, a)
+            if op is None:
+                continue
+            mnem, _ = _decode_sh2(op, a)
+            if mnem is None:
+                continue
+            head = mnem.split()[0]
+            if head not in ("rts", "rte", "jmp", "braf", "bra"):
+                continue
+            # Each exit has a delay slot; pops live just BEFORE the
+            # exit instruction.  _walk_epilogue_pops_all expects `end`
+            # as the last byte of the function/region — for one exit
+            # that's the delay slot's 2nd byte (exit_addr + 3).
+            all_pops_union |= set(_walk_epilogue_pops_all(binary, vram, a + 3))
+        restored_set = set(restored)
+        restored_extras = sorted(all_pops_union - restored_set)
 
         # 4. Augment `restored` with PR / MACL pops anywhere in reachable.
         # GCC will cycle-schedule the restore early, placing it OUTSIDE the
@@ -2520,7 +2608,7 @@ class BinaryModel:
     def _scan_all_switch_targets(self) -> set:
         """Walk the binary at 2-byte stride; for every `jmp @rN` that
         matches the GCC switch-dispatch idiom, harvest the jump-table
-        case body addresses into a set.
+        case body addresses.
 
         Pattern (within ~8 instructions before the jmp):
             mov.l @(disp,PC), rN     ; rN = *pool — the table start addr
@@ -2528,20 +2616,29 @@ class BinaryModel:
             mov.l @rN, rN             ; rN = *rN  — case body at table[index]
             jmp @rN                   ; transfer
 
-        The pool word's VALUE is the table start.  The table is a run
-        of 4-byte case body addresses; we walk forward stopping at the
-        first entry whose value isn't a valid 2-byte-aligned vram-range
-        address.
+        Also populates two reverse maps stored on `self`:
+          - self.switch_clusters:    dispatcher_pc -> sorted unique targets
+          - self.switch_dispatcher_of: target_addr -> [(dispatcher_pc, idx)]
+
+        These let analyze_function recognize "this candidate is a case
+        body of a known switch dispatcher" and auto-absorb the contiguous
+        sibling case bodies from the same dispatch table.
         """
         binary = self.binary
         vram = self.vram
         binary_end = self.end_addr
 
         targets: set = set()
+        self.switch_clusters = {}
+        self.switch_dispatcher_of = {}
         for jmp_pc in range(vram, binary_end, 2):
             tgts = self._detect_mov_l_jmp_switch_targets(jmp_pc)
-            for t in tgts:
+            if not tgts:
+                continue
+            self.switch_clusters[jmp_pc] = sorted(set(tgts))
+            for idx, t in enumerate(tgts):
                 targets.add(t)
+                self.switch_dispatcher_of.setdefault(t, []).append((jmp_pc, idx))
         return targets
 
     def _detect_mov_l_jmp_switch_targets(self, jmp_pc: int) -> list:
@@ -2868,6 +2965,39 @@ class SweepState:
         # access (see properties).
         self._outstanding_case_of_cache: Optional[dict] = None
         self._call_sources_of_cache: Optional[dict] = None
+
+    def check_trailing_zone_case_targets(self, fa: FunctionAnalysis,
+                                          trailing_window: int = 200) -> list:
+        """Scan the trailing window past `fa.end` for addresses that are
+        known case targets of an already-stamped switch dispatcher.
+
+        When the analyzer proposes a function boundary and the very next
+        addresses are case bodies of an existing dispatcher, the
+        boundary is almost certainly too short — case bodies for the
+        same switch are physically contiguous and the candidate should
+        absorb them.  Returns a list of yellow-flag strings (empty when
+        no hint fires).
+        """
+        hits_by_disp: dict = {}
+        for offset in range(1, trailing_window, 2):
+            addr = fa.end + offset
+            entries = self.outstanding_case_of.get(addr)
+            if not entries:
+                continue
+            for disp_start, case_idx in entries:
+                hits_by_disp.setdefault(disp_start, []).append((addr, case_idx))
+
+        flags = []
+        for disp_start, hits in hits_by_disp.items():
+            addr_str = ", ".join(
+                sorted({f"0x{a:08X}" for (a, _) in hits})
+            )
+            flags.append(
+                f"boundary likely short — case targets of FUN_{disp_start:08X} "
+                f"in trailing zone ({addr_str}); consider extending end to "
+                f"cover all cases"
+            )
+        return flags
 
     def apply_partner_awareness(self, fa: FunctionAnalysis) -> FunctionAnalysis:
         """When `fa`'s yaml subseg declares partners, compute the
