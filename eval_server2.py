@@ -54,7 +54,12 @@ LOCK = threading.Lock()
 # ---------------------------------------------------------------------------
 
 def _empty_session():
-    return {"history": [], "ai_override": None, "analyze_mode": None}
+    return {
+        "history": [],
+        "ai_override": None,
+        "analyze_mode": None,
+        "pending_partners": [],   # addrs queued via /queue-partner; applied on next approve
+    }
 
 
 def load_session():
@@ -109,7 +114,7 @@ def _remove_subseg_from_yaml(start_addr):
     return removed
 
 
-def _append_subseg_to_yaml(start_addr, end_addr, file_name):
+def _append_subseg_to_yaml(start_addr, end_addr, file_name, partners=None):
     text = open(STATE["yaml_path"]).read()
     if not text.endswith("\n"):
         text += "\n"
@@ -119,8 +124,63 @@ def _append_subseg_to_yaml(start_addr, end_addr, file_name):
         f"    file:  {file_name}\n"
         f"    end:   0x{end_addr:08X}\n"
     )
+    if partners:
+        partners_list = ", ".join(f"0x{p:08X}" for p in sorted(set(partners)))
+        addition += f"    partners: [{partners_list}]\n"
     with open(STATE["yaml_path"], "w") as f:
         f.write(text + addition)
+
+
+def _add_partner_to_existing_subseg(subseg_start, new_partner):
+    """In-place yaml edit: add `new_partner` to the partners list of the
+    subseg whose start matches `subseg_start`.  Creates a new partners
+    field if none exists.  Idempotent — won't duplicate an existing
+    partner.
+
+    Returns True on success, False if no matching subseg was found.
+    """
+    text = open(STATE["yaml_path"]).read()
+    lines = text.splitlines(keepends=True)
+    target = f"  - start: 0x{subseg_start:08X}"
+    i = 0
+    while i < len(lines):
+        if lines[i].rstrip("\r\n") == target:
+            # Found the subseg.  Scan its body lines for an existing
+            # partners field; if found, parse and update; else, insert
+            # a new partners line just before the next subseg or EOF.
+            j = i + 1
+            body_end = j
+            partners_line_idx = None
+            while body_end < len(lines):
+                s = lines[body_end].rstrip("\r\n")
+                if s.startswith("  - ") or (s and not s.startswith("    ")):
+                    break
+                if s.lstrip().startswith("partners:"):
+                    partners_line_idx = body_end
+                body_end += 1
+
+            partner_hex = f"0x{new_partner:08X}"
+            if partners_line_idx is not None:
+                pline = lines[partners_line_idx]
+                # Existing list: parse inside [...] and append if not present.
+                lo = pline.find("[")
+                hi = pline.find("]")
+                if lo != -1 and hi != -1 and lo < hi:
+                    existing = [t.strip() for t in pline[lo + 1 : hi].split(",") if t.strip()]
+                    norm = [e.upper().replace("0X", "0x") for e in existing]
+                    if partner_hex not in [n.replace("0x", "0x") for n in norm]:
+                        existing.append(partner_hex)
+                        new_inner = ", ".join(existing)
+                        lines[partners_line_idx] = pline[: lo + 1] + new_inner + pline[hi:]
+            else:
+                indent = "    "
+                lines.insert(body_end, f"{indent}partners: [{partner_hex}]\n")
+
+            with open(STATE["yaml_path"], "w") as f:
+                f.writelines(lines)
+            return True
+        i += 1
+    return False
 
 
 def _find_overlapping_subsegs(new_start, new_end, exclude_start=None):
@@ -406,9 +466,15 @@ def _midpoint_to_dict(m):
     }
 
 
-def _candidate_to_dict(fa):
+def _candidate_to_dict(fa, partners=None, pending_partners=None):
     """Project analyzer.FunctionAnalysis to the candidate dict the
-    banner renderer (keys.js renderCandidateBanner) consumes."""
+    banner renderer (keys.js renderCandidateBanner) consumes.
+
+    `partners` is the list of int addrs from the yaml subseg's partners
+    field (when this candidate is already stamped).  `pending_partners`
+    is the session-queued list (added via /queue-partner before approval
+    and applied on next approve).
+    """
     return {
         "start_hex": f"{fa.start:08X}",
         "start": fa.start,
@@ -425,6 +491,10 @@ def _candidate_to_dict(fa):
             "runtime_hits": fa.evidence.runtime_hits,
             "midpoints": [_midpoint_to_dict(m) for m in fa.midpoints],
         },
+        "partners": [{"addr": p, "addr_hex": f"{p:08X}"} for p in (partners or [])],
+        "pending_partners": [
+            {"addr": p, "addr_hex": f"{p:08X}"} for p in (pending_partners or [])
+        ],
     }
 
 
@@ -460,12 +530,24 @@ def _gap_to_dict(g):
     }
 
 
-def _build_candidate_payload(sweep, candidate_fa, previous_typed, attn=None):
+def _build_candidate_payload(sweep, candidate_fa, previous_typed,
+                              attn=None, pending_partners=None):
     """Build the per-pane payload (banner + listing rows).  Mirrors
-    eval_server._build_candidate_payload's output shape."""
+    eval_server._build_candidate_payload's output shape.
+
+    Partners (from yaml) are looked up by candidate's start; pending
+    partners (session-queued) are passed in by the caller.
+    """
     rows = sweep.listing(candidate_fa, previous=previous_typed, attn=attn)
+    partners = []
+    for s in sweep.verified:
+        if s.start == candidate_fa.start:
+            partners = list(s.partners or [])
+            break
     return {
-        "candidate": _candidate_to_dict(candidate_fa),
+        "candidate": _candidate_to_dict(
+            candidate_fa, partners=partners, pending_partners=pending_partners,
+        ),
         "previous": _previous_to_dict(previous_typed),
         "lines": [_row_to_dict(r) for r in rows],
     }
@@ -522,8 +604,10 @@ def state():
         else:
             internal_gaps = [_gap_to_dict(g) for g in sweep.gaps(proposed_start=nxt.function.start)]
 
+        pending_partners = list(session.get("pending_partners") or [])
         primary_payload = _build_candidate_payload(
-            sweep, nxt.function, nxt.previous, attn=attn_addrs,
+            sweep, nxt.function, nxt.previous,
+            attn=attn_addrs, pending_partners=pending_partners,
         )
 
         # Natural pane (for split view) — only when override is active AND
@@ -689,6 +773,70 @@ def unpin_all():
     return jsonify({"ok": True, "had_override": had_override})
 
 
+@app.route("/queue-partner", methods=["POST"])
+def queue_partner():
+    """Queue a partner address for the next /verdict approve.  Toggles
+    if the addr is already queued.  Pure session mutation — no yaml
+    write until approve is clicked.
+
+    Used by the UI's '+ Partner FUN_xxxxxxxx' button.  Multiple partners
+    can be queued for one approve.
+    """
+    data = request.get_json(force=True)
+    raw = data.get("partner")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'partner'"}), 400
+    try:
+        addr = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    with LOCK:
+        session = load_session()
+        pending = list(session.get("pending_partners") or [])
+        if addr in pending:
+            pending.remove(addr)
+            action = "removed"
+        else:
+            pending.append(addr)
+            action = "added"
+        session["pending_partners"] = pending
+        save_session(session)
+    return jsonify({"ok": True, "action": action, "pending_partners": [f"0x{p:08X}" for p in pending]})
+
+
+@app.route("/add-partner", methods=["POST"])
+def add_partner():
+    """Add a partner cross-reference to an EXISTING stamped subseg.
+    For retroactive partnering — when a relationship is discovered
+    after both functions have already been stamped.
+
+    Symmetric: also adds the back-reference on the partner's subseg
+    (if it exists in the yaml).  Idempotent.
+    """
+    data = request.get_json(force=True)
+    raw_a = data.get("start")
+    raw_b = data.get("partner")
+    if raw_a is None or raw_b is None:
+        return jsonify({"ok": False, "error": "need 'start' and 'partner'"}), 400
+    try:
+        a = analyzer._coerce_addr(raw_a)
+        b = analyzer._coerce_addr(raw_b)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    if a == b:
+        return jsonify({"ok": False, "error": "a function can't partner with itself"}), 400
+    with LOCK:
+        ok_a = _add_partner_to_existing_subseg(a, b)
+        ok_b = _add_partner_to_existing_subseg(b, a)
+    if not ok_a:
+        return jsonify({"ok": False, "error": f"no subseg at 0x{a:08X}"}), 404
+    return jsonify({
+        "ok": True,
+        "updated": [f"0x{a:08X}"] + ([f"0x{b:08X}"] if ok_b else []),
+        "back_ref_skipped": not ok_b,
+    })
+
+
 @app.route("/unstamp", methods=["POST"])
 def unstamp():
     """Re-dirty a previously verified subseg so forward-sweep proposes
@@ -846,11 +994,37 @@ def verdict():
         tus = cfg.get("tus") or []
         tu = next((t for t in tus if t["start"] <= nxt.function.start <= t["end"]), None)
         file_name = tu["name"] if tu else f"tu_{nxt.function.start:08X}"
-        _append_subseg_to_yaml(nxt.function.start, nxt.function.end, file_name)
+
+        # Partners come from two sources, unioned:
+        #   1. pending_partners staged via /queue-partner before approval
+        #   2. existing stamps whose partners list already includes this
+        #      candidate's start (auto back-reference)
+        pending_partners = list(session.get("pending_partners") or [])
+        auto_back_refs = []
+        for s in sweep.verified:
+            if nxt.function.start in (s.partners or []):
+                auto_back_refs.append(s.start)
+        all_partners = sorted(set(pending_partners) | set(auto_back_refs))
+
+        _append_subseg_to_yaml(
+            nxt.function.start, nxt.function.end, file_name,
+            partners=all_partners,
+        )
+        # Forward cross-reference: for every partner queued (or auto-found),
+        # add this candidate's start to their partners list (if they're
+        # already stamped).  The pending_partners user-queued addrs may
+        # NOT be stamped yet — those back-refs get added when those
+        # functions themselves get approved (the auto_back_refs path
+        # above catches that on the other side).
+        for p in all_partners:
+            _add_partner_to_existing_subseg(p, nxt.function.start)
+
+        session["pending_partners"] = []   # clear queue after approve
         save_session(session)
         return jsonify({
             "ok": True,
             "absorbed": [f"0x{s:08X}" for s, _ in absorbed],
+            "partners": [f"0x{p:08X}" for p in all_partners],
         })
 
 

@@ -162,6 +162,19 @@ function renderProgress(s) {
 // Per-pane banner: full candidate metadata for one side of the diff.
 // `paneLabel` is "AI OVERRIDE" or "ORACLE NATURAL" (or empty when no
 // override is active and only the primary pane is shown).
+function partnersHtml(candidate) {
+  const parts = [];
+  if (candidate.partners && candidate.partners.length) {
+    const names = candidate.partners.map(p => `FUN_${p.addr_hex}`).join(', ');
+    parts.push(`<span class="partners">Partner of ${escapeHtml(names)}</span>`);
+  }
+  if (candidate.pending_partners && candidate.pending_partners.length) {
+    const names = candidate.pending_partners.map(p => `FUN_${p.addr_hex}`).join(', ');
+    parts.push(`<span class="partners pending">Queued partner: ${escapeHtml(names)}</span>`);
+  }
+  return parts.join('');
+}
+
 function renderCandidateBanner(target, candidate, prev, paneLabel) {
   if (!candidate) {
     target.innerHTML = '';
@@ -181,6 +194,7 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     ${referenceHtml(c.reference)}
     ${evidenceHtml(c.evidence)}
     ${prev ? `<span class="prev">after ${prev.name}</span>` : ''}
+    ${partnersHtml(c)}
     ${flagsHtml}
   `;
 }

@@ -368,6 +368,7 @@ class VerifiedSubseg:
     end: int
     type: str = "code"
     file: str = ""
+    partners: list = field(default_factory=list)   # other subseg start addrs forming the same logical C fn
 
 
 @dataclass
@@ -2732,6 +2733,7 @@ class SweepState:
                 end=s["end"],
                 type=s.get("type", "code"),
                 file=s.get("file", ""),
+                partners=[_coerce_addr(p) for p in (s.get("partners") or [])],
             )
             for s in (yaml_cfg.get("subsegments") or [])
             if s.get("type") == "code"

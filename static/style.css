@@ -87,6 +87,22 @@ header#header > #header-content {
 .addr { color: #888; }
 .size { color: #888; }
 .prev { color: #888; font-size: 11px; }
+.partners {
+  display: inline-block;
+  background: #2a4a3a;
+  color: #9ed;
+  padding: 0.1em 0.5em;
+  margin-left: 0.4em;
+  border-radius: 0.2em;
+  border: 1px solid #4a8a6a;
+  font-size: 11px;
+}
+.partners.pending {
+  background: #4a4a2a;
+  color: #ec9;
+  border-color: #8a8a4a;
+  font-style: italic;
+}
 .flags .flag {
   background: #4a3f2a;
   color: #fc9;
