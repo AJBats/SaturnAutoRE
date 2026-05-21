@@ -84,9 +84,39 @@ function evidenceHtml(e) {
   return parts.join('');
 }
 
+// ANALYZE MODE banner — reuses the .gap-alert DOM slot but with orange
+// styling (.analyze-mode class).  Driven by /state.analyze_mode payload.
+function renderAnalyzeBanner(am) {
+  const el = document.getElementById('gap-alert');
+  if (!el) return;
+  if (!am) return;  // caller handles non-analyze-mode case
+  el.classList.remove('hidden');
+  el.classList.add('analyze-mode');
+  const blocks = am.blocks_summary || [];
+  const active = am.active_block || 0;
+  const items = blocks.map((b, i) => `
+    <li class="${i === active ? 'active' : ''}">
+      Block ${i + 1} of ${blocks.length}:
+      <code>0x${b.start_hex} - 0x${b.end_hex}</code>
+      <span class="gap-size">(${b.size} bytes)</span>
+      ${i === active ? ' &larr; viewing' : ''}
+    </li>
+  `).join('');
+  const label = am.label ? ` &mdash; ${escapeHtml(am.label)}` : '';
+  el.innerHTML = `
+    <div class="gap-alert-title">
+      ANALYZE MODE${label}
+    </div>
+    <ul class="analyze-block-list">${items}</ul>
+  `;
+}
+
 function renderGapAlert(gaps) {
   const el = document.getElementById('gap-alert');
   if (!el) return;
+  // Clear analyze-mode styling whenever we touch this element via the
+  // gap-alert renderer (analyze_mode is rendered via a sibling helper).
+  el.classList.remove('analyze-mode');
   if (!gaps || gaps.length === 0) {
     el.classList.add('hidden');
     el.innerHTML = '';
@@ -132,6 +162,47 @@ function renderProgress(s) {
 // Per-pane banner: full candidate metadata for one side of the diff.
 // `paneLabel` is "AI OVERRIDE" or "ORACLE NATURAL" (or empty when no
 // override is active and only the primary pane is shown).
+function renderPartnerButtons(candidate) {
+  const el = document.getElementById('partner-buttons');
+  if (!el) return;
+  if (!candidate) {
+    el.innerHTML = '';
+    return;
+  }
+  const suggestions = candidate.suggested_partners || [];
+  // Already-confirmed partners shouldn't re-render as suggestion buttons.
+  const confirmed = new Set((candidate.partners || []).map(p => p.addr));
+  // Queued partners get a "pressed" visual state — second click cancels.
+  const queued = new Set((candidate.pending_partners || []).map(p => p.addr));
+  const buttons = suggestions
+    .filter(s => !confirmed.has(s.addr))
+    .map(s => {
+      const isQueued = queued.has(s.addr);
+      const klass = isQueued ? 'partner-btn pressed' : 'partner-btn';
+      const tip = s.reason ? ` title="${escapeHtml(s.reason)}"` : '';
+      return `<button class="${klass}" data-partner="${s.addr}"${tip}>+ Partner FUN_${s.addr_hex}</button>`;
+    })
+    .join('');
+  el.innerHTML = buttons;
+}
+
+function partnersHtml(candidate) {
+  const parts = [];
+  if (candidate.partners && candidate.partners.length) {
+    const names = candidate.partners.map(p => `FUN_${p.addr_hex}`).join(', ');
+    const balanced = candidate.partner_balanced;
+    const klass = balanced ? 'partners balanced' : 'partners';
+    const tick = balanced ? '✓ ' : '';
+    const suffix = balanced ? ' (frame balanced)' : '';
+    parts.push(`<span class="${klass}">${tick}Partner of ${escapeHtml(names)}${suffix}</span>`);
+  }
+  if (candidate.pending_partners && candidate.pending_partners.length) {
+    const names = candidate.pending_partners.map(p => `FUN_${p.addr_hex}`).join(', ');
+    parts.push(`<span class="partners pending">Queued partner: ${escapeHtml(names)}</span>`);
+  }
+  return parts.join('');
+}
+
 function renderCandidateBanner(target, candidate, prev, paneLabel) {
   if (!candidate) {
     target.innerHTML = '';
@@ -151,6 +222,7 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     ${referenceHtml(c.reference)}
     ${evidenceHtml(c.evidence)}
     ${prev ? `<span class="prev">after ${prev.name}</span>` : ''}
+    ${partnersHtml(c)}
     ${flagsHtml}
   `;
 }
@@ -542,7 +614,24 @@ async function fetchState() {
     const s = await r.json();
 
     renderProgress(s);
-    renderGapAlert(s.internal_gaps);
+    if (s.analyze_mode) {
+      renderAnalyzeBanner(s.analyze_mode);
+    } else {
+      renderGapAlert(s.internal_gaps);
+    }
+    // Swap footer button rows based on mode.
+    document.getElementById('verdict-row').classList.toggle('hidden', !!s.analyze_mode);
+    document.getElementById('analyze-row').classList.toggle('hidden', !s.analyze_mode);
+    if (s.analyze_mode) {
+      const am = s.analyze_mode;
+      const cur = am.blocks_summary[am.active_block];
+      document.getElementById('analyze-status').textContent =
+        `block ${am.active_block + 1} of ${am.block_count} — 0x${cur.start_hex} → 0x${cur.end_hex}`;
+    }
+    // Render "+ Partner FUN_X" buttons in the verdict row, one per
+    // suggestion.  Pressed state reflects whether the addr is already
+    // queued (so a second click acts as toggle/cancel).
+    renderPartnerButtons(s.candidate);
 
     const primaryListing = document.getElementById('listing');
     const primaryBanner  = document.getElementById('banner-primary');
@@ -700,6 +789,24 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-reject').addEventListener('click',  () => submitVerdict('rejected'));
   document.getElementById('btn-unsure').addEventListener('click',  () => submitVerdict('unsure'));
 
+  // Partner buttons (delegated — re-rendered on every state poll).
+  document.getElementById('partner-buttons').addEventListener('click', async (e) => {
+    const btn = e.target.closest('.partner-btn');
+    if (!btn) return;
+    const addr = parseInt(btn.dataset.partner, 10);
+    const r = await fetch('/queue-partner', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({partner: '0x' + addr.toString(16).toUpperCase().padStart(8, '0')}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setStatus('queue-partner rejected: ' + (data.error || 'unknown'));
+      return;
+    }
+    fetchState();
+  });
+
   // Pin-zone clicks: + button in any line's leftmost margin → POST
   // /pin-end with that row's addr.  Server sets the current
   // candidate's `candidate_end` to addr-1 (= "the next function
@@ -790,10 +897,40 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener('keydown', (e) => {
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+    const analyzeRowVisible = !document.getElementById('analyze-row').classList.contains('hidden');
+    if (analyzeRowVisible) {
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); document.getElementById('btn-analyze-prev').click(); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); document.getElementById('btn-analyze-next').click(); }
+      // 1/2/3 stay disabled in analyze mode — server returns 409 anyway.
+      return;
+    }
     if (e.key === '1') { e.preventDefault(); document.getElementById('btn-approve').click(); }
     else if (e.key === '2') { e.preventDefault(); document.getElementById('btn-reject').click(); }
     else if (e.key === '3') { e.preventDefault(); document.getElementById('btn-unsure').click(); }
   });
+
+  // Analyze-mode button wiring.
+  async function analyzeCycle(direction) {
+    const r = await fetch('/analyze-mode/cycle', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({direction}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setStatus('analyze cycle rejected: ' + (data.error || 'unknown'));
+      return;
+    }
+    fetchState();
+  }
+  async function analyzeExit() {
+    const r = await fetch('/analyze-mode/clear', {method: 'POST'});
+    await r.json();
+    fetchState();
+  }
+  document.getElementById('btn-analyze-prev').addEventListener('click', () => analyzeCycle('prev'));
+  document.getElementById('btn-analyze-next').addEventListener('click', () => analyzeCycle('next'));
+  document.getElementById('btn-analyze-exit').addEventListener('click', analyzeExit);
 
   // Wire arc hover/click delegation once
   wireArcEvents();
