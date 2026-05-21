@@ -2270,9 +2270,20 @@ class BinaryModel:
                 pool_targets.append(tgt)
 
         # 9. Verdict.
+        # Suppress the "conditional rts" warning when this function is
+        # a switch case body (start is a known case target).  Absorbed
+        # sibling case bodies legitimately have one rts each — they're
+        # each case's natural exit, not "conditional returns mid-
+        # function" the way the flag implies.  Clear the list BEFORE
+        # _verdict so the verdict score (and HIGH/MEDIUM bucketing)
+        # reflect the suppression.
+        if start in self.switch_dispatcher_of:
+            conditional_rts_for_verdict = []
+        else:
+            conditional_rts_for_verdict = conditional_rts
         verdict_str, yellow = _verdict(
             saved, stack_alloc, restored, stack_dealloc,
-            final_rts, branches, conditional_rts,
+            final_rts, branches, conditional_rts_for_verdict,
         )
         flags.extend(yellow)
         try:
