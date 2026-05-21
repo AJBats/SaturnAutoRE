@@ -212,6 +212,7 @@ class FunctionAnalysis:
     prologue_saved: list                 # ['r14', 'r13', ..., 'pr', 'macl']
     prologue_stack: int                  # bytes reserved (negative add #-N, r15)
     prologue_restored: list = field(default_factory=list)  # mirror of prologue_saved restored in epilogue
+    prologue_restored_extras: list = field(default_factory=list)  # epilogue pops that DON'T match a prologue push (caller-frame unwinds)
     epilogue_range: tuple = (None, None) # (start, end_inclusive) or (None, None)
     final_exit: Optional[int] = None     # addr of rts/jmp/braf/bra whose delay slot is at end-1
     delay_slot: Optional[int] = None     # addr of the delay-slot instruction
@@ -232,6 +233,7 @@ class FunctionAnalysis:
     # ----- Verdict
     verdict: Verdict = Verdict.UNKNOWN
     yellow_flags: list = field(default_factory=list)
+    partner_balanced: bool = False        # set by SweepState.apply_partner_awareness when partners resolve combined frame balance
 
     # ----- Reference / midpoint / evidence
     reference: Optional[ReferenceAgreement] = None
@@ -468,6 +470,26 @@ def _is_macl_push(mnem): return mnem == "sts.l macl, @-r15"
 def _is_macl_pop(mnem):  return mnem == "lds.l @r15+, macl"
 
 
+def _ctrl_push(mnem):
+    """If mnem is `stc.l <ctrl>, @-r15` (gbr/vbr/sr) return ctrl name."""
+    if not mnem.startswith("stc.l "):
+        return None
+    parts = mnem.split()
+    if len(parts) != 3 or parts[2] != "@-r15":
+        return None
+    return parts[1].rstrip(",")
+
+
+def _ctrl_pop(mnem):
+    """If mnem is `ldc.l @r15+, <ctrl>` (gbr/vbr/sr) return ctrl name."""
+    if not mnem.startswith("ldc.l @r15+, "):
+        return None
+    parts = mnem.split()
+    if len(parts) != 3:
+        return None
+    return parts[2]
+
+
 def _is_stack_alloc(mnem):
     """add #-N, r15 — returns N (positive) or None."""
     if not mnem.startswith("add #-"):
@@ -594,6 +616,10 @@ def _walk_prologue(binary, vram, start):
             saved.append("macl")
             last_prologue = addr
             consecutive_non_prologue = 0
+        elif _ctrl_push(mnem) is not None:
+            saved.append(_ctrl_push(mnem))
+            last_prologue = addr
+            consecutive_non_prologue = 0
         elif _is_stack_alloc(mnem) is not None:
             stack = _is_stack_alloc(mnem)
             last_prologue = addr
@@ -606,6 +632,77 @@ def _walk_prologue(binary, vram, start):
         addr += 2
 
     return last_prologue, saved, stack, flags
+
+
+def _walk_epilogue_pops_all(binary, vram, end):
+    """Walk backward from `end` (last byte of function) collecting EVERY
+    register pop in the epilogue zone, regardless of whether it matches
+    the prologue's saved list.
+
+    Complementary to _walk_epilogue_backward which uses strict matching
+    and stops the first time a pop doesn't correspond to a prologue
+    push.  This helper collects the FULL pop sequence so callers
+    (specifically the partner-aware verdict in SweepState) can detect
+    pops that unwind a CALLER's stack frame — the canonical signal for
+    "this function is half of a multi-block C function whose other
+    half pushed these regs."
+
+    Returns a list of register names in BACKWARD walk order (last pop
+    in execution first).  Order is informational; the partner-aware
+    code consumes it as a set.
+    """
+    delay_slot = end - 1
+    rts_addr = delay_slot - 2
+    op_rts = _read_opcode(binary, vram, rts_addr)
+    if op_rts is None:
+        return []
+    mnem_rts, _ = _decode_sh2(op_rts, rts_addr)
+    if mnem_rts is None:
+        return []
+    exit_head = mnem_rts.split()[0]
+    if exit_head not in ("rts", "jmp", "braf", "bra"):
+        return []
+
+    pops: list = []
+
+    def _pop_reg_of(m):
+        return (_pop_register(m)
+                or ("pr" if _is_pr_pop(m) else None)
+                or ("macl" if _is_macl_pop(m) else None)
+                or _ctrl_pop(m))
+
+    # Check the delay slot — GCC schedules an epilogue pop here sometimes.
+    op_ds = _read_opcode(binary, vram, delay_slot)
+    if op_ds is not None:
+        mnem_ds, _ = _decode_sh2(op_ds, delay_slot)
+        if mnem_ds:
+            reg = _pop_reg_of(mnem_ds)
+            if reg:
+                pops.append(reg)
+
+    # Walk backward from the instruction immediately before rts, picking
+    # up consecutive pops + dealloc instructions.  Stop at the first
+    # non-pop, non-dealloc — that's the body proper.
+    cur = rts_addr - 2
+    binary_end = vram + len(binary) - 1
+    while cur >= vram and cur <= binary_end:
+        op = _read_opcode(binary, vram, cur)
+        if op is None:
+            break
+        m, _ = _decode_sh2(op, cur)
+        if m is None:
+            break
+        reg = _pop_reg_of(m)
+        if reg is not None:
+            pops.append(reg)
+            cur -= 2
+            continue
+        if _is_stack_dealloc(m):
+            cur -= 2
+            continue
+        break
+
+    return pops
 
 
 def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
@@ -2026,6 +2123,14 @@ class BinaryModel:
         )
         epilogue_range = (epi_start, code_end) if epi_start is not None else (None, None)
 
+        # 3b. Complementary "all pops" scan — captures pops the strict
+        # walker dismissed (i.e., pops that don't match any prologue
+        # push because they unwind the CALLER's stack frame).  Used by
+        # partner-aware verdict to detect frames balanced across a
+        # multi-block function pair.
+        all_pops = _walk_epilogue_pops_all(binary, vram, code_end)
+        restored_extras = [r for r in all_pops if r not in set(restored)]
+
         # 4. Augment `restored` with PR / MACL pops anywhere in reachable.
         # GCC will cycle-schedule the restore early, placing it OUTSIDE the
         # contiguous-epilogue window the backward walker tracks.  Without
@@ -2139,6 +2244,7 @@ class BinaryModel:
             prologue_saved=saved,
             prologue_stack=stack_alloc,
             prologue_restored=restored,
+            prologue_restored_extras=restored_extras,
             epilogue_range=epilogue_range,
             final_exit=final_rts,
             delay_slot=delay_slot,
@@ -2765,40 +2871,50 @@ class SweepState:
 
     def apply_partner_awareness(self, fa: FunctionAnalysis) -> FunctionAnalysis:
         """When `fa`'s yaml subseg declares partners, compute the
-        UNION of saved/restored registers across the function and all
-        its partners.  If the combined frame is balanced (saved set ==
-        restored set), the local imbalance yellow flag is suppressed
-        and the verdict is bumped from MEDIUM to HIGH (if MEDIUM was
-        solely caused by the imbalance).
+        UNION of pushes vs pops across the function and all stamped
+        partners — using prologue_saved + prologue_restored +
+        prologue_restored_extras (the latter catches pops that unwind
+        the caller's frame, which the strict epilogue walker
+        otherwise ignores).
 
-        Partners that aren't stamped yet (or can't be analyzed) are
-        silently skipped — the flag stays in that case so the user
-        still sees the issue until the other half is stamped too.
+        If the combined frame balances (pushes set == pops set):
+          - imbalance yellow flags get suppressed
+          - verdict bumps from MEDIUM to HIGH (when MEDIUM was solely
+            driven by the imbalance)
+          - fa.partner_balanced becomes True (frontend renders a green
+            "✓ balanced via partner" chip)
 
-        Returns a fresh FunctionAnalysis (via _dc_replace) when changes
-        apply, else returns `fa` unchanged.
+        Partners not yet stamped are silently skipped.  Returns a
+        fresh FunctionAnalysis (via _dc_replace) when changes apply,
+        else returns `fa` unchanged.
         """
         own = next((s for s in self.verified if s.start == fa.start), None)
         if own is None or not own.partners:
             return fa
 
-        combined_saved = set(fa.prologue_saved or [])
-        combined_restored = set(fa.prologue_restored or [])
+        combined_pushes = set(fa.prologue_saved or [])
+        combined_pops = set(fa.prologue_restored or []) | set(fa.prologue_restored_extras or [])
+        any_unstamped = False
         for p in own.partners:
             partner_sub = next((s for s in self.verified if s.start == p), None)
             if partner_sub is None:
-                continue   # partner not stamped yet
+                any_unstamped = True
+                continue
             try:
                 partner_fa = self.model.analyze_function(p, hint_end=partner_sub.end)
             except Exception:
                 continue
-            combined_saved |= set(partner_fa.prologue_saved or [])
-            combined_restored |= set(partner_fa.prologue_restored or [])
+            combined_pushes |= set(partner_fa.prologue_saved or [])
+            combined_pops |= (
+                set(partner_fa.prologue_restored or [])
+                | set(partner_fa.prologue_restored_extras or [])
+            )
 
-        if combined_saved != combined_restored:
-            return fa   # partners declared but combined frame still imbalanced
+        if any_unstamped or combined_pushes != combined_pops:
+            return fa
 
-        # Filter the local imbalance flags out.
+        # Combined frame is balanced — suppress imbalance flags, bump
+        # verdict, mark as partner-balanced for banner display.
         IMBALANCE_MARKERS = (
             "prologue/epilogue register order mismatch",
             "critical: prologue pushed",
@@ -2808,11 +2924,14 @@ class SweepState:
             if not any(m in f for m in IMBALANCE_MARKERS)
         ]
         new_verdict = fa.verdict
-        # Bump MEDIUM → HIGH when no flags remain after suppression
-        # (the imbalance was the only thing dragging the verdict down).
         if fa.verdict == Verdict.MEDIUM and not new_flags:
             new_verdict = Verdict.HIGH
-        return _dc_replace(fa, yellow_flags=new_flags, verdict=new_verdict)
+        return _dc_replace(
+            fa,
+            yellow_flags=new_flags,
+            verdict=new_verdict,
+            partner_balanced=True,
+        )
 
     def suggested_partners(self, fa: FunctionAnalysis) -> list:
         """Suggest partner addresses for `fa` based on stack imbalance +
@@ -2839,7 +2958,11 @@ class SweepState:
         Empty list means the function is balanced — no partner needed.
         """
         saved = set(fa.prologue_saved or [])
-        restored = set(fa.prologue_restored or [])
+        # Include extras so case-body-style functions (which pop the
+        # caller's frame regs via epilogue but never push them) get
+        # their imbalance detected.  Strict-walker restored only
+        # contains pops matching the prologue.
+        restored = set(fa.prologue_restored or []) | set(fa.prologue_restored_extras or [])
         saves_without_restores = saved - restored
         restores_without_saves = restored - saved
 
@@ -3100,6 +3223,33 @@ class SweepState:
                 seen_srcs.add(src_pc)
                 result.setdefault(tgt, {}).setdefault(fn_start, 0)
                 result[tgt][fn_start] += 1
+            # Switch case targets — the walker only records in-range
+            # ones in fa.branches.  Out-of-range case targets are the
+            # interesting ones for cross-function call attribution
+            # (e.g., a dispatcher's switch table points at case bodies
+            # in another TU).
+            binary = self.model.binary
+            vram = self.model.vram
+            pool_priors = self.model.pool_priors_dict()
+            for ind_src in (fa.indirect_calls or []):
+                op = _read_opcode(binary, vram, ind_src)
+                if op is None:
+                    continue
+                m, _ = _decode_sh2(op, ind_src)
+                if m is None:
+                    continue
+                head = m.split()[0]
+                if head == "jmp":
+                    all_cases = _detect_mov_l_jmp_switch_targets(binary, vram, ind_src)
+                elif head == "braf":
+                    all_cases = _detect_braf_switch_targets(binary, vram, ind_src, pool_priors)
+                else:
+                    continue
+                for t in set(all_cases):
+                    if fa.start <= t <= fa.end:
+                        continue
+                    result.setdefault(t, {}).setdefault(fn_start, 0)
+                    result[t][fn_start] += 1
 
         for sub in self._verified_for_hints():
             _harvest(sub.start, sub.end)

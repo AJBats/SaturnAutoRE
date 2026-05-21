@@ -499,6 +499,7 @@ def _candidate_to_dict(fa, partners=None, pending_partners=None,
             {"addr": p, "addr_hex": f"{p:08X}"} for p in (pending_partners or [])
         ],
         "suggested_partners": list(suggested_partners or []),
+        "partner_balanced": bool(getattr(fa, "partner_balanced", False)),
     }
 
 

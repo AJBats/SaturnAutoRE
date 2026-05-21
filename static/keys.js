@@ -190,7 +190,11 @@ function partnersHtml(candidate) {
   const parts = [];
   if (candidate.partners && candidate.partners.length) {
     const names = candidate.partners.map(p => `FUN_${p.addr_hex}`).join(', ');
-    parts.push(`<span class="partners">Partner of ${escapeHtml(names)}</span>`);
+    const balanced = candidate.partner_balanced;
+    const klass = balanced ? 'partners balanced' : 'partners';
+    const tick = balanced ? '✓ ' : '';
+    const suffix = balanced ? ' (frame balanced)' : '';
+    parts.push(`<span class="${klass}">${tick}Partner of ${escapeHtml(names)}${suffix}</span>`);
   }
   if (candidate.pending_partners && candidate.pending_partners.length) {
     const names = candidate.pending_partners.map(p => `FUN_${p.addr_hex}`).join(', ');

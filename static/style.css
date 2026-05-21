@@ -103,6 +103,12 @@ header#header > #header-content {
   border-color: #8a8a4a;
   font-style: italic;
 }
+.partners.balanced {
+  background: #2e6a3a;
+  color: #cfc;
+  border-color: #6cb073;
+  font-weight: bold;
+}
 .flags .flag {
   background: #4a3f2a;
   color: #fc9;
