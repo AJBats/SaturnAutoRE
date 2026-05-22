@@ -265,6 +265,7 @@ def _build_sweep(session):
         model, cfg,
         ai_override=session.get("ai_override"),
         analyze_mode=session.get("analyze_mode"),
+        frontier_simulation=session.get("frontier_simulation", False),
     )
 
 
@@ -438,6 +439,13 @@ def _row_to_dict(row):
             "type": row.branch_type,
             "direction": row.branch_direction,
         }
+    # Walker-stop confidence on bra/jmp/braf rows — drives tag tooltip
+    # in the frontend.  Only set for instruction rows the walker
+    # examined as potential tail calls.
+    if row.tag_tooltip and is_function_section:
+        out["tag_tooltip"] = row.tag_tooltip
+    if row.stop_confidence and is_function_section:
+        out["stop_confidence"] = row.stop_confidence
     return out
 
 
@@ -670,6 +678,7 @@ def state():
             "progress": progress,
             "internal_gaps": internal_gaps,
             "analyze_mode": _analyze_mode_to_dict(analyze_mode) if analyze_mode else None,
+            "frontier_simulation": bool(session.get("frontier_simulation", False)),
         })
 
 
@@ -700,9 +709,12 @@ def pin_end():
                 "error": (f"next_start 0x{next_start:08X} must be after candidate "
                           f"start 0x{nxt.function.start:08X}"),
             }), 400
-        # Reject if next_start lands inside an already-verified subseg.
+        # Reject if next_start lands STRICTLY INSIDE an already-verified
+        # subseg.  Pinning AT an existing stamp's start is fine — that's
+        # the user saying "my candidate ends right before this next
+        # function begins," which is exactly the adjacency we want.
         for s in sweep.verified:
-            if s.start <= next_start <= s.end:
+            if s.start < next_start <= s.end:
                 return jsonify({
                     "ok": False,
                     "error": f"next_start 0x{next_start:08X} is inside verified subseg FUN_{s.start:08X}",
@@ -792,6 +804,24 @@ def unpin_all():
         session["ai_override"] = None
         save_session(session)
     return jsonify({"ok": True, "had_override": had_override})
+
+
+@app.route("/frontier/toggle", methods=["POST"])
+def frontier_toggle():
+    """Flip the frontier_simulation flag.  When on, the walker is
+    capped only by natural CFG termination — future stamps don't leak
+    into the cap.  Use during audit walks to see what the analyzer
+    would propose if THIS were the next unswept function."""
+    data = request.get_json(force=True) or {}
+    with LOCK:
+        session = load_session()
+        if "on" in data:
+            new_val = bool(data["on"])
+        else:
+            new_val = not bool(session.get("frontier_simulation", False))
+        session["frontier_simulation"] = new_val
+        save_session(session)
+    return jsonify({"ok": True, "frontier_simulation": new_val})
 
 
 @app.route("/queue-partner", methods=["POST"])

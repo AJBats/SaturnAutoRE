@@ -307,6 +307,13 @@ header#header > #header-content {
 .tag.tag-ref-end {
   color: #e8a;
 }
+/* Walker-stop confidence on bra/jmp/braf rows.  Color-codes the rank
+   suffix the analyzer attached when it decided whether to halt or
+   absorb across a branch target.  Hover the tag for the tooltip with
+   the signals behind the decision. */
+.tag.tag-stop-high    { color: #ff8855; font-weight: bold; }   /* halt — strong */
+.tag.tag-stop-medium  { color: #fc8;    }                       /* halt — ambiguous */
+.tag.tag-stop-none    { color: #888;    font-style: italic; }   /* absorbed — no signal */
 
 /* Pin-zone: small `+` button in the leftmost margin of each addressed
    row.  Hidden by default, fades in on row hover.  Click → POST
@@ -630,6 +637,28 @@ footer#footer {
   color: #fff;
   border-color: #9eb;
 }
+
+.frontier-toggle {
+  background: #222;
+  color: #888;
+  border: 1px solid #444;
+  padding: 0.25em 0.7em;
+  border-radius: 0.2em;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+  margin-left: 1em;
+  letter-spacing: 0.05em;
+}
+.frontier-toggle:hover { background: #333; }
+.frontier-toggle.active {
+  background: #5a2222;
+  color: #fcc;
+  border-color: #c66;
+  font-weight: bold;
+}
+.frontier-toggle.active:hover { background: #6a2828; }
+
 .analyze-row {
   display: flex; gap: 0.6em; align-items: center;
 }

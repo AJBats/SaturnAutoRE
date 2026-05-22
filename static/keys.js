@@ -157,6 +157,12 @@ function renderProgress(s) {
   } else {
     el.innerHTML = progressHtml(s.progress);
   }
+  const btn = document.getElementById('btn-frontier');
+  if (btn) {
+    const on = !!s.frontier_simulation;
+    btn.textContent = on ? 'FRONTIER: ON' : 'FRONTIER: OFF';
+    btn.classList.toggle('active', on);
+  }
 }
 
 // Per-pane banner: full candidate metadata for one side of the diff.
@@ -367,10 +373,17 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
       addrHtml = escapeHtml(addrStr);
     }
     if (line.kind === 'label') {
+      // Label rows have zero bytes themselves — they're anchor markers
+      // above an instruction at the same address.  Clicking `+` on a
+      // label still means "this address is where the next function
+      // starts," which is exclusive (data-bytes-len=0 → next_start =
+      // addr → end at addr - 1).  Distinct from clicking `+` on an
+      // instruction row, which is inclusive (includes through that
+      // row's last byte).
       const labelPinPart = line.addr
-        ? `<span class="pin-zone" title="pin current candidate's end at the byte before this address">+</span>`
+        ? `<span class="pin-zone" title="treat this label's address as the next function's start; pin end at addr - 1">+</span>`
         : `<span class="pin-zone"></span>`;
-      return `<span class="line ${cls}" data-addr="${line.addr || ''}">${labelPinPart}<span class="margin"> </span>${indentSpan}<span class="lbl">${escapeHtml(line.label)}</span></span>`;
+      return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="0">${labelPinPart}<span class="margin"> </span>${indentSpan}<span class="lbl">${escapeHtml(line.label)}</span></span>`;
     }
     const margin = line.margin || ' ';
     const labelPart = line.label
@@ -382,9 +395,14 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
     // ended in reference's view).
     let tagText = line.tag || '';
     if (isRefEnd) tagText = tagText ? `${tagText}  ref: next FUN` : 'ref: next FUN';
-    const tagClass = isRefEnd ? 'tag tag-ref-end' : 'tag';
+    const tagClasses = ['tag'];
+    if (isRefEnd) tagClasses.push('tag-ref-end');
+    if (line.stop_confidence) tagClasses.push(`tag-stop-${line.stop_confidence.toLowerCase()}`);
+    const tooltipAttr = line.tag_tooltip
+      ? ` title="${escapeHtml(line.tag_tooltip)}"`
+      : '';
     const tagPart = tagText
-      ? `<span class="${tagClass}">${escapeHtml(tagText)}</span>`
+      ? `<span class="${tagClasses.join(' ')}"${tooltipAttr}>${escapeHtml(tagText)}</span>`
       : '';
     if (isPrimary && line.branch) {
       CURRENT_BRANCHES.push({
@@ -394,14 +412,22 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
         direction: line.branch.direction,
       });
     }
-    // Pin-zone: small `+` that appears in the leftmost margin on row
-    // hover.  Click → POST /pin-end with this row's addr, telling the
-    // server "the next function starts here" → current candidate's
-    // end pins to `addr - 1`.  Only on rows with a real addr.
+    // Pin-zone: small `+` in the leftmost margin on row hover.
+    //
+    // Inclusive semantics: clicking `+` on a row means "include THIS
+    // row in the function" — so the candidate end pins at the LAST
+    // BYTE of this row (= addr + bytes_len - 1).  Reads naturally
+    // top-to-bottom: the user reaches a line they want included,
+    // clicks `+`, function extends through that line.
+    //
+    // Byte length comes from the line's `bytes` field ("00 09" → 2,
+    // "01 02 03 04" → 4).  Stashed in data-bytes-len for the click
+    // handler.
+    const bytesLen = (line.bytes || '').trim().split(/\s+/).filter(Boolean).length;
     const pinPart = line.addr
-      ? `<span class="pin-zone" title="pin current candidate's end at the byte before this address">+</span>`
+      ? `<span class="pin-zone" title="include this row in the function; pin end at the last byte of this row">+</span>`
       : `<span class="pin-zone"></span>`;
-    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
+    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
   }).join('\n');
   target.innerHTML = html;
   if (isPrimary) {
@@ -838,22 +864,27 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!line) return;
     const addr = parseInt(line.dataset.addr, 10);
     if (Number.isNaN(addr) || addr <= 0) return;
-    const hex = '0x' + addr.toString(16).toUpperCase().padStart(8, '0');
+    const bytesLen = parseInt(line.dataset.bytesLen || '0', 10);
     // Route based on click position relative to the current candidate:
     //  - Above current start → pin-start (this addr becomes the new
-    //    function start; oracle computes the end from there).
-    //  - At or below current start → pin-end (this addr is where the
-    //    NEXT function starts, so current ends at addr - 1).
-    // Server-side comparisons against the live candidate state cover
-    // the edge cases (e.g. clicking at exact candidate start = noop
-    // via the "addr must be after start" validation).
+    //    function start).
+    //  - At or below current start → pin-end with INCLUSIVE semantics:
+    //    send next_start = addr + bytes_len.  Reads as "include
+    //    through this row's last byte" — clicking on the last
+    //    instruction the user wants in the function extends the end
+    //    through that row.  Label rows have bytes_len=0 → exclusive
+    //    behavior (label marks the next function's start).
+    // Server-side comparisons against the live candidate cover edge
+    // cases (clicking at the candidate start = noop via the "addr
+    // must be after start" validation).
     let url, body;
     if (LAST_CANDIDATE_START != null && addr < LAST_CANDIDATE_START) {
       url = '/pin-start';
-      body = {addr: hex};
+      body = {addr: '0x' + addr.toString(16).toUpperCase().padStart(8, '0')};
     } else {
+      const nextStart = addr + bytesLen;
       url = '/pin-end';
-      body = {next_start: hex};
+      body = {next_start: '0x' + nextStart.toString(16).toUpperCase().padStart(8, '0')};
     }
     const r = await fetch(url, {
       method: 'POST',
@@ -931,6 +962,11 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-analyze-prev').addEventListener('click', () => analyzeCycle('prev'));
   document.getElementById('btn-analyze-next').addEventListener('click', () => analyzeCycle('next'));
   document.getElementById('btn-analyze-exit').addEventListener('click', analyzeExit);
+
+  document.getElementById('btn-frontier').addEventListener('click', async () => {
+    await fetch('/frontier/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    fetchState();
+  });
 
   // Wire arc hover/click delegation once
   wireArcEvents();

@@ -149,6 +149,14 @@ class Branch:
     mnem: str                           # 'bra', 'bsr', 'bf', 'bf/s', 'jmp', 'jsr', etc.
     internal: bool                      # target inside [func.start, func.end]
     direction: Optional[str] = None     # 'forward' / 'backward' / None (for indirect)
+    # Walker-stop confidence at `target` (only set for uncond branches the
+    # walker considered as potential tail-call exits — bra and resolved
+    # single-target jmp/braf).  Switch-detected indirect branches don't
+    # get this — they're handled by switch absorption.  Used by the
+    # renderer to surface a confidence-scored row tag + tooltip on the
+    # walker's halt/continue decision.
+    stop_confidence: Optional[str] = None   # 'HIGH' / 'MEDIUM' / 'NONE' / None
+    stop_reasons: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +338,13 @@ class ListingRow:
 
     # ----- Indirect-target resolution annotation ("⇒ FUN_X" inline tail)
     indirect_resolved_label: str = ""    # "FUN_0602AB10" or "0x06037000" — empty if not applicable
+
+    # ----- Walker-stop confidence (only set on bra/jmp/braf rows the
+    # walker considered as potential tail-call exits).  Renderer reads
+    # `tag_tooltip` for hover-text and may color/style the tag based on
+    # `stop_confidence`.
+    stop_confidence: Optional[str] = None    # 'HIGH' / 'MEDIUM' / 'NONE' / None (not applicable)
+    tag_tooltip: str = ""                     # multi-line text for hover; reasons behind the tag
 
     # ----- Decoration flags (precedence already resolved: attn > midpoint > ref_end)
     is_attn: bool = False
@@ -548,6 +563,28 @@ def _read_opcode(binary, vram, addr):
     if off + 1 >= len(binary):
         return None
     return (binary[off] << 8) | binary[off + 1]
+
+
+def _count_leading_pushes(binary, vram, addr, *, max_scan=8):
+    """Count consecutive `mov.l rN, @-r15` pushes starting at `addr`.
+
+    Used as a "target opens with prologue" signal for walker-stop
+    decisions: when a bra/jmp lands on a cluster of stack pushes, the
+    target almost certainly is a real function entry — independent of
+    static-caller count.
+
+    Encoding: mov.l rm, @-rn = 0010 nnnn mmmm 0110.  We mask the 'n'
+    nibble to 15 (stack pointer) and accept any 'm'.
+    """
+    pushes = 0
+    for i in range(max_scan):
+        op = _read_opcode(binary, vram, addr + 2 * i)
+        if op is None:
+            break
+        if (op & 0xFF0F) != 0x2F06:
+            break
+        pushes += 1
+    return pushes
 
 
 def _looks_like_fn_start(mnem):
@@ -1051,12 +1088,24 @@ def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
 
 # ----- Control-flow walk + branch classification + pool extension ----------
 
-def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
+def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None,
+                       should_stop=None):
     """Walk reachable addresses from `start` via control flow.  Returns
     (reachable, max_reachable, branches, indirect_calls).
 
     Branches collected as analyzer.Branch records (internal=False initially;
-    set later by _classify_branch_internality)."""
+    set later by _classify_branch_internality).
+
+    `should_stop` is an optional callable(target_addr) -> (stop_bool,
+    confidence_str, reasons_list).  Called on uncond direct bra and
+    resolved single-target indirect jmp/braf.  When stop_bool is True
+    the walker treats the branch as a tail-call exit (doesn't push the
+    target to worklist).  The returned confidence + reasons get
+    attached to the Branch for renderer use regardless of follow/stop
+    decision — even NONE-confidence branches get the rank annotation.
+
+    Switch-detected indirect branches DON'T consult should_stop —
+    switch absorption is a separate explicit mechanism."""
     reachable = set()
     branches = []
     indirect = []
@@ -1081,7 +1130,6 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
             if head in _BRANCH_MNEMONICS:
                 tgt = _branch_target(mnem)
                 b = Branch(src=pc, target=tgt, mnem=head, internal=False)
-                branches.append(b)
                 # bsr is a CALL (control returns) — don't follow target, fall through after delay slot
                 is_call = head == "bsr"
                 # Don't follow branches whose target lands OUTSIDE this
@@ -1092,10 +1140,29 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
                 # bras_external flag count (and pollute the rendered
                 # branches list with unreachable source addresses).
                 in_range = (tgt is not None and start <= tgt <= hard_limit_addr)
+
+                # Walker-stop check for `bra` only (the canonical tail-
+                # call style).  Conditional branches (bf/bt/bf-s/bt-s)
+                # and calls (bsr) don't get the stop treatment — they
+                # don't transfer control unconditionally.
+                #
+                # Confidence is ALWAYS computed for `bra` so the row
+                # renderer can show the rank tag + tooltip regardless
+                # of whether the target is in-range.  The walker_stop
+                # decision (skip pushing to worklist) only applies for
+                # in-range targets — external bras already aren't
+                # followed.
+                walker_stop = False
+                if head == "bra" and should_stop is not None and tgt is not None:
+                    stop_decision, b.stop_confidence, b.stop_reasons = should_stop(tgt)
+                    if in_range:
+                        walker_stop = stop_decision
+                branches.append(b)
+
                 # delay-slot branches: bra, bsr, bf/s, bt/s
                 if head in {"bf/s", "bt/s", "bra", "bsr"}:
                     reachable.add(pc + 2)
-                    if in_range and tgt not in reachable and not is_call:
+                    if in_range and tgt not in reachable and not is_call and not walker_stop:
                         worklist.append(tgt)
                     if head == "bra":
                         # unconditional jump — control does NOT fall through past delay slot
@@ -1148,10 +1215,15 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None):
                             binary, vram, reachable, start, pc, mnem,
                         )
                         if resolved is not None:
-                            branches.append(Branch(
+                            b = Branch(
                                 src=pc, target=resolved, mnem=head, internal=False,
-                            ))
-                            if (start <= resolved <= hard_limit_addr
+                            )
+                            walker_stop = False
+                            if should_stop is not None:
+                                walker_stop, b.stop_confidence, b.stop_reasons = should_stop(resolved)
+                            branches.append(b)
+                            if (not walker_stop
+                                    and start <= resolved <= hard_limit_addr
                                     and resolved not in reachable):
                                 worklist.append(resolved)
                     # unconditional — terminates THIS linear walk; targets
@@ -2011,6 +2083,137 @@ class BinaryModel:
             cur_end = max(cur_end, sub_max)
         return absorbed
 
+    def walker_stop_confidence(
+        self,
+        addr: int,
+        *,
+        verified_starts: Optional[set] = None,
+    ) -> tuple:
+        """Score whether a CFG walker should STOP at `addr` when it
+        encounters a naked bra/jmp to it (treat the branch as a tail
+        call rather than absorbing the body at `addr`).
+
+        Distinct from `function_entry_confidence` — that's the richer
+        "is this any kind of entry?" question used for UI labeling.
+        This one specifically answers: "should the walker halt?"
+
+        Signal taxonomy for STOP decisions:
+
+          HIGH (strong stop):
+            - 2+ distinct static callers (v2 methodology: scan binary
+              for bsr/jsr opcodes filtered against pool data — robust,
+              not derived from external boundary guesses).  Multiple
+              independent call sites converge here, almost certainly
+              an externally-callable function being tail-called.
+            - User-stamped (only when verified_starts is supplied —
+              gates the circular logic for audit use).
+
+          MEDIUM:
+            - 1 static caller — ambiguous (could be the walker's own
+              function, could be a single external caller).
+
+          NONE: everything else.
+
+        Deliberately excluded as primary signals:
+          - switch_dispatcher_of: switch absorption is a separate,
+            explicit mechanism for "this case body IS part of this
+            function's CFG".  Not a halt signal.
+          - runtime_hits: derived from Ghidra-set BPs that inherit
+            Ghidra's hallucinated boundaries.  Empirical confirmation
+            that execution reached an address != confirmation the
+            address is an entry point.  Mentioned in reasons as a
+            corroborating signal but doesn't bump the level.
+          - reference_starts: Ghidra/auto-disassembler output produces
+            false midpoints.  Same treatment — corroborating, not
+            primary.
+        """
+        reasons = []
+        order = ["NONE", "MEDIUM", "HIGH"]
+        level = "NONE"
+
+        def _bump(new_level: str):
+            nonlocal level
+            if order.index(new_level) > order.index(level):
+                level = new_level
+
+        if verified_starts is not None and addr in verified_starts:
+            reasons.append("user-stamped function entry")
+            _bump("HIGH")
+
+        sc = self.static_callers.get(addr, 0)
+        if sc >= 2:
+            reasons.append(f"static callers: {sc}")
+            _bump("HIGH")
+        elif sc == 1:
+            reasons.append("static callers: 1")
+            _bump("MEDIUM")
+
+        # Corroborating-but-not-primary signals — shown in tooltip but
+        # don't bump the level (both derived from Ghidra-tainted
+        # sources).
+        rh = self.runtime_hits.get(addr, 0)
+        if rh > 0:
+            reasons.append(f"runtime hits: {rh} (corroborating)")
+        if addr in self.reference_starts:
+            reasons.append("reference declares as function (corroborating)")
+
+        return level, reasons
+
+    def function_entry_confidence(
+        self,
+        addr: int,
+        *,
+        include_reference: bool = False,
+        verified_starts: Optional[set] = None,
+    ) -> tuple:
+        """Score whether `addr` is a function entry point.  Used for
+        UI labeling / navigation — NOT for walker stop decisions
+        (see `walker_stop_confidence`).
+
+        Switch case targets count HIGH here because they're definitely
+        SOME kind of entry, even though they shouldn't trigger a
+        walker stop (switch absorption handles them).
+
+        Levels: HIGH / MEDIUM / LOW / NONE.
+
+        HIGH: switch_dispatcher_of, user-stamped, static_callers >= 2
+        MEDIUM: static_callers == 1
+        LOW (opt-in): reference_starts
+        """
+        reasons = []
+        order = ["NONE", "LOW", "MEDIUM", "HIGH"]
+        level = "NONE"
+
+        def _bump(new_level: str):
+            nonlocal level
+            if order.index(new_level) > order.index(level):
+                level = new_level
+
+        if verified_starts is not None and addr in verified_starts:
+            reasons.append("user-stamped function entry")
+            _bump("HIGH")
+        if addr in self.switch_dispatcher_of:
+            disps = self.switch_dispatcher_of[addr]
+            unique = sorted({d for d, _ in disps})
+            disp_str = ", ".join(f"FUN_{d:08X}" for d in unique[:3])
+            extra = "" if len(unique) <= 3 else f" (+{len(unique)-3} more)"
+            reasons.append(f"switch case target of {disp_str}{extra}")
+            _bump("HIGH")
+
+        sc = self.static_callers.get(addr, 0)
+        if sc >= 2:
+            reasons.append(f"static callers: {sc}")
+            _bump("HIGH")
+        elif sc == 1:
+            reasons.append("static callers: 1")
+            _bump("MEDIUM")
+
+        if include_reference and addr in self.reference_starts:
+            reasons.append("reference declares as function")
+            _bump("LOW")
+
+        return level, reasons
+
     def is_address_in_function(self, addr: int, fn: FunctionAnalysis) -> bool:
         """Cheap membership check — used by eval_server to validate pin
         requests without re-analyzing.
@@ -2163,8 +2366,19 @@ class BinaryModel:
 
         # 2. Control flow + branches.  Pool_priors lets the walker trace
         # switch-dispatch jump tables (braf r0 over a .short table).
+        # should_stop lets the walker halt at naked bra/jmp/braf whose
+        # target has function-entry signals — preventing over-absorption
+        # across what are conceptually tail-call boundaries.  Threshold
+        # is HIGH only (static_callers >= 2) — MEDIUM (single caller)
+        # is too noisy: many real internal branches target addresses
+        # with one static caller (the function we're walking).  MEDIUM
+        # gets surfaced in the tag tooltip as informational instead.
+        def _should_stop(tgt):
+            level, reasons = self.walker_stop_confidence(tgt)
+            return (level == "HIGH", level, reasons)
         reachable, max_reachable, branches, indirect = _control_flow_walk(
             binary, vram, start, hard_limit, pool_priors=pool_priors,
+            should_stop=_should_stop,
         )
 
         # 2b. Switch-cluster sibling absorption.  When `start` is a
@@ -2179,6 +2393,7 @@ class BinaryModel:
         for sib_start in sibling_walks:
             sub_reach, sub_max, sub_branches, sub_indirect = _control_flow_walk(
                 binary, vram, sib_start, hard_limit, pool_priors=pool_priors,
+                should_stop=_should_stop,
             )
             reachable |= sub_reach
             max_reachable = max(max_reachable, sub_max)
@@ -2948,10 +3163,17 @@ class SweepState:
                  yaml_cfg: dict,
                  ai_override: Optional[dict] = None,
                  analyze_mode: Optional[dict] = None,
+                 frontier_simulation: bool = False,
                  ):
         self.model = model
         self.yaml_cfg = yaml_cfg
         self.ai_override = dict(ai_override or {})
+        # Frontier simulation: pretend no future stamps exist when capping
+        # the walker.  Lets us audit "what would the analyzer do if THIS
+        # were the next unswept function?" — the cap would otherwise leak
+        # information from stamps that wouldn't exist yet at frontier
+        # time, making the walker look smarter than it actually is.
+        self.frontier_simulation = bool(frontier_simulation)
         # Analyze-mode blocks are treated as "virtual stamps" by the
         # outstanding-case-target scan: their switch dispatchers feed
         # into outstanding_case_of just like real verified subsegs do.
@@ -3098,7 +3320,13 @@ class SweepState:
         own approvals rather than from invented translation-unit
         boundaries — more authentic, and tracks the user's progress
         as they stamp more functions.
+
+        When `frontier_simulation` is on, returns None unconditionally
+        — simulates being at the unswept frontier where no future
+        stamps exist to constrain the walk.
         """
+        if self.frontier_simulation:
+            return None
         next_start = min(
             (s.start for s in self.verified if s.start > start),
             default=None,
@@ -3108,6 +3336,14 @@ class SweepState:
     def suggested_partners(self, fa: FunctionAnalysis) -> list:
         """Suggest partner addresses for `fa` based on stack imbalance +
         transfer signals.
+
+        Suppressed entirely in frontier_simulation mode — partner
+        suggestions are computed over whatever range the walker
+        produced, which in frontier mode is the wild-walk range
+        rather than the real function.  Surfacing partners off a
+        deliberately-over-absorbed range produces misleading hints
+        (e.g. matching the OVERREACH region's pops against unrelated
+        callers).  Frontier is an audit lens; keep it noise-free.
 
         Returns list of dicts: [{addr, addr_hex, reason}, ...].  Two
         analysis paths combine into the suggestion list:
@@ -3129,6 +3365,8 @@ class SweepState:
 
         Empty list means the function is balanced — no partner needed.
         """
+        if self.frontier_simulation:
+            return []
         saved = set(fa.prologue_saved or [])
         # Include extras so case-body-style functions (which pop the
         # caller's frame regs via epilogue but never push them) get
@@ -3591,6 +3829,19 @@ class SweepState:
         """
         attn_set = set(attn or [])
 
+        # Resolve the candidate's suggested-partner ranges once, so the
+        # walker-stop tooltip can disclose when a flagged tail-call target
+        # actually lies inside a partner the user is being suggested to
+        # absorb.  Surfaces the tension between "HIGH tail call" and
+        # "absorb as partner" rather than picking one signal silently.
+        partner_ranges = []
+        for p in self.suggested_partners(candidate):
+            try:
+                p_fa = self.model.analyze_function(p["addr"])
+                partner_ranges.append((p_fa.start, p_fa.end, p["addr_hex"]))
+            except Exception:
+                pass
+
         rows = []
         row_id = [0]  # mutable counter so _emit_* can bump it
 
@@ -3620,7 +3871,7 @@ class SweepState:
                 f"0x{previous.start:08X} → 0x{previous.end:08X}  ({size} bytes)",
                 anchor_addr=previous.start,
             )
-            self._emit_function_rows(rows, next_id, prev_fa, Section.PREV, attn_set, candidate)
+            self._emit_function_rows(rows, next_id, prev_fa, Section.PREV, attn_set, candidate, partner_ranges)
 
             # ----- 2. Intermediate section (gap between prev end and candidate start) -----
             if previous.end + 1 < candidate.start:
@@ -3643,7 +3894,7 @@ class SweepState:
             f"verdict: {candidate.verdict.value}",
             anchor_addr=candidate.start,
         )
-        self._emit_function_rows(rows, next_id, candidate, Section.CURRENT, attn_set, candidate)
+        self._emit_function_rows(rows, next_id, candidate, Section.CURRENT, attn_set, candidate, partner_ranges)
 
         # ----- 4. Trailing section (TRAILING_BYTES past candidate end) -----
         trailing_start = candidate.end + 1
@@ -3687,7 +3938,7 @@ class SweepState:
             unpin_action=unpin,
         ))
 
-    def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate):
+    def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate, partner_ranges=None):
         """Translate FunctionAnalysis + pool sets into ListingRows for [fa.start, fa.end].
 
         SINGLE RESPONSIBILITY: lookup, not decide.  Reads pre-decided
@@ -3971,6 +4222,68 @@ class SweepState:
             if head == "bra" and b is not None and b.internal:
                 if not row.tag:
                     row.tag = "⇒"
+
+            # Walker-stop confidence annotation.  For bra and resolved
+            # single-target jmp/braf, the walker recorded stop_confidence
+            # on the Branch.  Suffix the row tag with the rank so the
+            # user can see the walker's tail-call decision inline, and
+            # populate tag_tooltip with the reasoning for hover.
+            if (b is not None and b.stop_confidence is not None
+                    and head in ("bra", "jmp", "braf")):
+                row.stop_confidence = b.stop_confidence
+                rank_suffix = f" ({b.stop_confidence})"
+                if rank_suffix not in row.tag:
+                    row.tag = row.tag + rank_suffix
+                tooltip_parts = [
+                    f"walker stop confidence: {b.stop_confidence}",
+                    f"target: 0x{b.target:08X}" if b.target is not None else "",
+                ]
+                if b.stop_reasons:
+                    tooltip_parts.append("signals:")
+                    for r in b.stop_reasons:
+                        tooltip_parts.append(f"  - {r}")
+                else:
+                    tooltip_parts.append("signals: (none)")
+                # Cross-reference with candidate's suggested partners.
+                # When a HIGH tail-call target lands inside a suggested
+                # partner range, the "external callers" count includes
+                # callers that are actually inside the same logical
+                # function — disclose this so the user can interpret the
+                # rank with the partner context.
+                if b.target is not None and partner_ranges:
+                    for ps, pe, ph in partner_ranges:
+                        if ps <= b.target <= pe:
+                            tooltip_parts.append(
+                                f"note: target is inside suggested partner "
+                                f"FUN_{ph} (0x{ps:08X}→0x{pe:08X}) — "
+                                f"some 'static callers' may be in-partner"
+                            )
+                            break
+                # Target-prologue signal: if the next few instructions at
+                # the branch target are stack pushes, the target looks
+                # like a real function entry — the walker should probably
+                # have stopped here regardless of static-caller count.
+                if b.target is not None:
+                    pushes = _count_leading_pushes(
+                        self.model.binary, self.model.vram, b.target
+                    )
+                    if pushes >= 2:
+                        tooltip_parts.append(
+                            f"note: target opens with {pushes} stack pushes "
+                            f"(mov.l rN, @-r15) — looks like a function prologue"
+                        )
+                # Frame-imbalance signal for the CURRENT function: if the
+                # epilogue pops registers that the prologue never pushed,
+                # this function is structurally unbalanced — strong hint
+                # that the walker absorbed code from another function.
+                extras = list(fa.prologue_restored_extras or [])
+                if extras and not (fa.prologue_saved or []):
+                    tooltip_parts.append(
+                        f"note: this function pops [{', '.join(sorted(extras))}] "
+                        f"that were never pushed at start — frame imbalance "
+                        f"suggests the walker overran a real boundary"
+                    )
+                row.tag_tooltip = "\n".join(p for p in tooltip_parts if p)
 
             # Returns — explicit EXIT tag.
             if head in _RETURN_HEADS:
