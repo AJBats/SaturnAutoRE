@@ -2012,6 +2012,19 @@ class BinaryModel:
         # → classify as POOL2.
         self._classify_orphan_pool()
 
+        # ----- Phase B: re-scan static_callers with enriched pool skip -----
+        # Pass E reclassified additional bytes as POOL2/POOL4 (jump
+        # tables, lookup tables, orphan runs between known pools).  The
+        # Phase-A static_callers scan ran with only the binary mov.l/mova
+        # target set, so any phantom bsr/bra decodes inside those
+        # newly-classified pool regions are sitting in `static_callers`.
+        # Re-scan with the enriched skip set so consumers (walker_stop
+        # confidence, midpoint scoring, suggested_partners) see filtered
+        # counts.
+        self.static_callers = self._scan_static_callers(
+            pool_data_addrs=self._pool_data_addrs_from_byte_kind(),
+        )
+
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -2725,7 +2738,7 @@ class BinaryModel:
             nexts[s] = sorted_starts[i + 1] if i + 1 < len(sorted_starts) else None
         return nexts
 
-    def _scan_static_callers(self) -> dict:
+    def _scan_static_callers(self, pool_data_addrs: Optional[set] = None) -> dict:
         """Scan THIS binary's bytes for call references to each address.
 
         Two patterns:
@@ -2735,24 +2748,27 @@ class BinaryModel:
              a 4-byte pool word; if the word's value lands in vram range
              AND is 2-byte aligned, count it as a function-pointer ref.
 
-        Skips bytes inside known pool words (from the binary-scan subset
-        only — NOT file priors — to match eval_server byte-for-byte).
-        Pool bytes that bit-align as bsr/bra opcodes would otherwise
-        produce phantom callers.
+        Skips opcode decode on any address in `pool_data_addrs` — pool
+        bytes that bit-align as bsr/bra opcodes would otherwise produce
+        phantom callers.  Called twice during model init:
+          - Phase A: skip set from `_binary_pool_targets` only.  Pass E
+            consumes this to gate its orphan-pool safeguard.
+          - Phase B: skip set enriched with Pass E's POOL2/POOL4
+            classifications.  This is the value consumers see.
 
-        Mirrors eval_server._load_static_callers.  Returns {addr: count}.
+        Returns {addr: count}.
         """
         import struct
         binary = self.binary
         vram = self.vram
         end = self.end_addr
 
-        # Build pool-data-skip set from the binary-scan subset (matching
-        # eval_server's STATE["binary_pool_targets"] usage exactly).
-        pool_data_addrs = set()
-        for tgt, size in self._binary_pool_targets.items():
-            for i in range(0, size, 2):
-                pool_data_addrs.add(tgt + i)
+        if pool_data_addrs is None:
+            # Default: derive from _binary_pool_targets (Phase A semantics).
+            pool_data_addrs = set()
+            for tgt, size in self._binary_pool_targets.items():
+                for i in range(0, size, 2):
+                    pool_data_addrs.add(tgt + i)
 
         callers: dict = {}
         for addr in range(vram, end, 2):
@@ -2777,6 +2793,20 @@ class BinaryModel:
                     if vram <= v <= end and (v & 1) == 0:
                         callers[v] = callers.get(v, 0) + 1
         return callers
+
+    def _pool_data_addrs_from_byte_kind(self) -> set:
+        """Build a pool-byte skip set from `byte_kind` (POOL2/POOL4).
+        Includes interior bytes of multi-byte pool words (byte_kind only
+        records the start address).  Used by Phase-B static_callers scan
+        to skip phantom opcodes inside Pass-E-classified pool regions.
+        """
+        pool_data_addrs: set = set()
+        for addr, kind in self.byte_kind.items():
+            if kind is ByteKind.POOL4:
+                pool_data_addrs.update((addr, addr + 2))
+            elif kind is ByteKind.POOL2:
+                pool_data_addrs.add(addr)
+        return pool_data_addrs
 
     def _scan_cross_module_callers(self,
                                     scan_dir: Optional[Path],
