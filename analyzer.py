@@ -1149,15 +1149,18 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None,
                 #
                 # Confidence is ALWAYS computed for `bra` so the row
                 # renderer can show the rank tag + tooltip regardless
-                # of whether the target is in-range.  The walker_stop
-                # decision (skip pushing to worklist) only applies for
-                # in-range targets — external bras already aren't
-                # followed.
+                # of where the target lands.  walker_stop itself is
+                # purely diagnostic for in-range targets — internal
+                # branches always get followed (they're real flow
+                # inside this function, and inflated static_callers
+                # counts from same-function internal bras would
+                # otherwise wrongly mark in-range labels as
+                # unreachable).  Out-of-range bras are never followed
+                # regardless (see the `if in_range` push gate below),
+                # so the rank annotation lives purely in the tooltip.
                 walker_stop = False
                 if head == "bra" and should_stop is not None and tgt is not None:
-                    stop_decision, b.stop_confidence, b.stop_reasons = should_stop(tgt)
-                    if in_range:
-                        walker_stop = stop_decision
+                    _stop_decision, b.stop_confidence, b.stop_reasons = should_stop(tgt)
                 branches.append(b)
 
                 # delay-slot branches: bra, bsr, bf/s, bt/s
@@ -1219,12 +1222,18 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None,
                             b = Branch(
                                 src=pc, target=resolved, mnem=head, internal=False,
                             )
+                            # Rank stays diagnostic; only out-of-range
+                            # resolved targets are eligible for stop
+                            # gating (internal branches always follow).
                             walker_stop = False
+                            resolved_in_range = (start <= resolved <= hard_limit_addr)
                             if should_stop is not None:
-                                walker_stop, b.stop_confidence, b.stop_reasons = should_stop(resolved)
+                                stop_decision, b.stop_confidence, b.stop_reasons = should_stop(resolved)
+                                if not resolved_in_range:
+                                    walker_stop = stop_decision
                             branches.append(b)
                             if (not walker_stop
-                                    and start <= resolved <= hard_limit_addr
+                                    and resolved_in_range
                                     and resolved not in reachable):
                                 worklist.append(resolved)
                     # unconditional — terminates THIS linear walk; targets
