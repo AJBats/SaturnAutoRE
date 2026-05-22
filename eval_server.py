@@ -114,21 +114,42 @@ def _remove_subseg_from_yaml(start_addr):
     return removed
 
 
-def _append_subseg_to_yaml(start_addr, end_addr, file_name, partners=None):
+def _insert_subseg_in_yaml(start_addr, end_addr, partners=None):
+    """Insert a subseg block at the address-sorted position.
+
+    Subsegs are kept in start-address order on disk so the file reads
+    top-to-bottom in memory order.  Inserts before the first existing
+    subseg whose start > new start; appends if none qualifies.
+    """
     text = open(STATE["yaml_path"]).read()
     if not text.endswith("\n"):
         text += "\n"
-    addition = (
+    lines = text.splitlines(keepends=True)
+
+    block = (
         f"  - start: 0x{start_addr:08X}\n"
         f"    type:  code\n"
-        f"    file:  {file_name}\n"
         f"    end:   0x{end_addr:08X}\n"
     )
     if partners:
         partners_list = ", ".join(f"0x{p:08X}" for p in sorted(set(partners)))
-        addition += f"    partners: [{partners_list}]\n"
+        block += f"    partners: [{partners_list}]\n"
+
+    insert_at = len(lines)
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("  - start: 0x"):
+            try:
+                existing = int(stripped.split("0x", 1)[1], 16)
+            except (ValueError, IndexError):
+                continue
+            if existing > start_addr:
+                insert_at = i
+                break
+
+    lines.insert(insert_at, block)
     with open(STATE["yaml_path"], "w") as f:
-        f.write(text + addition)
+        f.writelines(lines)
 
 
 def _add_partner_to_existing_subseg(subseg_start, new_partner):
@@ -1041,12 +1062,6 @@ def verdict():
         for ex_start, _ex_end in absorbed:
             _remove_subseg_from_yaml(ex_start)
 
-        # Find the containing TU for the file_name field.
-        # Synthetic per-subseg `file:` field.  Cosmetic only — nothing
-        # analytical reads it.  TUs were retired (binary is one logical
-        # code block).
-        file_name = f"tu_{nxt.function.start:08X}"
-
         # Partners come from two sources, unioned:
         #   1. pending_partners staged via /queue-partner before approval
         #   2. existing stamps whose partners list already includes this
@@ -1058,8 +1073,8 @@ def verdict():
                 auto_back_refs.append(s.start)
         all_partners = sorted(set(pending_partners) | set(auto_back_refs))
 
-        _append_subseg_to_yaml(
-            nxt.function.start, nxt.function.end, file_name,
+        _insert_subseg_in_yaml(
+            nxt.function.start, nxt.function.end,
             partners=all_partners,
         )
         # Forward cross-reference: for every partner queued (or auto-found),
