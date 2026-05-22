@@ -3282,30 +3282,41 @@ class SweepState:
             int(b["start"]) for b in (self.analyze_mode.get("blocks") or [])
         }
 
-    def _caller_kind(self, caller_start: int, target_subseg) -> str:
+    def _caller_kind(self, caller_start: int, target_addr: int) -> str:
         """Classify a caller for the "Called from" label.
 
           - "analyze" — caller is one of the active analyze-mode block
             starts (we're exploring a multi-block synthetic function and
             this is another block of it)
-          - "partner" — caller is in the target subseg's yaml partners
-            list (or vice-versa — partnership is symmetric in intent
-            even if the back-reference isn't always written)
+          - "partner" — caller and target are paired via the yaml
+            partners mechanism.  Three resolution paths, since either
+            side might be the one currently being viewed (unstamped
+            candidate):
+              (a) target is stamped, caller is listed in target's partners
+              (b) caller is stamped, target_addr appears verbatim in
+                  caller's partners list
+              (c) caller is stamped, target_addr falls inside a stamped
+                  subseg whose start is in caller's partners list
           - "stamped" — anything else (regular cross-function call)
-
-        `target_subseg` is the VerifiedSubseg the target sits inside, or
-        None if the target is in unstamped territory.
         """
         if caller_start in self._analyze_block_starts:
             return "analyze"
-        if target_subseg is not None:
-            if caller_start in (target_subseg.partners or []):
+        target_sub = next(
+            (s for s in self.verified if s.start <= target_addr <= s.end),
+            None,
+        )
+        # (a) forward — caller declared partner of target subseg
+        if target_sub is not None and caller_start in (target_sub.partners or []):
+            return "partner"
+        # (b) and (c) reverse — caller's partners reach the target
+        caller_sub = next(
+            (s for s in self.verified if s.start == caller_start), None,
+        )
+        if caller_sub is not None:
+            partners = caller_sub.partners or []
+            if target_addr in partners:
                 return "partner"
-            # Reverse: target_subseg's start is listed in caller's partners
-            caller_sub = next(
-                (s for s in self.verified if s.start == caller_start), None,
-            )
-            if caller_sub is not None and target_subseg.start in (caller_sub.partners or []):
+            if target_sub is not None and target_sub.start in partners:
                 return "partner"
         return "stamped"
 
@@ -4114,14 +4125,10 @@ class SweepState:
             # hint appears in unstamped territory.
             call_src = self.call_sources_of.get(addr)
             if call_src:
-                target_sub = next(
-                    (s for s in self.verified if s.start <= addr <= s.end),
-                    None,
-                )
                 parts = []
                 callers_struct = []
                 for caller_start, count in sorted(call_src.items()):
-                    kind = self._caller_kind(caller_start, target_sub)
+                    kind = self._caller_kind(caller_start, addr)
                     kind_tag = {"partner": ", partner", "analyze": ", analyze block"}.get(kind, "")
                     count_str = f"×{count}" if count > 1 else ""
                     inside = ", ".join(p for p in (count_str, kind_tag.lstrip(", ")) if p)
@@ -4456,14 +4463,10 @@ class SweepState:
             # Trailing-zone call-source hint (same rationale).
             csrc = call_hints.get(addr)
             if csrc:
-                target_sub = next(
-                    (s for s in self.verified if s.start <= addr <= s.end),
-                    None,
-                )
                 parts = []
                 callers_struct = []
                 for caller_start, count in sorted(csrc.items()):
-                    kind = self._caller_kind(caller_start, target_sub)
+                    kind = self._caller_kind(caller_start, addr)
                     kind_tag = {"partner": ", partner", "analyze": ", analyze block"}.get(kind, "")
                     count_str = f"×{count}" if count > 1 else ""
                     inside = ", ".join(p for p in (count_str, kind_tag.lstrip(", ")) if p)
