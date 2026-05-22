@@ -391,6 +391,8 @@ header#header > #header-content {
   gap: 0.8em;
   flex-wrap: wrap;
   font-size: 12px;
+  max-height: 6em;
+  overflow-y: auto;
 }
 .pane-banner.primary-banner { background: #1e251e; }
 .pane-banner.natural-banner { background: #25201e; }
