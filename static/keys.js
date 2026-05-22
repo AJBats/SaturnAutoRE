@@ -65,23 +65,26 @@ function evidenceHtml(e) {
     `<span class="evidence-pill ${rhCls}" title="breakpoint hits across all probe runs">`
     + `${e.runtime_hits} runtime hit${e.runtime_hits === 1 ? '' : 's'}</span>`
   );
+  return parts.join('');
+}
 
-  for (const mp of e.midpoints || []) {
+// Midpoint chips are emitted separately so the banner can place them
+// LAST — they grow into noise on big absorbed candidates, and putting
+// them after yellow_flags + partners lets the banner's scrollbar
+// swallow the noise without hiding the higher-signal items.
+function midpointsHtml(e) {
+  if (!e || !e.midpoints || !e.midpoints.length) return '';
+  return e.midpoints.map(mp => {
     const mpSc = mp.static_callers;
     const mpRh = mp.runtime_hits;
     const mpCm = mp.cross_module_callers || 0;
-    // Loud if reference claims a midpoint but evidence is weak.  Quiet
-    // (informational) if both signals back the split.
     const supported = (mpSc > 0 || mpRh > 0);
     const cmTail = mpCm > 0 ? `, ${mpCm} cross-module` : '';
-    parts.push(
-      `<span class="midpoint-warning ${supported ? 'supported' : 'suspect'}" `
+    return `<span class="midpoint-warning ${supported ? 'supported' : 'suspect'}" `
       + `title="reference proposes FUN_${mp.addr_hex} as a separate function inside our proposed range">`
       + `reference midpoint @ FUN_${mp.addr_hex} `
-      + `(${mpSc} static, ${mpRh} runtime${cmTail})</span>`
-    );
-  }
-  return parts.join('');
+      + `(${mpSc} static, ${mpRh} runtime${cmTail})</span>`;
+  }).join('');
 }
 
 // ANALYZE MODE banner — reuses the .gap-alert DOM slot but with orange
@@ -230,6 +233,7 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     ${prev ? `<span class="prev">after ${prev.name}</span>` : ''}
     ${partnersHtml(c)}
     ${flagsHtml}
+    ${midpointsHtml(c.evidence)}
   `;
 }
 
