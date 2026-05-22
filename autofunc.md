@@ -23,19 +23,17 @@ Minimum required:
    options:
      target_path: build/disc/files/FOO/FOO.BIN
      vram:        0x06000000          # binary's load address
-   tus:
-     - { name: tu_06000000, start: 0x06000000, end: 0x0601FFFF }
    subsegments: []                    # forward-sweep starts from vram
    ```
 
 Recommended additions (richer banner signals + cleaner rendering):
 
 3. **Reference disassembly.** A second-opinion `.s` tree to compare
-   the oracle's boundaries against — typically the output of a fresh
+   the analyzer's boundaries against — typically the output of a fresh
    Ghidra pass on the same binary, but it can be anything that emits
    the standard `FUN_<addr>:` / `.L_pool_<addr>:` label conventions
    (objdump, splat, hand-written stubs).  The eval tool treats it as
-   a second opinion, not as ground truth — when oracle and reference
+   a second opinion, not as ground truth — when analyzer and reference
    disagree, the banner surfaces the delta so the human decides who's
    right.  Point the loader at it via yaml options:
 
@@ -71,7 +69,7 @@ Start the server from the project root:
 python <SaturnAutoRE>/eval_server.py config/<binary>.yaml
 ```
 
-A browser tab opens at `http://localhost:5000`. Stamping begins.
+A browser tab opens at `http://localhost:5001`. Stamping begins.
 
 ## When you're called in to diagnose
 
@@ -84,7 +82,7 @@ The human hasn't verdicted yet. The currently displayed candidate is
 **not in session.json yet**; it's in `/state`. Read it:
 
 ```
-curl -s http://localhost:5000/state | python -m json.tool
+curl -s http://localhost:5001/state | python -m json.tool
 ```
 
 Skip to "Diagnose" below.
@@ -139,7 +137,7 @@ flow:
 - **`GET /state`** — the currently displayed candidate plus all evidence.
   Source of truth for live mid-stream questions. Key fields:
   - `candidate.start_hex` / `end_hex` — proposed boundaries.
-  - `candidate.yellow_flags` — list of strings from oracle's structural
+  - `candidate.yellow_flags` — list of strings from analyzer's structural
     check. Highest-signal diagnostic. Examples: `"no prologue register
     pushes detected"` (proposed start is mid-function), `"no clean rts
     at expected position"` (end is wrong), `"stack alloc/dealloc
@@ -158,42 +156,86 @@ flow:
     that fall *inside* our proposed range. Each midpoint has its own
     `static_callers` / `runtime_hits` so you can tell if reference's
     proposed split is real (caller evidence) or a Ghidra hallucination.
+  - `candidate.partners` — addresses already partnered with this
+    function in yaml (mega-function: one logical C function whose
+    code is split across disjoint address ranges).
+  - `candidate.suggested_partners` — addresses the analyzer proposes
+    as partners based on stack-frame imbalance + transfer signals.
+    Each: `{addr, addr_hex, reason}`. Empty = function is balanced
+    on its own.
+  - `candidate.pending_partners` — partner addresses queued for the
+    next approve (set via `/queue-partner`, written to yaml on
+    approve).
+  - `candidate.partner_balanced` — true when the verdict has been
+    upgraded because partners cover the imbalance.
+  - `analyze_mode` — non-null when the user/AI is exploring a
+    multi-block synthetic candidate (e.g. switch dispatcher + case
+    bodies). See "Analyze mode" below.
   - `internal_gaps` — list of uncovered byte ranges between verified
     subsegs. Each entry: `{start_hex, end_hex, size, preceding_name,
     preceding_start}`. Non-empty = the red gap banner is firing.
+
+### Endpoints (prefer these over editing session.json directly)
+
 - **`POST /unstamp {"start": "0x..."}`** — remove a verified subseg so the
-  human can re-review with current oracle logic. Works with either an
-  int or `"0x..."` hex string for `start`.
-- **`ai_override` in session.json** — pin a specific candidate when
-  forward-sweep can't find the function naturally, or when oracle's
-  proposed boundary is off. **Independent of any verdict** — setting it
-  auto-refreshes the UI on the next poll; you don't need a reject first.
-  Full schema:
+  human can re-review with current analyzer logic. Accepts int or `"0x..."` hex.
+- **`POST /pin-start {"addr": "0x..."}`** — pin the candidate's start
+  address. Replaces any existing override. Use when forward-sweep
+  can't find the function naturally, or after an `/unstamp` to jump
+  to a specific position.
+- **`POST /pin-end {"next_start": "0x..."}`** — pin the candidate's
+  end to the byte BEFORE `next_start`. Pass the address you'd like
+  to be the START of the next function; the pin lands at
+  `next_start - 1`. Rejects if `next_start` lands strictly inside a
+  verified subseg.
+- **`POST /unpin-end`** — clear just the end pin. If no other
+  override fields remain (start, attn, previous_subseg), the entire
+  override is cleared.
+- **`POST /unpin-all`** — clear the entire `ai_override` block.
+- **`POST /queue-partner {"partner": "0x..."}`** — queue a partner
+  address for the next approve. Toggles if already queued. The
+  partner is written to the yaml's `partners:` list on the candidate's
+  next approve verdict; no yaml mutation happens before that.
 
-  ```json
-  "ai_override": {
-    "candidate_start": "0x0602CC84",
-    "candidate_end":   "0x0602CD61",
-    "previous_subseg": {
-      "start": "0x0602B22C",
-      "end":   "0x0602CC83",
-      "type":  "code",
-      "file":  "tu_0602B22C"
-    },
-    "attn": ["0x0602CC84", "0x0602CD60"]
-  }
-  ```
+### Analyze mode (multi-block exploration)
 
-  `candidate_end` and `attn` are optional. `previous_subseg` mirrors
-  the yaml subseg shape (start/end accept int or hex string) and tells
-  the eval tool what to render in the "previous" section above the
-  candidate. When override is active the listing splits into two panes:
-  your pinned candidate on the left, oracle's natural proposal on the
-  right.
-- **`attn` in ai_override** — optional list of addresses to draw the
-  human's eye to (e.g. the exact instruction that proves the boundary).
-  Each listed address gets an orange box around the address column and
-  an orange-bold tail on the last 4 hex digits.
+Switch dispatchers can have case bodies that live at disjoint
+addresses (the dispatcher absorbs the immediate case via switch
+absorption, but other cases may be a partner block elsewhere).
+Analyze mode lets you stage a multi-block view to discover the shape
+before committing partners.
+
+- **`POST /analyze-mode/enter {"blocks": [{"start": 0x..., "end": 0x...}, ...], "label": "..."}`**
+  — define the synthetic multi-block candidate. No yaml mutation,
+  no history. The UI's `analyze_mode` slot is populated and the
+  candidate view switches to multi-block.
+- **`POST /analyze-mode/cycle {"direction": "next" | "prev"}`** —
+  navigate between blocks (also wired to ←/→ keys in the UI).
+- **`POST /analyze-mode/clear`** — exit analyze mode. Sweep resumes.
+
+### `ai_override` (advanced — usually let the pin endpoints manage it)
+
+The pin/unpin endpoints write `ai_override` for you. Edit it directly
+only when you need the `attn` field, which the endpoints don't set:
+
+```json
+"ai_override": {
+  "candidate_start": "0x0602CC84",
+  "candidate_end":   "0x0602CD61",
+  "previous_subseg": {
+    "start": "0x0602B22C",
+    "end":   "0x0602CC83",
+    "type":  "code",
+    "file":  "tu_0602B22C"
+  },
+  "attn": ["0x0602CC84", "0x0602CD60"]
+}
+```
+
+`attn` highlights specific addresses in the listing (orange box on
+the address column, orange-bold tail on the last 4 hex digits) —
+useful when you want to draw the human's eye to a specific
+boundary-defining instruction.
 
 ## Rules
 
