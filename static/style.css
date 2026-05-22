@@ -592,6 +592,14 @@ svg.arcs .arc.sticky {
 .line.pool .m                   { color: #aac; }
 .line.pool .lbl                 { color: #88a; }
 
+/* "Called from FUN_X" label rows — color each caller name by kind.
+   The surrounding "Called from" / ":" / "(×N, partner)" text inherits
+   the default label color (#9cf, pale blue) and only the FUN_<addr>
+   span is recolored.  Bold weight inherited from .line.label .lbl. */
+.line.label .lbl .caller-name           { color: #9cf; }  /* stamped (default) */
+.line.label .lbl .caller-name.caller-partner { color: #cbf; }  /* pale lavender */
+.line.label .lbl .caller-name.caller-analyze { color: #9ed; }  /* pale cyan-green */
+
 /* Inline tags — appear after the mnemonic */
 .line .tag {
   display: inline-block;

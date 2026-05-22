@@ -391,7 +391,13 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
       const labelPinPart = line.addr
         ? `<span class="pin-zone" title="treat this label's address as the next function's start; pin end at addr - 1">+</span>`
         : `<span class="pin-zone"></span>`;
-      return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="0">${labelPinPart}<span class="margin"> </span>${indentSpan}<span class="lbl">${escapeHtml(line.label)}</span></span>`;
+      // "Called from" label rows ship a structured `callers` list so we
+      // can color each FUN_<addr> span by kind (stamped / partner /
+      // analyze block).  Fall back to plain text for any other label.
+      const lblHtml = line.callers && line.callers.length
+        ? calledFromHtml(line.callers)
+        : escapeHtml(line.label);
+      return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="0">${labelPinPart}<span class="margin"> </span>${indentSpan}<span class="lbl">${lblHtml}</span></span>`;
     }
     const margin = line.margin || ' ';
     const labelPart = line.label
@@ -992,4 +998,21 @@ function escapeHtml(s) {
     .replaceAll('>', '&gt;')
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#39;');
+}
+
+// Render a "Called from" label row from a structured callers list.
+// Each caller's FUN_<addr> span gets a kind-specific class so it can be
+// colored independently of the "Called from" / ":" / suffix text.
+function calledFromHtml(callers) {
+  const parts = callers.map(c => {
+    const kindClass = `caller-${c.kind || 'stamped'}`;
+    const kindTag = c.kind === 'partner' ? ', partner'
+                  : c.kind === 'analyze' ? ', analyze block'
+                  : '';
+    const countStr = c.count > 1 ? `×${c.count}` : '';
+    const inside = [countStr, kindTag.replace(/^, /, '')].filter(Boolean).join(', ');
+    const suffix = inside ? ` (${inside})` : '';
+    return `<span class="caller-name ${kindClass}">FUN_${escapeHtml(c.addr_hex)}</span>${escapeHtml(suffix)}`;
+  });
+  return `Called from ${parts.join(', ')}:`;
 }

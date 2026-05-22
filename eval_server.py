@@ -467,6 +467,10 @@ def _row_to_dict(row):
         out["tag_tooltip"] = row.tag_tooltip
     if row.stop_confidence and is_function_section:
         out["stop_confidence"] = row.stop_confidence
+    # Structured callers on "Called from FUN_X" label rows — lets the
+    # frontend color each caller name by kind (stamped/partner/analyze).
+    if row.callers:
+        out["callers"] = list(row.callers)
     return out
 
 

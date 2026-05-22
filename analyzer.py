@@ -356,6 +356,16 @@ class ListingRow:
     pin_action: PinAction = PinAction.NONE
     unpin_action: UnpinAction = UnpinAction.NONE
 
+    # ----- "Called from" structured callers (only set on LABEL rows
+    # generated from call_sources_of).  Each entry:
+    #   {"addr_hex": "0603AB66", "count": 2, "kind": "stamped" | "partner" | "analyze"}
+    # The renderer uses `kind` to color each FUN_<addr> span differently
+    # — stamped (pale blue, default), partner (pale lavender, same logical
+    # function via yaml partners), analyze (pale green, same logical
+    # function via current analyze_mode blocks).  `label` still holds the
+    # plain-text rendering for fallback / non-call labels.
+    callers: list = field(default_factory=list)
+
 
 # ---------------------------------------------------------------------------
 # Sweep state — yaml + session-driven derived state
@@ -3264,6 +3274,41 @@ class SweepState:
         self._outstanding_case_of_cache: Optional[dict] = None
         self._call_sources_of_cache: Optional[dict] = None
 
+        # Active analyze-mode block start addrs — used to flag "Called
+        # from" entries that come from another block of the same
+        # synthetic mega-function, so the UI can render them with a
+        # different color + "(analyze block)" suffix.
+        self._analyze_block_starts = {
+            int(b["start"]) for b in (self.analyze_mode.get("blocks") or [])
+        }
+
+    def _caller_kind(self, caller_start: int, target_subseg) -> str:
+        """Classify a caller for the "Called from" label.
+
+          - "analyze" — caller is one of the active analyze-mode block
+            starts (we're exploring a multi-block synthetic function and
+            this is another block of it)
+          - "partner" — caller is in the target subseg's yaml partners
+            list (or vice-versa — partnership is symmetric in intent
+            even if the back-reference isn't always written)
+          - "stamped" — anything else (regular cross-function call)
+
+        `target_subseg` is the VerifiedSubseg the target sits inside, or
+        None if the target is in unstamped territory.
+        """
+        if caller_start in self._analyze_block_starts:
+            return "analyze"
+        if target_subseg is not None:
+            if caller_start in (target_subseg.partners or []):
+                return "partner"
+            # Reverse: target_subseg's start is listed in caller's partners
+            caller_sub = next(
+                (s for s in self.verified if s.start == caller_start), None,
+            )
+            if caller_sub is not None and target_subseg.start in (caller_sub.partners or []):
+                return "partner"
+        return "stamped"
+
     def check_trailing_zone_case_targets(self, fa: FunctionAnalysis,
                                           trailing_window: int = 200) -> list:
         """Scan the trailing window past `fa.end` for addresses that are
@@ -4069,16 +4114,31 @@ class SweepState:
             # hint appears in unstamped territory.
             call_src = self.call_sources_of.get(addr)
             if call_src:
+                target_sub = next(
+                    (s for s in self.verified if s.start <= addr <= s.end),
+                    None,
+                )
                 parts = []
+                callers_struct = []
                 for caller_start, count in sorted(call_src.items()):
-                    suffix = f" (×{count})" if count > 1 else ""
+                    kind = self._caller_kind(caller_start, target_sub)
+                    kind_tag = {"partner": ", partner", "analyze": ", analyze block"}.get(kind, "")
+                    count_str = f"×{count}" if count > 1 else ""
+                    inside = ", ".join(p for p in (count_str, kind_tag.lstrip(", ")) if p)
+                    suffix = f" ({inside})" if inside else ""
                     parts.append(f"FUN_{caller_start:08X}{suffix}")
+                    callers_struct.append({
+                        "addr_hex": f"{caller_start:08X}",
+                        "count": count,
+                        "kind": kind,
+                    })
                 rows.append(ListingRow(
                     row_id=next_id(),
                     kind=RowKind.LABEL,
                     section=section,
                     addr=addr,
                     label="Called from " + ", ".join(parts) + ":",
+                    callers=callers_struct,
                 ))
 
             # ----- Pool4 row?
@@ -4396,16 +4456,31 @@ class SweepState:
             # Trailing-zone call-source hint (same rationale).
             csrc = call_hints.get(addr)
             if csrc:
+                target_sub = next(
+                    (s for s in self.verified if s.start <= addr <= s.end),
+                    None,
+                )
                 parts = []
+                callers_struct = []
                 for caller_start, count in sorted(csrc.items()):
-                    suffix = f" (×{count})" if count > 1 else ""
+                    kind = self._caller_kind(caller_start, target_sub)
+                    kind_tag = {"partner": ", partner", "analyze": ", analyze block"}.get(kind, "")
+                    count_str = f"×{count}" if count > 1 else ""
+                    inside = ", ".join(p for p in (count_str, kind_tag.lstrip(", ")) if p)
+                    suffix = f" ({inside})" if inside else ""
                     parts.append(f"FUN_{caller_start:08X}{suffix}")
+                    callers_struct.append({
+                        "addr_hex": f"{caller_start:08X}",
+                        "count": count,
+                        "kind": kind,
+                    })
                 rows.append(ListingRow(
                     row_id=next_id(),
                     kind=RowKind.LABEL,
                     section=section,
                     addr=addr,
                     label="Called from " + ", ".join(parts) + ":",
+                    callers=callers_struct,
                 ))
 
             kind = self.model.byte_kind.get(addr)
