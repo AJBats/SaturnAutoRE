@@ -218,6 +218,9 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     return;
   }
   const c = candidate;
+  const greenFlagsHtml = (c.green_flags && c.green_flags.length)
+    ? `<span class="flags">${c.green_flags.map(f => `<span class="flag flag-green">${escapeHtml(f)}</span>`).join('')}</span>`
+    : '';
   const flagsHtml = (c.yellow_flags && c.yellow_flags.length)
     ? `<span class="flags">${c.yellow_flags.map(f => `<span class="flag">${escapeHtml(f)}</span>`).join('')}</span>`
     : '';
@@ -232,6 +235,7 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     ${evidenceHtml(c.evidence)}
     ${prev ? `<span class="prev">after ${prev.name}</span>` : ''}
     ${partnersHtml(c)}
+    ${greenFlagsHtml}
     ${flagsHtml}
     ${midpointsHtml(c.evidence)}
   `;

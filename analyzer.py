@@ -241,6 +241,7 @@ class FunctionAnalysis:
     # ----- Verdict
     verdict: Verdict = Verdict.UNKNOWN
     yellow_flags: list = field(default_factory=list)
+    green_flags: list = field(default_factory=list)
     partner_balanced: bool = False        # set by SweepState.apply_partner_awareness when partners resolve combined frame balance
 
     # ----- Reference / midpoint / evidence
@@ -2573,6 +2574,16 @@ class BinaryModel:
         if phantom_hint:
             flags = ["supported only by cross-module phantom callers (likely hot-swap collision, not a real entry)"] + list(flags)
 
+        # Positive frame-balance signal: function pushed callee-saved
+        # regs in its prologue AND popped exactly the same set in mirror
+        # order at its epilogue, with no orphan pops elsewhere.  Surfaces
+        # well-formed C-compiled functions as a green chip in the banner,
+        # since the absence of yellow_flags alone is hard to spot.
+        green_flags: list = []
+        if saved and not restored_extras and list(restored) == list(reversed(saved)):
+            regs_str = ", ".join(saved)
+            green_flags.append(f"prologue/epilogue balanced — saved & restored [{regs_str}]")
+
         return FunctionAnalysis(
             start=start,
             end=end,
@@ -2591,6 +2602,7 @@ class BinaryModel:
             indirect_calls=list(indirect),
             verdict=verdict_enum,
             yellow_flags=flags,
+            green_flags=green_flags,
             indent_depths=indent_depths,
             indirect_resolutions=indirect_resolutions,
             reference=reference,

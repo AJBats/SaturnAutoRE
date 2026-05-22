@@ -513,6 +513,7 @@ def _candidate_to_dict(fa, partners=None, pending_partners=None,
         "size": fa.end - fa.start + 1,
         "verdict": fa.verdict.value,
         "yellow_flags": list(fa.yellow_flags),
+        "green_flags": list(fa.green_flags),
         "name": f"FUN_{fa.start:08X}",
         "reference": _reference_to_dict(fa.reference),
         "evidence": {

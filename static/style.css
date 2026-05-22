@@ -117,6 +117,10 @@ header#header > #header-content {
   border-radius: 0.2em;
   font-size: 11px;
 }
+.flags .flag.flag-green {
+  background: #2a4a3a;
+  color: #9ed;
+}
 .caught-up { color: #9d9; font-weight: bold; }
 
 /* RPG-style progress: % of race.bin verified */
