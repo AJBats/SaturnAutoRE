@@ -2114,19 +2114,38 @@ class BinaryModel:
 
     def set_alt_entries(self, alt_entry_main: dict) -> None:
         """Update the alt-entry view from SweepState's parsed yaml.
-        Called per /state poll; cheap (dict swap + maybe cache flush).
+        Called per /state poll; cheap (dict swap + targeted cache
+        eviction).
 
-        When the new map differs from the cached one, any analyze_function
-        cache entry for an affected main is invalid (walker would now
-        seed extra worklist entries) so we drop the whole cache.  Cache
-        is small and warms back up on the next /state poll.
+        When an alt's mapping changes, only the analyze_function
+        entries keyed on the affected main(s) need to be evicted —
+        walker output for unrelated functions is still valid.
+        Surgical eviction keeps sibling analyses warm so the immediate
+        post-/queue-entry /state poll doesn't re-walk hundreds of
+        unrelated subsegs.  That's the difference between a snappy
+        and a multi-second UI response on alt-entry toggles.
         """
         new_map = dict(alt_entry_main or {})
         if new_map == self.alt_entry_main:
             return
+        affected_mains: set = set()
+        for alt in set(self.alt_entry_main) | set(new_map):
+            old_main = self.alt_entry_main.get(alt)
+            new_main = new_map.get(alt)
+            if old_main != new_main:
+                if old_main is not None:
+                    affected_mains.add(old_main)
+                if new_main is not None:
+                    affected_mains.add(new_main)
         self.alt_entry_main = new_map
         self.alt_entries = set(new_map.keys())
-        self._analyze_cache.clear()
+        # Cache keys are (start, hint_end); evict only entries whose
+        # start is an affected main.
+        if affected_mains:
+            self._analyze_cache = {
+                k: v for k, v in self._analyze_cache.items()
+                if k[0] not in affected_mains
+            }
 
     def pool_priors_dict(self) -> dict:
         """Return a {addr: size} dict equivalent to the union eval_server
