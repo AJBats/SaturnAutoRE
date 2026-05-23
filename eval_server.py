@@ -59,6 +59,7 @@ def _empty_session():
         "ai_override": None,
         "analyze_mode": None,
         "pending_partners": [],   # addrs queued via /queue-partner; applied on next approve
+        "pending_entries": {},    # {main_hex: [addr, ...]} queued via /queue-entry; applied on next approve
     }
 
 
@@ -74,6 +75,13 @@ def load_session():
                 entry["feedback"] = "\n".join(fb) if fb else ""
             elif fb is None:
                 entry["feedback"] = ""
+        # Legacy normalization: pending_entries was briefly a flat list
+        # bound at-poll-time to the current candidate.  Newer shape is
+        # {main_hex: [addr, ...]} so the queue can't silently rebind
+        # when the candidate changes.  Drop any legacy list — the user
+        # re-queues with the explicit-main shape.
+        if isinstance(sess.get("pending_entries"), list):
+            sess["pending_entries"] = {}
         return sess
     return _empty_session()
 
@@ -114,7 +122,7 @@ def _remove_subseg_from_yaml(start_addr):
     return removed
 
 
-def _insert_subseg_in_yaml(start_addr, end_addr, partners=None):
+def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None):
     """Insert a subseg block at the address-sorted position.
 
     Subsegs are kept in start-address order on disk so the file reads
@@ -134,6 +142,9 @@ def _insert_subseg_in_yaml(start_addr, end_addr, partners=None):
     if partners:
         partners_list = ", ".join(f"0x{p:08X}" for p in sorted(set(partners)))
         block += f"    partners: [{partners_list}]\n"
+    if entries:
+        entries_list = ", ".join(f"0x{e:08X}" for e in sorted(set(entries)))
+        block += f"    entries: [{entries_list}]\n"
 
     insert_at = len(lines)
     for i, line in enumerate(lines):
@@ -197,6 +208,54 @@ def _add_partner_to_existing_subseg(subseg_start, new_partner):
                 indent = "    "
                 lines.insert(body_end, f"{indent}partners: [{partner_hex}]\n")
 
+            with open(STATE["yaml_path"], "w") as f:
+                f.writelines(lines)
+            return True
+        i += 1
+    return False
+
+
+def _remove_entry_from_existing_subseg(subseg_start, entry):
+    """In-place yaml edit: drop `entry` from the entries list of the
+    subseg whose start matches `subseg_start`.  Removes the whole
+    `entries:` line if it would become empty.
+
+    Returns True if the entry was removed, False if not found or the
+    subseg lacks an entries field.
+    """
+    text = open(STATE["yaml_path"]).read()
+    lines = text.splitlines(keepends=True)
+    target = f"  - start: 0x{subseg_start:08X}"
+    i = 0
+    while i < len(lines):
+        if lines[i].rstrip("\r\n") == target:
+            j = i + 1
+            entries_line_idx = None
+            while j < len(lines):
+                s = lines[j].rstrip("\r\n")
+                if s.startswith("  - ") or (s and not s.startswith("    ")):
+                    break
+                if s.lstrip().startswith("entries:"):
+                    entries_line_idx = j
+                    break
+                j += 1
+            if entries_line_idx is None:
+                return False
+            pline = lines[entries_line_idx]
+            lo = pline.find("[")
+            hi = pline.find("]")
+            if lo == -1 or hi == -1 or lo >= hi:
+                return False
+            existing = [t.strip() for t in pline[lo + 1 : hi].split(",") if t.strip()]
+            entry_norm = f"0x{entry:08X}".lower()
+            kept = [e for e in existing if e.lower() != entry_norm]
+            if len(kept) == len(existing):
+                return False
+            if kept:
+                new_inner = ", ".join(kept)
+                lines[entries_line_idx] = pline[: lo + 1] + new_inner + pline[hi:]
+            else:
+                del lines[entries_line_idx]
             with open(STATE["yaml_path"], "w") as f:
                 f.writelines(lines)
             return True
@@ -287,6 +346,7 @@ def _build_sweep(session):
         ai_override=session.get("ai_override"),
         analyze_mode=session.get("analyze_mode"),
         frontier_simulation=session.get("frontier_simulation", False),
+        pending_entries=session.get("pending_entries") or {},
     )
 
 
@@ -400,6 +460,7 @@ def _row_to_dict(row):
     if row.is_unreachable:     classes.append("unreachable")
     if row.is_tail_call:       classes.append("tail-call")
     if row.is_indirect_branch: classes.append("uncond-indirect")
+    if row.is_alt_entry:       classes.append("alt-entry")
     if row.category is not None:
         cat_cls = _CATEGORY_TO_CSS.get(row.category.name)
         if cat_cls:
@@ -498,7 +559,8 @@ def _midpoint_to_dict(m):
 
 
 def _candidate_to_dict(fa, partners=None, pending_partners=None,
-                        suggested_partners=None):
+                        suggested_partners=None, entries=None,
+                        pending_entries=None):
     """Project analyzer.FunctionAnalysis to the candidate dict the
     banner renderer (keys.js renderCandidateBanner) consumes.
 
@@ -508,6 +570,9 @@ def _candidate_to_dict(fa, partners=None, pending_partners=None,
     and applied on next approve).  `suggested_partners` is the
     analyzer-derived list of likely partner addrs based on stack
     imbalance signals — the UI renders one button per suggestion.
+    `entries` is the list of int alt-entry addrs from the yaml subseg's
+    entries field (when this candidate is already stamped) — multi-
+    entry functions where several callable entries share one body.
     """
     return {
         "start_hex": f"{fa.start:08X}",
@@ -533,6 +598,10 @@ def _candidate_to_dict(fa, partners=None, pending_partners=None,
         ],
         "suggested_partners": list(suggested_partners or []),
         "partner_balanced": bool(getattr(fa, "partner_balanced", False)),
+        "entries": [{"addr": e, "addr_hex": f"{e:08X}"} for e in (entries or [])],
+        "pending_entries": [
+            {"addr": e, "addr_hex": f"{e:08X}"} for e in (pending_entries or [])
+        ],
     }
 
 
@@ -569,7 +638,8 @@ def _gap_to_dict(g):
 
 
 def _build_candidate_payload(sweep, candidate_fa, previous_typed,
-                              attn=None, pending_partners=None):
+                              attn=None, pending_partners=None,
+                              pending_entries=None):
     """Build the per-pane payload (banner + listing rows).  Mirrors
     eval_server._build_candidate_payload's output shape.
 
@@ -578,9 +648,11 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
     """
     rows = sweep.listing(candidate_fa, previous=previous_typed, attn=attn)
     partners = []
+    entries = []
     for s in sweep.verified:
         if s.start == candidate_fa.start:
             partners = list(s.partners or [])
+            entries = list(s.entries or [])
             break
     suggestions = sweep.suggested_partners(candidate_fa)
     # Trailing-zone warnings: surface a yellow flag when the candidate
@@ -603,6 +675,8 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
             partners=partners,
             pending_partners=pending_partners,
             suggested_partners=suggestions,
+            entries=entries,
+            pending_entries=pending_entries,
         ),
         "previous": _previous_to_dict(previous_typed),
         "lines": [_row_to_dict(r) for r in rows],
@@ -661,9 +735,16 @@ def state():
             internal_gaps = [_gap_to_dict(g) for g in sweep.gaps(proposed_start=nxt.function.start)]
 
         pending_partners = list(session.get("pending_partners") or [])
+        # Pending entries are keyed by main_hex; project only the bucket
+        # belonging to the current candidate so the banner / listing
+        # only show queue state relevant to what the user is viewing.
+        all_pending_entries = session.get("pending_entries") or {}
+        main_hex = f"0x{nxt.function.start:08X}"
+        pending_entries = list(all_pending_entries.get(main_hex) or [])
         primary_payload = _build_candidate_payload(
             sweep, nxt.function, nxt.previous,
             attn=attn_addrs, pending_partners=pending_partners,
+            pending_entries=pending_entries,
         )
 
         # Natural pane (for split view) — only when override is active AND
@@ -882,6 +963,85 @@ def queue_partner():
     return jsonify({"ok": True, "action": action, "pending_partners": [f"0x{p:08X}" for p in pending]})
 
 
+@app.route("/queue-entry", methods=["POST"])
+def queue_entry():
+    """Queue an alt entry for the current candidate.  Toggles if the
+    addr is already queued.  Pure session mutation — no yaml write
+    until /verdict approve.
+
+    Pending entries are stored as `{main_hex: [addr, ...]}` keyed by
+    the candidate's start at queue time.  The binding is explicit and
+    survives candidate-identity changes (a queue for FUN_X sits
+    dormant when you context-switch to FUN_Y and reappears when you
+    come back).  SweepState attaches them to `alt_entry_main` so the
+    analyzer (walker, midpoints, confidence) treats them as declared
+    entries during /state — letting the human audit the multi-entry
+    shape before stamping.
+
+    Validates the entry sits strictly inside the current candidate's
+    range and doesn't fall in another stamped subseg.  Rejected while
+    analyze_mode is active (no candidate identity to bind to).
+    """
+    data = request.get_json(force=True)
+    raw = data.get("entry")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'entry'"}), 400
+    try:
+        addr = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    with LOCK:
+        session = load_session()
+        if session.get("analyze_mode"):
+            return jsonify({
+                "ok": False,
+                "error": "analyze_mode is active — exit ANALYZE MODE before queueing entries",
+            }), 409
+        cfg, model, sweep = _build_sweep(session)
+        nxt = sweep.next_candidate()
+        if nxt is None:
+            return jsonify({"ok": False, "error": "no current candidate"}), 400
+        cand_start = nxt.function.start
+        cand_end = nxt.function.end
+        main_hex = f"0x{cand_start:08X}"
+        # pending_entries is dict-shape (per-main).  Legacy list-shape
+        # would have been migrated to {} by load_session.
+        all_pending = dict(session.get("pending_entries") or {})
+        bucket = list(all_pending.get(main_hex) or [])
+        if addr in bucket:
+            bucket.remove(addr)
+            action = "removed"
+        else:
+            if not (cand_start < addr <= cand_end):
+                return jsonify({
+                    "ok": False,
+                    "error": (f"entry 0x{addr:08X} must sit strictly inside the "
+                              f"current candidate (0x{cand_start:08X}, 0x{cand_end:08X}]"),
+                }), 400
+            for s in sweep.verified:
+                if s.start == cand_start:
+                    continue
+                if s.start <= addr <= s.end:
+                    return jsonify({
+                        "ok": False,
+                        "error": f"entry 0x{addr:08X} falls inside another stamped subseg FUN_{s.start:08X}",
+                    }), 400
+            bucket.append(addr)
+            action = "added"
+        if bucket:
+            all_pending[main_hex] = bucket
+        else:
+            all_pending.pop(main_hex, None)
+        session["pending_entries"] = all_pending
+        save_session(session)
+    return jsonify({
+        "ok": True,
+        "action": action,
+        "main": main_hex,
+        "pending_entries": [f"0x{p:08X}" for p in bucket],
+    })
+
+
 @app.route("/add-partner", methods=["POST"])
 def add_partner():
     """Add a partner cross-reference to an EXISTING stamped subseg.
@@ -913,6 +1073,29 @@ def add_partner():
         "updated": [f"0x{a:08X}"] + ([f"0x{b:08X}"] if ok_b else []),
         "back_ref_skipped": not ok_b,
     })
+
+
+@app.route("/remove-entry", methods=["POST"])
+def remove_entry():
+    """Remove an alt entry from a stamped subseg's `entries:` list.
+    Backout-only — golden path for adding entries is queue+approve
+    via /queue-entry; this exists for retroactive correction when an
+    already-stamped function shouldn't have had a given alt entry."""
+    data = request.get_json(force=True)
+    raw_main = data.get("main")
+    raw_entry = data.get("entry")
+    if raw_main is None or raw_entry is None:
+        return jsonify({"ok": False, "error": "need 'main' and 'entry'"}), 400
+    try:
+        main = analyzer._coerce_addr(raw_main)
+        entry = analyzer._coerce_addr(raw_entry)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    with LOCK:
+        removed = _remove_entry_from_existing_subseg(main, entry)
+    if not removed:
+        return jsonify({"ok": False, "error": f"entry 0x{entry:08X} not found on FUN_{main:08X}"}), 404
+    return jsonify({"ok": True, "main": f"0x{main:08X}", "entry": f"0x{entry:08X}"})
 
 
 @app.route("/unstamp", methods=["POST"])
@@ -1079,9 +1262,35 @@ def verdict():
                 auto_back_refs.append(s.start)
         all_partners = sorted(set(pending_partners) | set(auto_back_refs))
 
+        # Pending alt entries queued via /queue-entry get written to the
+        # new subseg's entries: field on approve.  Queue is keyed by
+        # main_hex; only this candidate's bucket gets written + cleared.
+        # Re-validate against the FINAL fa.start/end here — between
+        # queue and approve the user may have pinned the end smaller
+        # (or expanded it), so the at-queue check is necessary but not
+        # sufficient.
+        all_pending_entries = dict(session.get("pending_entries") or {})
+        main_hex = f"0x{nxt.function.start:08X}"
+        queued = list(all_pending_entries.get(main_hex) or [])
+        valid_entries: list = []
+        dropped_entries: list = []
+        verified_other_ranges = [
+            (s.start, s.end) for s in sweep.verified
+            if s.start != nxt.function.start
+        ]
+        for e in queued:
+            if not (nxt.function.start < e <= nxt.function.end):
+                dropped_entries.append(e)
+                continue
+            if any(os_start <= e <= os_end for os_start, os_end in verified_other_ranges):
+                dropped_entries.append(e)
+                continue
+            valid_entries.append(e)
+
         _insert_subseg_in_yaml(
             nxt.function.start, nxt.function.end,
             partners=all_partners,
+            entries=valid_entries,
         )
         # Forward cross-reference: for every partner queued (or auto-found),
         # add this candidate's start to their partners list (if they're
@@ -1093,11 +1302,15 @@ def verdict():
             _add_partner_to_existing_subseg(p, nxt.function.start)
 
         session["pending_partners"] = []   # clear queue after approve
+        all_pending_entries.pop(main_hex, None)
+        session["pending_entries"] = all_pending_entries
         save_session(session)
         return jsonify({
             "ok": True,
             "absorbed": [f"0x{s:08X}" for s, _ in absorbed],
             "partners": [f"0x{p:08X}" for p in all_partners],
+            "entries": [f"0x{e:08X}" for e in valid_entries],
+            "dropped_entries": [f"0x{e:08X}" for e in dropped_entries],
         })
 
 

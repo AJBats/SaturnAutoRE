@@ -109,6 +109,22 @@ header#header > #header-content {
   border-color: #6cb073;
   font-weight: bold;
 }
+.entries {
+  display: inline-block;
+  background: #4a3a1f;
+  color: #ffd86b;
+  padding: 0.1em 0.5em;
+  margin-left: 0.4em;
+  border-radius: 0.2em;
+  border: 1px solid #8a6a2a;
+  font-size: 11px;
+}
+.entries.pending {
+  background: #4a4a2a;
+  color: #ec9;
+  border-color: #8a8a4a;
+  font-style: italic;
+}
 .flags .flag {
   background: #4a3f2a;
   color: #fc9;
@@ -591,6 +607,13 @@ svg.arcs .arc.sticky {
 .line.label .lbl                { color: #9cf; font-weight: bold; }
 .line.pool .m                   { color: #aac; }
 .line.pool .lbl                 { color: #88a; }
+
+/* Alt-entry LABEL row — declared multi-entry point inside a stamped
+   function.  Gold ribbon so the eye picks it out as a real entry
+   distinct from machine-generated .L_<addr>: anchors and the pale-blue
+   "Called from" rows. */
+.line.alt-entry .lbl            { color: #ffd86b; }
+.line.alt-entry                 { background: rgba(180, 140, 60, 0.18); }
 
 /* "Called from FUN_X" label rows — color each caller name by kind.
    The surrounding "Called from" / ":" / "(×N, partner)" text inherits

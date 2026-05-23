@@ -352,6 +352,7 @@ class ListingRow:
     is_attn: bool = False
     is_midpoint: bool = False
     is_ref_end: bool = False
+    is_alt_entry: bool = False           # set on the ENTRY: LABEL row emitted at each declared alt entry addr
 
     # ----- Action wiring — eval_server reads these to attach click handlers
     pin_action: PinAction = PinAction.NONE
@@ -399,6 +400,7 @@ class VerifiedSubseg:
     type: str = "code"
     file: str = ""
     partners: list = field(default_factory=list)   # other subseg start addrs forming the same logical C fn
+    entries: list = field(default_factory=list)    # alt entry addrs inside (start, end] — one stamp, shared body
 
 
 @dataclass
@@ -1143,9 +1145,16 @@ def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
 # ----- Control-flow walk + branch classification + pool extension ----------
 
 def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None,
-                       should_stop=None):
+                       should_stop=None, extra_starts=None):
     """Walk reachable addresses from `start` via control flow.  Returns
     (reachable, max_reachable, branches, indirect_calls).
+
+    `extra_starts` is an optional iterable of additional worklist seeds
+    (used for declared alt entry points that share `start`'s function
+    body — see VerifiedSubseg.entries).  Each is treated like a fresh
+    walk root; reachable, branches, and indirect calls all get merged
+    into the same return tuple as if a single function had multiple
+    entries.
 
     Branches collected as analyzer.Branch records (internal=False initially;
     set later by _classify_branch_internality).
@@ -1164,6 +1173,8 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None,
     branches = []
     indirect = []
     worklist = [start]
+    if extra_starts:
+        worklist.extend(extra_starts)
     while worklist:
         pc = worklist.pop()
         while True:
@@ -2002,6 +2013,15 @@ class BinaryModel:
         self.switch_clusters: dict = {}      # dispatcher_pc -> sorted unique case targets
         self.switch_dispatcher_of: dict = {} # case_addr -> [(dispatcher_pc, case_idx)]
 
+        # User-declared alt entry points: addresses that share their
+        # owning function's body but are themselves entry points
+        # (multiple callable entries, one stamp).  Populated by
+        # SweepState before each /state poll via set_alt_entries().
+        # `alt_entries` is the set of alt addrs; `alt_entry_main`
+        # maps each alt to its owning subseg's start.
+        self.alt_entries: set = set()
+        self.alt_entry_main: dict = {}
+
         # Phase 3 outputs
         self.instructions: dict = {}         # {addr: Instruction}
         self.indirect_resolutions: dict = {} # {addr: resolved_target}
@@ -2091,6 +2111,22 @@ class BinaryModel:
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
+
+    def set_alt_entries(self, alt_entry_main: dict) -> None:
+        """Update the alt-entry view from SweepState's parsed yaml.
+        Called per /state poll; cheap (dict swap + maybe cache flush).
+
+        When the new map differs from the cached one, any analyze_function
+        cache entry for an affected main is invalid (walker would now
+        seed extra worklist entries) so we drop the whole cache.  Cache
+        is small and warms back up on the next /state poll.
+        """
+        new_map = dict(alt_entry_main or {})
+        if new_map == self.alt_entry_main:
+            return
+        self.alt_entry_main = new_map
+        self.alt_entries = set(new_map.keys())
+        self._analyze_cache.clear()
 
     def pool_priors_dict(self) -> dict:
         """Return a {addr: size} dict equivalent to the union eval_server
@@ -2216,6 +2252,11 @@ class BinaryModel:
             reasons.append("user-stamped function entry")
             _bump("HIGH")
 
+        if addr in self.alt_entries:
+            main = self.alt_entry_main[addr]
+            reasons.append(f"user-declared alt entry of FUN_{main:08X}")
+            _bump("HIGH")
+
         sc = self.static_callers.get(addr, 0)
         if sc >= 2:
             reasons.append(f"static callers: {sc}")
@@ -2267,6 +2308,10 @@ class BinaryModel:
 
         if verified_starts is not None and addr in verified_starts:
             reasons.append("user-stamped function entry")
+            _bump("HIGH")
+        if addr in self.alt_entries:
+            main = self.alt_entry_main[addr]
+            reasons.append(f"user-declared alt entry of FUN_{main:08X}")
             _bump("HIGH")
         if addr in self.switch_dispatcher_of:
             disps = self.switch_dispatcher_of[addr]
@@ -2393,7 +2438,20 @@ class BinaryModel:
         """Cached analyze_function.  Returns a copy of the cached
         FunctionAnalysis so callers can safely mutate `end` (the only
         field SweepState mutates post-analysis) without polluting the
-        cache.  Cache key is (start, hint_end)."""
+        cache.  Cache key is (start, hint_end).
+
+        When `start` is a declared alt entry, redirect to the owning
+        function's main start — alt entries share the main's body, so
+        there's exactly one analysis per multi-entry function.  The
+        redirected call BYPASSES the cache: alt callers typically pass
+        a hint_end computed from the alt's natural range (e.g. cap to
+        next stamp), which can differ from a normal main-keyed
+        hint_end and would otherwise pollute the cache entry that
+        normal callers of `main` share.
+        """
+        main = self.alt_entry_main.get(start)
+        if main is not None:
+            return _dc_replace(self._analyze_function_uncached(main, hint_end))
         key = (start, hint_end)
         cached = self._analyze_cache.get(key)
         if cached is None:
@@ -2452,9 +2510,14 @@ class BinaryModel:
         def _should_stop(tgt):
             level, reasons = self.walker_stop_confidence(tgt)
             return (level == "HIGH", level, reasons)
+        # Declared alt entries that belong to this main get seeded into
+        # the walker's worklist so their bodies are part of the
+        # reachable set.  Multi-entry functions: one stamp, one walk,
+        # multiple roots.
+        extra_starts = [a for a, m in self.alt_entry_main.items() if m == start]
         reachable, max_reachable, branches, indirect = _control_flow_walk(
             binary, vram, start, hard_limit, pool_priors=pool_priors,
-            should_stop=_should_stop,
+            should_stop=_should_stop, extra_starts=extra_starts,
         )
 
         # 2b. Switch-cluster sibling absorption.  When `start` is a
@@ -3261,6 +3324,12 @@ class BinaryModel:
             if a > end:
                 break  # sorted list — no more candidates beyond end
             # a is in (start, end]
+            # Declared alt entry points aren't midpoints — they're
+            # entries the user has already accepted as part of this
+            # function.  Suppress here so the banner doesn't flag them
+            # as "reference disagrees" suggestions.
+            if a in self.alt_entries and self.alt_entry_main.get(a) == start:
+                continue
             midpoints.append(Midpoint(
                 addr=a,
                 static_callers=sc.get(a, 0),
@@ -3348,6 +3417,7 @@ class SweepState:
                  ai_override: Optional[dict] = None,
                  analyze_mode: Optional[dict] = None,
                  frontier_simulation: bool = False,
+                 pending_entries: Optional[dict] = None,
                  ):
         self.model = model
         self.yaml_cfg = yaml_cfg
@@ -3375,11 +3445,65 @@ class SweepState:
                 type=s.get("type", "code"),
                 file=s.get("file", ""),
                 partners=[_coerce_addr(p) for p in (s.get("partners") or [])],
+                entries=[_coerce_addr(e) for e in (s.get("entries") or [])],
             )
             for s in (yaml_cfg.get("subsegments") or [])
             if s.get("type") == "code"
         ]
         self.verified.sort(key=lambda s: s.start)
+
+        # Validate `entries:` lists and derive alt_entry_main.  Each alt
+        # entry must sit strictly inside its owning subseg's (start, end]
+        # (alt != start, but alt == end is fine — single-instruction
+        # entry just before the rts).  An alt can't be claimed by two
+        # subsegs.  Bad entries get logged + dropped; valid ones build
+        # the alt_entry_main map the BinaryModel consults.
+        self.alt_entry_main: dict = {}
+        for sub in self.verified:
+            kept = []
+            for e in sub.entries:
+                if not (sub.start < e <= sub.end):
+                    continue
+                if e in self.alt_entry_main:
+                    continue
+                # Reject if inside any OTHER verified subseg.
+                if any(other.start <= e <= other.end
+                       for other in self.verified if other is not sub):
+                    continue
+                kept.append(e)
+                self.alt_entry_main[e] = sub.start
+            sub.entries = kept
+        # Pending alt entries (queued via /queue-entry, not yet written
+        # to yaml).  Stored as `{main_hex: [addr, ...]}` keyed by the
+        # function's main start — explicit binding survives candidate-
+        # identity changes.  Attach each (main, entry) to alt_entry_main
+        # so the analyzer treats them as declared entries during this
+        # poll: the walker seeds them, midpoints suppress them,
+        # function_entry_confidence scores them HIGH.  Lets the human
+        # audit the multi-entry shape before stamping.
+        self.pending_entries: dict = dict(pending_entries or {})
+        for main_hex, entries in self.pending_entries.items():
+            try:
+                main = _coerce_addr(main_hex)
+            except (ValueError, TypeError):
+                continue
+            for e in entries or []:
+                if e <= main:
+                    continue
+                if e in self.alt_entry_main:
+                    continue
+                # Reject if inside any verified subseg that ISN'T the
+                # pending main itself (the main may or may not be in
+                # `self.verified` — unstamped candidates aren't).
+                if any(s.start <= e <= s.end and s.start != main for s in self.verified):
+                    continue
+                self.alt_entry_main[e] = main
+
+        # Push the derived view into the BinaryModel so its analyze_function
+        # / confidence methods see the current alt entries.  Cheap to
+        # call per /state poll: just a dict + set swap, plus cache
+        # invalidation if the dict changed.
+        self.model.set_alt_entries(self.alt_entry_main)
 
         # Sibling-pool cache: per-subseg reachable sets are expensive to
         # build (each requires a full analyze_function), so cache and
@@ -4216,6 +4340,22 @@ class SweepState:
                 pin = PinAction.PIN_START
             else:
                 pin = PinAction.PIN_END
+
+            # ----- Alt entry label
+            # When this address is a declared alt entry of the function
+            # being rendered, emit an ENTRY: marker so the multi-entry
+            # structure is visible in the listing.  Marked with a
+            # dedicated bool so CSS can style it distinctly.
+            if (addr != fa.start
+                    and self.model.alt_entry_main.get(addr) == fa.start):
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label=f"ENTRY FUN_{addr:08X}:",
+                    is_alt_entry=True,
+                ))
 
             # ----- Outstanding switch-case-target hint label
             # When this address is a known case target of an already-

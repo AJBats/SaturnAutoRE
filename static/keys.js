@@ -212,6 +212,19 @@ function partnersHtml(candidate) {
   return parts.join('');
 }
 
+function entriesHtml(candidate) {
+  const parts = [];
+  if (candidate.entries && candidate.entries.length) {
+    const names = candidate.entries.map(e => `FUN_${e.addr_hex}`).join(', ');
+    parts.push(`<span class="entries">Alt entries: ${escapeHtml(names)}</span>`);
+  }
+  if (candidate.pending_entries && candidate.pending_entries.length) {
+    const names = candidate.pending_entries.map(e => `FUN_${e.addr_hex}`).join(', ');
+    parts.push(`<span class="entries pending">Queued entry: ${escapeHtml(names)}</span>`);
+  }
+  return parts.join('');
+}
+
 function renderCandidateBanner(target, candidate, prev, paneLabel) {
   if (!candidate) {
     target.innerHTML = '';
@@ -241,6 +254,7 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     ${evidenceHtml(c.evidence)}
     ${prev ? `<span class="prev">after ${prev.name}</span>` : ''}
     ${partnersHtml(c)}
+    ${entriesHtml(c)}
     ${greenFlagsHtml}
     ${flagsHtml}
     ${midpointsHtml(c.evidence)}

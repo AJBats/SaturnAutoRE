@@ -168,6 +168,16 @@ flow:
     approve).
   - `candidate.partner_balanced` — true when the verdict has been
     upgraded because partners cover the imbalance.
+  - `candidate.entries` — alt entry addrs declared on this function
+    in yaml (multi-entry function: several callable entries sharing
+    one body — one stamp, no overlap). Distinct from partners: same
+    body, multiple entries vs. disjoint bodies, one logical function.
+  - `candidate.pending_entries` — alt entry addrs queued for the next
+    approve (set via `/queue-entry`, written to yaml on approve).
+    While queued, the analyzer treats them as if already declared —
+    walker seeds them, midpoints suppress them, `function_entry_confidence`
+    scores them HIGH — so you can audit the multi-entry shape before
+    stamping.
   - `analyze_mode` — non-null when the user/AI is exploring a
     multi-block synthetic candidate (e.g. switch dispatcher + case
     bodies). See "Analyze mode" below.
@@ -196,6 +206,17 @@ flow:
   address for the next approve. Toggles if already queued. The
   partner is written to the yaml's `partners:` list on the candidate's
   next approve verdict; no yaml mutation happens before that.
+- **`POST /queue-entry {"entry": "0x..."}`** — queue an alt entry
+  address for the next approve. Toggles if already queued. Must sit
+  strictly inside the current candidate's `(start, end]` and not
+  fall in another stamped subseg. The entry is written to the yaml's
+  `entries:` list on the next approve. Golden path for adding alt
+  entries — there is intentionally no retroactive `/add-entry`; to
+  add an entry to an already-stamped function, `/unstamp` it first
+  and re-queue.
+- **`POST /remove-entry {"main": "0x...", "entry": "0x..."}`** —
+  drop an alt entry from a stamped subseg's `entries:` list.
+  Backout-only; for adds use `/queue-entry`.
 
 ### Analyze mode (multi-block exploration)
 
