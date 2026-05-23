@@ -5,6 +5,11 @@ let LAST_CANDIDATE_END = null;
 let LAST_NATURAL_START = null;
 let LAST_NATURAL_END = null;
 let LAST_ATTN_KEY = '';
+// Identity key of the candidate's entries + pending_entries.  Changes
+// when the user queues / unqueues an alt entry (boundaries stay the
+// same, so primChanged wouldn't trip — without this guard the listing
+// keeps rendering against stale row data until F5).
+let LAST_ENTRIES_KEY = '';
 
 function setStatus(text) {
   document.getElementById('status').textContent = text;
@@ -711,6 +716,7 @@ async function fetchState() {
       LAST_CANDIDATE_END = null;
       LAST_NATURAL_START = null;
       LAST_NATURAL_END = null;
+      LAST_ENTRIES_KEY = '';
       return;
     }
 
@@ -742,6 +748,14 @@ async function fetchState() {
     const attnKey = Array.from(attnSet).sort().join(',');
     const attnChanged = (attnKey !== LAST_ATTN_KEY);
     LAST_ATTN_KEY = attnKey;
+    // Detect entries-set churn (confirmed OR queued).  Boundary-only
+    // change detection misses /queue-entry and /remove-entry because
+    // they keep start/end identical, so we'd serve stale listing rows.
+    const confirmedAddrs = (s.candidate.entries || []).map(e => e.addr);
+    const pendingAddrs   = (s.candidate.pending_entries || []).map(e => e.addr);
+    const entriesKey = [...confirmedAddrs, '|', ...pendingAddrs].sort().join(',');
+    const entriesChanged = (entriesKey !== LAST_ENTRIES_KEY);
+    LAST_ENTRIES_KEY = entriesKey;
     // Per-pane midpoint sets — reference's view of where function starts
     // fall INSIDE each pane's candidate range.  Each pane uses its own
     // range so the natural pane (often wider) can highlight midpoints
@@ -765,7 +779,7 @@ async function fetchState() {
     }
     const primRefEndSet = refEndSet(s.candidate);
     const natRefEndSet  = overrideActive ? refEndSet(s.natural_view.candidate) : primRefEndSet;
-    if (primChanged || natChanged || attnChanged) {
+    if (primChanged || natChanged || attnChanged || entriesChanged) {
       if (overrideActive) {
         // Diff-align so rows for the same VRAM anchor address sit at the
         // same Y position across panes.  When a side has a header /
