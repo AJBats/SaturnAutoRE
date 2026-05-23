@@ -242,6 +242,7 @@ class FunctionAnalysis:
     verdict: Verdict = Verdict.UNKNOWN
     yellow_flags: list = field(default_factory=list)
     green_flags: list = field(default_factory=list)
+    flag_tooltips: dict = field(default_factory=dict)  # flag_text -> hover-tooltip
     partner_balanced: bool = False        # set by SweepState.apply_partner_awareness when partners resolve combined frame balance
 
     # ----- Reference / midpoint / evidence
@@ -514,6 +515,32 @@ def _ctrl_pop(mnem):
     if len(parts) != 3:
         return None
     return parts[2]
+
+
+def _stack_pushed_reg(mnem):
+    """Unified push-extractor: return the register being pushed onto r15
+    by `mnem` (one of mov.l rN, sts.l pr/macl, stc.l gbr/vbr/sr) or None.
+    """
+    if not mnem:
+        return None
+    if _is_pr_push(mnem): return "pr"
+    if _is_macl_push(mnem): return "macl"
+    r = _push_register(mnem)
+    if r is not None: return r
+    return _ctrl_push(mnem)
+
+
+def _stack_popped_reg(mnem):
+    """Unified pop-extractor: return the register being popped from r15
+    by `mnem` (one of mov.l @r15+, lds.l pr/macl, ldc.l gbr/vbr/sr) or
+    None."""
+    if not mnem:
+        return None
+    if _is_pr_pop(mnem): return "pr"
+    if _is_macl_pop(mnem): return "macl"
+    r = _pop_register(mnem)
+    if r is not None: return r
+    return _ctrl_pop(mnem)
 
 
 def _is_stack_alloc(mnem):
@@ -2593,15 +2620,85 @@ class BinaryModel:
         if phantom_hint:
             flags = ["supported only by cross-module phantom callers (likely hot-swap collision, not a real entry)"] + list(flags)
 
-        # Positive frame-balance signal: function pushed callee-saved
-        # regs in its prologue AND popped exactly the same set in mirror
-        # order at its epilogue, with no orphan pops elsewhere.  Surfaces
-        # well-formed C-compiled functions as a green chip in the banner,
-        # since the absence of yellow_flags alone is hard to spot.
+        # Positive frame-balance signal.  Two conditions:
+        #   (a) every callee-saved reg pushed in the prologue is popped
+        #       somewhere reachable
+        #   (b) every "orphan" reachable pop (popped but not in the
+        #       prologue's saved set) has a matching push reachable too
+        #       — i.e., it's part of a locally-balanced save-around-jsr
+        #       or similar body pattern, not a partner-frame unwind
+        #
+        # Bypasses `restored` / `restored_extras` because those depend on
+        # the epilogue walker's contiguity rules — variable-size stack
+        # deallocs (`sub rN, r15` interleaved between pops at the drain)
+        # split the contiguous sequence and leave some prologue pops
+        # uncaptured.  Scanning the full reachable set with the unified
+        # push/pop extractors is more permissive but catches the cases
+        # the contiguity walker misses, while still rejecting truly
+        # imbalanced functions via the orphan-with-no-push check.
+        # Frame-balance signal — run two complementary checks and
+        # dispatch based on whether they agree:
+        #
+        #   STRICT: set(saved) == set(restored ∪ restored_extras)
+        #     Looks only at pops the epilogue walker captured near each
+        #     exit.  Misses pops scattered through the body or hidden
+        #     behind non-pop instructions (e.g. `sub rN, r15` variable
+        #     dealloc interleaved with the drain pops).
+        #
+        #   PERMISSIVE: saved ⊆ reachable_pops AND every orphan pop has
+        #   a matching push reachable
+        #     Scans the full reachable set for pops/pushes.  Catches
+        #     central-drain functions the strict check misses.  Loses
+        #     register-rename-through-stack patterns the strict check
+        #     gets right (push rX + pop rY reading the same slot).
+        #
+        # Both pass  → green "balanced" flag
+        # Both fail  → no flag (genuinely unbalanced)
+        # Disagree   → yellow "mixed-signal" flag with a tooltip
+        #              explaining which check fired and likely structure
         green_flags: list = []
-        if saved and not restored_extras and list(restored) == list(reversed(saved)):
+        flag_tooltips: dict = {}
+        if saved:
+            strict_balanced = set(saved) == set(restored or []) | set(restored_extras or [])
+            reachable_pushes: set = set()
+            reachable_pops: set = set()
+            for a in sorted(reachable):
+                op = _read_opcode(binary, vram, a)
+                if op is None: continue
+                mn, _ = _decode_sh2(op, a)
+                if mn is None: continue
+                pushed = _stack_pushed_reg(mn)
+                if pushed: reachable_pushes.add(pushed)
+                popped = _stack_popped_reg(mn)
+                if popped: reachable_pops.add(popped)
+            saved_set = set(saved)
+            unmatched_orphan_pops = (reachable_pops - saved_set) - reachable_pushes
+            permissive_balanced = (
+                saved_set <= reachable_pops and not unmatched_orphan_pops
+            )
             regs_str = ", ".join(saved)
-            green_flags.append(f"prologue/epilogue balanced — saved & restored [{regs_str}]")
+            if strict_balanced and permissive_balanced:
+                green_flags.append(f"prologue/epilogue balanced — saved & restored [{regs_str}]")
+            elif strict_balanced and not permissive_balanced:
+                tag = "pro/epi mixed-signal (rename or partner unwind?)"
+                flags.append(tag)
+                flag_tooltips[tag] = (
+                    f"Saved set [{regs_str}] matches the near-exit epilogue, "
+                    "but the function body has reachable pops without "
+                    "matching pushes. Likely register-rename through stack "
+                    "(push rX, pop rY reads the same slot) OR a partner-"
+                    "style unwind of the caller's frame."
+                )
+            elif not strict_balanced and permissive_balanced:
+                tag = "pro/epi mixed-signal (central drain or split exit?)"
+                flags.append(tag)
+                flag_tooltips[tag] = (
+                    f"All saved registers [{regs_str}] are popped somewhere "
+                    "reachable, but not at the function's immediate epilogue. "
+                    "Likely a central-drain pattern (shared cleanup section "
+                    "in the middle of the function) OR a split exit "
+                    "(multiple epilogue paths, each balanced)."
+                )
 
         return FunctionAnalysis(
             start=start,
@@ -2622,6 +2719,7 @@ class BinaryModel:
             verdict=verdict_enum,
             yellow_flags=flags,
             green_flags=green_flags,
+            flag_tooltips=flag_tooltips,
             indent_depths=indent_depths,
             indirect_resolutions=indirect_resolutions,
             reference=reference,

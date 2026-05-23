@@ -218,11 +218,17 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
     return;
   }
   const c = candidate;
+  const flagTooltips = c.flag_tooltips || {};
+  const flagSpan = (f, extraClass) => {
+    const tip = flagTooltips[f];
+    const titleAttr = tip ? ` title="${escapeHtml(tip)}"` : '';
+    return `<span class="flag${extraClass ? ' ' + extraClass : ''}"${titleAttr}>${escapeHtml(f)}</span>`;
+  };
   const greenFlagsHtml = (c.green_flags && c.green_flags.length)
-    ? `<span class="flags">${c.green_flags.map(f => `<span class="flag flag-green">${escapeHtml(f)}</span>`).join('')}</span>`
+    ? `<span class="flags">${c.green_flags.map(f => flagSpan(f, 'flag-green')).join('')}</span>`
     : '';
   const flagsHtml = (c.yellow_flags && c.yellow_flags.length)
-    ? `<span class="flags">${c.yellow_flags.map(f => `<span class="flag">${escapeHtml(f)}</span>`).join('')}</span>`
+    ? `<span class="flags">${c.yellow_flags.map(f => flagSpan(f)).join('')}</span>`
     : '';
   const label = paneLabel ? `<span class="pane-label">${escapeHtml(paneLabel)}</span>` : '';
   target.innerHTML = `
