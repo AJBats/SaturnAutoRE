@@ -360,6 +360,17 @@ header#header > #header-content {
   background: rgba(108, 195, 108, 0.25);
   border-radius: 0.15em;
 }
+/* Shift-held: + on a row inside the candidate's body queues that
+   addr as an alt entry instead of pinning the boundary.  Swap hover
+   to the gold ENTRY palette so the new meaning is obvious before
+   the click lands.  Outside the candidate section the gold doesn't
+   appear because /queue-entry would server-reject anyway. */
+body.shift-held .line.section-current .pin-zone {
+  color: #ffd86b;
+}
+body.shift-held .line.section-current .pin-zone:hover {
+  background: rgba(180, 140, 60, 0.35);
+}
 
 /* Unpin button inside the trailing-zone section header on the primary
    pane.  Only rendered when an ai_override is active.  Reusing the

@@ -913,20 +913,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const addr = parseInt(line.dataset.addr, 10);
     if (Number.isNaN(addr) || addr <= 0) return;
     const bytesLen = parseInt(line.dataset.bytesLen || '0', 10);
-    // Route based on click position relative to the current candidate:
-    //  - Above current start → pin-start (this addr becomes the new
-    //    function start).
-    //  - At or below current start → pin-end with INCLUSIVE semantics:
-    //    send next_start = addr + bytes_len.  Reads as "include
-    //    through this row's last byte" — clicking on the last
-    //    instruction the user wants in the function extends the end
-    //    through that row.  Label rows have bytes_len=0 → exclusive
-    //    behavior (label marks the next function's start).
-    // Server-side comparisons against the live candidate cover edge
-    // cases (clicking at the candidate start = noop via the "addr
-    // must be after start" validation).
+    // Route based on modifier + click position relative to the
+    // current candidate:
+    //  - Shift held → /queue-entry: toggle this addr as an alt entry
+    //    of the current candidate (gold "+ Entry" hover signals this).
+    //    Server validates the addr is inside the candidate's range;
+    //    out-of-range shift+clicks get rejected with a status message.
+    //  - No modifier, above current start → /pin-start.
+    //  - No modifier, at or below current start → /pin-end with
+    //    INCLUSIVE semantics (next_start = addr + bytes_len).  Label
+    //    rows have bytes_len=0 → exclusive (label marks next start).
     let url, body;
-    if (LAST_CANDIDATE_START != null && addr < LAST_CANDIDATE_START) {
+    if (e.shiftKey) {
+      url = '/queue-entry';
+      body = {entry: '0x' + addr.toString(16).toUpperCase().padStart(8, '0')};
+    } else if (LAST_CANDIDATE_START != null && addr < LAST_CANDIDATE_START) {
       url = '/pin-start';
       body = {addr: '0x' + addr.toString(16).toUpperCase().padStart(8, '0')};
     } else {
@@ -975,6 +976,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   document.addEventListener('keydown', (e) => {
+    if (e.key === 'Shift') document.body.classList.add('shift-held');
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
     const analyzeRowVisible = !document.getElementById('analyze-row').classList.contains('hidden');
     if (analyzeRowVisible) {
@@ -986,6 +988,16 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === '1') { e.preventDefault(); document.getElementById('btn-approve').click(); }
     else if (e.key === '2') { e.preventDefault(); document.getElementById('btn-reject').click(); }
     else if (e.key === '3') { e.preventDefault(); document.getElementById('btn-unsure').click(); }
+  });
+  // Shift-held state lets CSS recolor pin-zone hover gold (= queue alt
+  // entry semantics) inside the candidate.  Drop on keyup AND window
+  // blur — without the blur handler, alt-tabbing away while holding
+  // shift leaves the body class stuck on.
+  document.addEventListener('keyup', (e) => {
+    if (e.key === 'Shift') document.body.classList.remove('shift-held');
+  });
+  window.addEventListener('blur', () => {
+    document.body.classList.remove('shift-held');
   });
 
   // Analyze-mode button wiring.
