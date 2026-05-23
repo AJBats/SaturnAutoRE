@@ -650,6 +650,16 @@ svg.arcs .arc.sticky {
 .line.uncond-indirect .tag { background: #5a2a2a; color: #fdd; }   /* ⇒ exits */
 .line.tail-call .tag       { background: #f55; color: #fff; }      /* ⇒ TAIL? — loudest */
 
+/* Stack push/pop operand soft highlight — `@-r15` / `@r15+` inside
+   the mnem column.  Background box (highlighter-pen effect) so a column
+   of stack ops reads vertically while scanning the listing. */
+.line .m .stack-op {
+  background: #3a4a2a;
+  color: #cea;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
 /* Footer — feedback box always visible above the verdict buttons */
 footer#footer {
   position: fixed;

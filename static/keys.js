@@ -466,7 +466,14 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
     const pinPart = line.addr
       ? `<span class="pin-zone" title="include this row in the function; pin end at the last byte of this row">+</span>`
       : `<span class="pin-zone"></span>`;
-    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${escapeHtml(line.mnem || '')}</span>${tagPart}</span>`;
+    // Stack push (@-r15) / pop (@r15+) get a soft highlight so the eye
+    // can scan stack manipulations vertically.  Substring replace on the
+    // already-escaped mnem is safe — neither `@-r15` nor `@r15+` contain
+    // chars that escapeHtml mangles.
+    const mnemHtml = escapeHtml(line.mnem || '')
+      .replaceAll('@-r15', '<span class="stack-op">@-r15</span>')
+      .replaceAll('@r15+', '<span class="stack-op">@r15+</span>');
+    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${mnemHtml}</span>${tagPart}</span>`;
   }).join('\n');
   target.innerHTML = html;
   if (isPrimary) {
