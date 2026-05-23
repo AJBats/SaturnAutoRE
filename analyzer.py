@@ -447,8 +447,8 @@ _FN_START_PREFIXES = (
     "mov.l r8, @-r15", "mov.l r9, @-r15", "mov.l r10, @-r15",
     "mov.l r11, @-r15", "mov.l r12, @-r15", "mov.l r13, @-r15",
     "mov.l r14, @-r15",
-    # PR / MACL push — typical pre-prologue save.
-    "sts.l pr, @-r15", "sts.l macl, @-r15",
+    # PR / MACL / MACH push — typical pre-prologue save.
+    "sts.l pr, @-r15", "sts.l macl, @-r15", "sts.l mach, @-r15",
     # Scratch-register pushes — tiny helper functions (memclr/memcpy-style
     # loops, jsr trampolines) save only r0-r7 because they don't call out.
     "mov.l r0, @-r15", "mov.l r1, @-r15", "mov.l r2, @-r15",
@@ -495,6 +495,8 @@ def _is_pr_push(mnem):   return mnem == "sts.l pr, @-r15"
 def _is_pr_pop(mnem):    return mnem == "lds.l @r15+, pr"
 def _is_macl_push(mnem): return mnem == "sts.l macl, @-r15"
 def _is_macl_pop(mnem):  return mnem == "lds.l @r15+, macl"
+def _is_mach_push(mnem): return mnem == "sts.l mach, @-r15"
+def _is_mach_pop(mnem):  return mnem == "lds.l @r15+, mach"
 
 
 def _ctrl_push(mnem):
@@ -519,12 +521,14 @@ def _ctrl_pop(mnem):
 
 def _stack_pushed_reg(mnem):
     """Unified push-extractor: return the register being pushed onto r15
-    by `mnem` (one of mov.l rN, sts.l pr/macl, stc.l gbr/vbr/sr) or None.
+    by `mnem` (one of mov.l rN, sts.l pr/macl/mach, stc.l gbr/vbr/sr) or
+    None.
     """
     if not mnem:
         return None
     if _is_pr_push(mnem): return "pr"
     if _is_macl_push(mnem): return "macl"
+    if _is_mach_push(mnem): return "mach"
     r = _push_register(mnem)
     if r is not None: return r
     return _ctrl_push(mnem)
@@ -532,12 +536,13 @@ def _stack_pushed_reg(mnem):
 
 def _stack_popped_reg(mnem):
     """Unified pop-extractor: return the register being popped from r15
-    by `mnem` (one of mov.l @r15+, lds.l pr/macl, ldc.l gbr/vbr/sr) or
-    None."""
+    by `mnem` (one of mov.l @r15+, lds.l pr/macl/mach, ldc.l gbr/vbr/sr)
+    or None."""
     if not mnem:
         return None
     if _is_pr_pop(mnem): return "pr"
     if _is_macl_pop(mnem): return "macl"
+    if _is_mach_pop(mnem): return "mach"
     r = _pop_register(mnem)
     if r is not None: return r
     return _ctrl_pop(mnem)
@@ -691,6 +696,10 @@ def _walk_prologue(binary, vram, start):
             saved.append("macl")
             last_prologue = addr
             consecutive_non_prologue = 0
+        elif _is_mach_push(mnem):
+            saved.append("mach")
+            last_prologue = addr
+            consecutive_non_prologue = 0
         elif _ctrl_push(mnem) is not None:
             saved.append(_ctrl_push(mnem))
             last_prologue = addr
@@ -744,6 +753,7 @@ def _walk_epilogue_pops_all(binary, vram, end):
         return (_pop_register(m)
                 or ("pr" if _is_pr_pop(m) else None)
                 or ("macl" if _is_macl_pop(m) else None)
+                or ("mach" if _is_mach_pop(m) else None)
                 or _ctrl_pop(m))
 
     # Check the delay slot — GCC schedules an epilogue pop here sometimes.
@@ -858,7 +868,8 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
     if mnem_ds:
         ds_pop_reg = (_pop_register(mnem_ds)
                       or ("pr" if _is_pr_pop(mnem_ds) else None)
-                      or ("macl" if _is_macl_pop(mnem_ds) else None))
+                      or ("macl" if _is_macl_pop(mnem_ds) else None)
+                      or ("mach" if _is_mach_pop(mnem_ds) else None))
     ds_dealloc = _is_stack_dealloc(mnem_ds) if mnem_ds else None
     delay_slot_consumed = False
     matched_stack = 0
@@ -910,17 +921,22 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
         # stack-alloc/dealloc-mismatch flag).
         if (_push_register(mnem) is not None
                 or mnem == "sts.l pr, @-r15"
-                or mnem == "sts.l macl, @-r15"):
+                or mnem == "sts.l macl, @-r15"
+                or mnem == "sts.l mach, @-r15"):
             break
 
-        # Pop / pr-pop / macl-pop: must match expected sequence.
+        # Pop / pr-pop / macl-pop / mach-pop: must match expected sequence.
         reg = _pop_register(mnem)
         is_pr = _is_pr_pop(mnem)
         is_macl = _is_macl_pop(mnem)
+        is_mach = _is_mach_pop(mnem)
         dealloc = _is_stack_dealloc(mnem)
 
-        if reg or is_pr or is_macl:
-            popped = reg or ("pr" if is_pr else "macl")
+        if reg or is_pr or is_macl or is_mach:
+            popped = (reg
+                      or ("pr" if is_pr else None)
+                      or ("macl" if is_macl else None)
+                      or ("mach" if is_mach else None))
             if expected_idx < len(expected) and popped == expected[expected_idx]:
                 matches.append(popped)
                 expected_idx += 1
@@ -1442,12 +1458,12 @@ def _verdict(saved, stack_alloc, restored, stack_dealloc, final_rts, branches, c
     #      prologue's push list in reverse-walk order, so `restored` is
     #      always a SUFFIX of `reversed(saved)`.  Anything missing from
     #      the head of that suffix is a "mid-life save" and not a problem.
-    saved_critical = {r for r in saved if r in ("pr", "macl")}
-    restored_critical = {r for r in restored if r in ("pr", "macl")}
+    saved_critical = {r for r in saved if r in ("pr", "macl", "mach")}
+    restored_critical = {r for r in restored if r in ("pr", "macl", "mach")}
     missing_critical = saved_critical - restored_critical
 
-    saved_gp = [r for r in saved if r not in ("pr", "macl")]
-    restored_gp = [r for r in restored if r not in ("pr", "macl")]
+    saved_gp = [r for r in saved if r not in ("pr", "macl", "mach")]
+    restored_gp = [r for r in restored if r not in ("pr", "macl", "mach")]
     expected_gp = list(reversed(saved_gp))
     gp_suffix_ok = (not restored_gp) or (restored_gp == expected_gp[-len(restored_gp):])
 
@@ -2525,6 +2541,15 @@ class BinaryModel:
                 mnem, _ = _decode_sh2(op, a)
                 if mnem and _is_macl_pop(mnem):
                     restored.append("macl")
+                    break
+        if "mach" in saved and "mach" not in restored:
+            for a in reachable:
+                op = _read_opcode(binary, vram, a)
+                if op is None:
+                    continue
+                mnem, _ = _decode_sh2(op, a)
+                if mnem and _is_mach_pop(mnem):
+                    restored.append("mach")
                     break
 
         # 5. Extend end through trailing pool zone (no-op if pool_priors empty).
