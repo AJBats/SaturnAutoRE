@@ -27,7 +27,13 @@ function setStatus(text) {
 
 function progressHtml(p) {
   if (!p) return '';
-  const pct = p.pct.toFixed(2);
+  // Floor-truncate, not round.  toFixed(2) rounds half-up, so 99.9953%
+  // displays as "100.00%" — that's the worst time to lose precision,
+  // because the user's signal for "am I actually done" disappears.
+  // Only show 100.00% when verified === total exactly.
+  const pct = (p.verified_bytes === p.total_bytes)
+    ? '100.00'
+    : (Math.floor(p.pct * 100) / 100).toFixed(2);
   const v = p.verified_bytes.toLocaleString();
   const t = p.total_bytes.toLocaleString();
   // Tiny inline bar — width = pct, RPG-style fill
