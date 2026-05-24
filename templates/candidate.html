@@ -11,6 +11,7 @@
     <div id="gap-alert" class="gap-alert hidden"></div>
     <header id="header">
       <span id="progress-content">loading…</span>
+      <div id="scrubber" class="scrubber hidden" title="Click any segment to focus that function. Color = stamped confidence (HIGH/MEDIUM/LOW)."></div>
       <button id="btn-frontier" class="frontier-toggle" title="Frontier simulation: drop the next-stamp cap so the walker behaves as if THIS were the next unswept function. Use for auditing walker signal quality.">FRONTIER: OFF</button>
     </header>
     <div id="banners-row" class="banners-row">
@@ -39,6 +40,7 @@
       <button id="btn-reject"  data-verdict="rejected">2 reject</button>
       <button id="btn-unsure"  data-verdict="unsure">3 unsure</button>
       <span id="partner-buttons" class="partner-buttons"></span>
+      <button id="btn-audit" class="audit-toggle" title="Enter AUDIT MODE — walk through every stamped function with ←/→ and unstamp on demand.">audit</button>
       <span id="status" class="status">history: 0</span>
     </div>
     <div class="analyze-row hidden" id="analyze-row">
@@ -46,6 +48,13 @@
       <button id="btn-analyze-next" title="next block (→)">next block →</button>
       <button id="btn-analyze-exit" title="exit ANALYZE MODE">✕ exit ANALYZE MODE</button>
       <span id="analyze-status" class="status"></span>
+    </div>
+    <div class="audit-row hidden" id="audit-row">
+      <button id="btn-audit-prev" title="previous stamped function (←)">← prev</button>
+      <button id="btn-audit-next" title="next stamped function (→)">next →</button>
+      <button id="btn-audit-unstamp" class="audit-unstamp" title="Unstamp the focused function; audit focus advances to the previous stamp.">unstamp</button>
+      <button id="btn-audit-exit" title="exit AUDIT MODE">✕ exit AUDIT</button>
+      <span id="audit-status" class="status"></span>
     </div>
   </footer>
 

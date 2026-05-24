@@ -10,6 +10,16 @@ let LAST_ATTN_KEY = '';
 // same, so primChanged wouldn't trip — without this guard the listing
 // keeps rendering against stale row data until F5).
 let LAST_ENTRIES_KEY = '';
+// Identity of the scrubber's verified-subseg set + focus.  Skip the
+// (300+ cell) DOM rebuild when nothing changed.  Format:
+// "<count>|<start1>:<end1>:<verdict1>,...|<focus>" — end is included
+// so an external yaml edit that changes a stamp's boundary forces
+// a rebuild (the tooltip carries the end hex).
+let LAST_SCRUBBER_KEY = '';
+// Last audit focus address from /state.  Used by the unstamp handler
+// instead of reading `.scrubber-cell.focused` from DOM, which can lag
+// server state if a focus POST is in flight.
+let LAST_AUDIT_FOCUS = null;
 
 function setStatus(text) {
   document.getElementById('status').textContent = text;
@@ -153,6 +163,59 @@ function renderGapAlert(gaps) {
   `;
 }
 
+// Scrubber: bar of equal-width cells in the header — one per verified
+// subseg, colored by per-function confidence (HIGH/MEDIUM/LOW), with
+// the focused cell outlined.  Click → POST /audit-mode/focus.  We
+// rebuild the DOM only when the verified set or focus changes, since
+// the 300+ children would otherwise re-paint every 1s poll.
+function renderScrubber(scrubberData, focusStart) {
+  const el = document.getElementById('scrubber');
+  if (!el) return;
+  if (!scrubberData) {
+    el.classList.add('hidden');
+    el.innerHTML = '';
+    LAST_SCRUBBER_KEY = '';
+    return;
+  }
+  const key = `${scrubberData.length}|`
+    + scrubberData.map(c => `${c.start}:${c.end_hex}:${c.verdict}`).join(',')
+    + `|${focusStart}`;
+  if (key === LAST_SCRUBBER_KEY) {
+    // Identity unchanged — DOM already correct; nothing to do.
+    return;
+  }
+  LAST_SCRUBBER_KEY = key;
+  const cells = scrubberData.map(c => {
+    const focused = (c.start === focusStart) ? ' focused' : '';
+    const tip = `${c.name}  ·  ${c.size}b  ·  ${c.verdict}  ·  0x${c.start_hex} → 0x${c.end_hex}`;
+    return `<div class="scrubber-cell verdict-${c.verdict}${focused}" `
+      + `data-start="${c.start}" `
+      + `title="${escapeHtml(tip)}"></div>`;
+  }).join('');
+  el.classList.remove('hidden');
+  el.innerHTML = cells;
+}
+
+// Update the audit-row's status text + button enabled state.  Called
+// only when audit_mode is active.
+function renderAuditStatus(audit, candidate) {
+  const status = document.getElementById('audit-status');
+  if (status) {
+    const verdict = candidate ? candidate.verdict : '?';
+    const name = candidate ? candidate.name : `FUN_${audit.focus_hex}`;
+    status.textContent =
+      `function ${audit.focus_index + 1} of ${audit.total} `
+      + `— ${name} · ${verdict}`;
+  }
+  // Disable arrow buttons at the ends so the user gets visual feedback
+  // that they've hit the boundary (the server clamps too, but a
+  // disabled button reads more clearly than a silent no-op).
+  const prev = document.getElementById('btn-audit-prev');
+  const next = document.getElementById('btn-audit-next');
+  if (prev) prev.disabled = (audit.focus_index === 0);
+  if (next) next.disabled = (audit.focus_index >= audit.total - 1);
+}
+
 // Global header: project-level info only (progress + caught-up message).
 // Per-candidate metadata moved to .pane-banner inside each listing pane.
 function renderProgress(s) {
@@ -165,12 +228,18 @@ function renderProgress(s) {
   } else {
     el.innerHTML = progressHtml(s.progress);
   }
+}
+
+// Refresh the FRONTIER badge (label + active class) from /state.  Kept
+// separate from renderProgress so it can fire in audit mode too — the
+// progress bar is suppressed there, but the frontier toggle is still
+// live and the badge would otherwise go stale after a click.
+function renderFrontierButton(s) {
   const btn = document.getElementById('btn-frontier');
-  if (btn) {
-    const on = !!s.frontier_simulation;
-    btn.textContent = on ? 'FRONTIER: ON' : 'FRONTIER: OFF';
-    btn.classList.toggle('active', on);
-  }
+  if (!btn) return;
+  const on = !!s.frontier_simulation;
+  btn.textContent = on ? 'FRONTIER: ON' : 'FRONTIER: OFF';
+  btn.classList.toggle('active', on);
 }
 
 // Per-pane banner: full candidate metadata for one side of the diff.
@@ -685,20 +754,46 @@ async function fetchState() {
     const r = await fetch('/state');
     const s = await r.json();
 
-    renderProgress(s);
-    if (s.analyze_mode) {
-      renderAnalyzeBanner(s.analyze_mode);
+    // AUDIT MODE owns the header (scrubber replaces progress) and the
+    // footer (audit-row replaces verdict-row).  Audit + analyze are
+    // mutually exclusive on the server, so the analyze branches below
+    // are skipped while audit is on.
+    const auditOn = !!s.audit_mode;
+    const progressEl = document.getElementById('progress-content');
+    // FRONTIER badge refreshes in both modes — the toggle stays live
+    // in audit mode so users can flip between "show me what was
+    // stamped" and "show me what the walker would do today".
+    renderFrontierButton(s);
+    LAST_AUDIT_FOCUS = auditOn ? s.audit_mode.focus_start : null;
+    if (auditOn) {
+      if (progressEl) progressEl.classList.add('hidden');
+      renderScrubber(s.scrubber, s.audit_mode.focus_start);
+      // Suppress gap alert + analyze banner in audit (server already
+      // suppresses internal_gaps; clear analyze-mode banner state too).
+      renderGapAlert([]);
     } else {
-      renderGapAlert(s.internal_gaps);
+      if (progressEl) progressEl.classList.remove('hidden');
+      renderScrubber(null, null);
+      renderProgress(s);
+      if (s.analyze_mode) {
+        renderAnalyzeBanner(s.analyze_mode);
+      } else {
+        renderGapAlert(s.internal_gaps);
+      }
     }
-    // Swap footer button rows based on mode.
-    document.getElementById('verdict-row').classList.toggle('hidden', !!s.analyze_mode);
-    document.getElementById('analyze-row').classList.toggle('hidden', !s.analyze_mode);
-    if (s.analyze_mode) {
+    // Swap footer button rows based on mode.  Verdict row hidden when
+    // EITHER analyze or audit is active.
+    document.getElementById('verdict-row').classList.toggle('hidden', !!s.analyze_mode || auditOn);
+    document.getElementById('analyze-row').classList.toggle('hidden', !s.analyze_mode || auditOn);
+    document.getElementById('audit-row').classList.toggle('hidden', !auditOn);
+    if (s.analyze_mode && !auditOn) {
       const am = s.analyze_mode;
       const cur = am.blocks_summary[am.active_block];
       document.getElementById('analyze-status').textContent =
         `block ${am.active_block + 1} of ${am.block_count} — 0x${cur.start_hex} → 0x${cur.end_hex}`;
+    }
+    if (auditOn) {
+      renderAuditStatus(s.audit_mode, s.candidate);
     }
     // Render "+ Partner FUN_X" buttons in the verdict row, one per
     // suggestion.  Pressed state reflects whether the addr is already
@@ -986,6 +1081,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (e.key === 'Shift') document.body.classList.add('shift-held');
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
     const analyzeRowVisible = !document.getElementById('analyze-row').classList.contains('hidden');
+    const auditRowVisible   = !document.getElementById('audit-row').classList.contains('hidden');
+    if (auditRowVisible) {
+      if (e.key === 'ArrowLeft')  { e.preventDefault(); document.getElementById('btn-audit-prev').click(); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); document.getElementById('btn-audit-next').click(); }
+      // 1/2/3 verdicts are disabled in audit mode — server returns 409.
+      return;
+    }
     if (analyzeRowVisible) {
       if (e.key === 'ArrowLeft')  { e.preventDefault(); document.getElementById('btn-analyze-prev').click(); }
       else if (e.key === 'ArrowRight') { e.preventDefault(); document.getElementById('btn-analyze-next').click(); }
@@ -1029,6 +1131,59 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-analyze-prev').addEventListener('click', () => analyzeCycle('prev'));
   document.getElementById('btn-analyze-next').addEventListener('click', () => analyzeCycle('next'));
   document.getElementById('btn-analyze-exit').addEventListener('click', analyzeExit);
+
+  // ---- AUDIT MODE wiring ----
+  async function auditPost(url, body) {
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body || {}),
+    });
+    const data = await r.json();
+    if (!data.ok) {
+      setStatus(`${url.slice(1)} failed: ` + (data.error || 'unknown'));
+      return false;
+    }
+    fetchState();
+    return true;
+  }
+  document.getElementById('btn-audit').addEventListener('click', () => {
+    auditPost('/audit-mode/enter', {});
+  });
+  document.getElementById('btn-audit-exit').addEventListener('click', () => {
+    auditPost('/audit-mode/exit', {});
+  });
+  document.getElementById('btn-audit-prev').addEventListener('click', () => {
+    auditPost('/audit-mode/cycle', {direction: 'prev'});
+  });
+  document.getElementById('btn-audit-next').addEventListener('click', () => {
+    auditPost('/audit-mode/cycle', {direction: 'next'});
+  });
+  document.getElementById('btn-audit-unstamp').addEventListener('click', async () => {
+    // Use the cached audit focus from the last /state response rather
+    // than reading the focused scrubber cell from DOM.  Under fast
+    // navigation (a focus POST already in flight), the .focused class
+    // can lag behind server state and we'd unstamp the wrong subseg.
+    // Server snapshots neighbors before the yaml write, so the focus
+    // auto-advances to prev (or next, or audit exits if zero remain).
+    if (LAST_AUDIT_FOCUS == null) {
+      setStatus('audit: no focused function');
+      return;
+    }
+    await auditPost('/unstamp', {
+      start: '0x' + LAST_AUDIT_FOCUS.toString(16).toUpperCase().padStart(8, '0'),
+    });
+  });
+  // Scrubber click delegation — focuses the clicked cell's function.
+  document.getElementById('scrubber').addEventListener('click', (e) => {
+    const cell = e.target.closest('.scrubber-cell');
+    if (!cell) return;
+    const start = parseInt(cell.dataset.start, 10);
+    if (Number.isNaN(start)) return;
+    auditPost('/audit-mode/focus', {
+      start: '0x' + start.toString(16).toUpperCase().padStart(8, '0'),
+    });
+  });
 
   document.getElementById('btn-frontier').addEventListener('click', async () => {
     await fetch('/frontier/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });

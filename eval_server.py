@@ -58,6 +58,7 @@ def _empty_session():
         "history": [],
         "ai_override": None,
         "analyze_mode": None,
+        "audit_mode": None,       # {"focus_start": int} when active; None otherwise
         "pending_partners": [],   # addrs queued via /queue-partner; applied on next approve
         "pending_entries": {},    # {main_hex: [addr, ...]} queued via /queue-entry; applied on next approve
     }
@@ -386,6 +387,128 @@ def _analyze_mode_active_candidate(model, sweep, analyze_mode):
     return analyzer.NextCandidate(previous=previous, function=fa)
 
 
+# ---------------------------------------------------------------------------
+# Audit mode — read-only walk over already-stamped functions.  No yaml
+# mutation from inside audit mode except via /unstamp (the action audit
+# exists to expose).  Mutually orthogonal to ai_override and analyze_mode;
+# we 409 on conflicting endpoints while it's active.
+# ---------------------------------------------------------------------------
+
+def _audit_guard_response(session):
+    """If audit_mode is active, return a (jsonify, 409) tuple that the
+    caller can `return ...` immediately.  Else return None.  Used to
+    keep audit-mode read-only against mutating endpoints (pin, queue,
+    verdict, analyze-mode/*) so the UI can't land in a mixed state."""
+    if session.get("audit_mode"):
+        return jsonify({
+            "ok": False,
+            "error": "audit_mode is active — exit AUDIT before this action",
+        }), 409
+    return None
+
+
+def _audit_mode_active(session):
+    """Return the focus_start int if audit_mode is active, else None.
+    Source-of-truth for "should I 409 this mutating endpoint?"."""
+    am = session.get("audit_mode")
+    if not am:
+        return None
+    try:
+        return int(am.get("focus_start"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _audit_neighbor_start(verified_sorted, focus_start, direction):
+    """Return the start addr of the verified subseg adjacent to focus_start
+    in address-sorted order.  Clamps at the ends (no wraparound) — feels
+    natural for an audit walk.  When focus_start is no longer in the
+    list (stale after an external yaml edit), snaps to the last subseg
+    (or None if the list is empty)."""
+    starts = [s.start for s in verified_sorted]
+    if focus_start not in starts:
+        return starts[-1] if starts else None
+    i = starts.index(focus_start)
+    if direction == "next":
+        return starts[min(i + 1, len(starts) - 1)]
+    if direction == "prev":
+        return starts[max(i - 1, 0)]
+    return focus_start
+
+
+def _audit_scrubber_payload(sweep, model):
+    """Project every verified subseg → {start, hexes, name, size, verdict}.
+    Verdict reuses the analyzer's cached analyze_function + partner-aware
+    bump so the scrubber colors match what the user sees in the banner
+    when they click that cell.  Fast because analyze_function is cached
+    process-lifetime and pre-warmed at startup."""
+    out = []
+    for sub in sweep.verified:
+        fa = model.analyze_function(sub.start, hint_end=sub.end)
+        fa = sweep.apply_partner_awareness(fa)
+        out.append({
+            "start": sub.start,
+            "start_hex": f"{sub.start:08X}",
+            "end_hex": f"{sub.end:08X}",
+            "name": f"FUN_{sub.start:08X}",
+            "size": sub.end - sub.start + 1,
+            "verdict": fa.verdict.value,
+        })
+    return out
+
+
+def _audit_state_payload(session, sweep, model):
+    """Build the audit-mode portion of /state when audit_mode is active.
+    Returns (audit_dict, candidate_payload) or (None, None) if audit_mode
+    is invalid (no stamps).
+
+    When focus_start has gone stale (e.g. external yaml edit removed the
+    focused subseg), snaps to the last subseg in-memory only — does NOT
+    persist.  GET handlers stay read-only; the corrected focus will be
+    persisted by the next mutating endpoint or by audit_mode/focus when
+    the user navigates.  The in-memory mutation on `session` is harmless
+    because /state never calls save_session on this object."""
+    verified = sweep.verified  # already sorted by start in SweepState.__init__
+    if not verified:
+        return None, None
+    focus_start = _audit_mode_active(session)
+    starts = [s.start for s in verified]
+    if focus_start is None or focus_start not in starts:
+        focus_start = starts[-1]
+
+    i = starts.index(focus_start)
+    sub = verified[i]
+    prev = verified[i - 1] if i > 0 else None
+    prev_start = starts[i - 1] if i > 0 else None
+    next_start = starts[i + 1] if i + 1 < len(starts) else None
+
+    # When frontier_simulation is ON, drop the saved-end cap so the
+    # walker runs to natural CFG termination — answers "what would the
+    # walker do today if this were the next unswept function?".  When
+    # OFF, hint_end clamps to the saved end and we backfill in case
+    # the walker would have terminated early on its own.
+    frontier = bool(session.get("frontier_simulation"))
+    hint_end = None if frontier else sub.end
+    fa = model.analyze_function(sub.start, hint_end=hint_end)
+    if not frontier and fa.end != sub.end:
+        fa = dataclasses.replace(fa, end=sub.end)
+    payload = _build_candidate_payload(
+        sweep, fa, prev,
+        attn=None, pending_partners=None, pending_entries=None,
+    )
+    audit_dict = {
+        "focus_start": focus_start,
+        "focus_hex": f"{focus_start:08X}",
+        "focus_index": i,
+        "total": len(verified),
+        "prev_start": prev_start,
+        "prev_hex": f"{prev_start:08X}" if prev_start is not None else None,
+        "next_start": next_start,
+        "next_hex": f"{next_start:08X}" if next_start is not None else None,
+    }
+    return audit_dict, payload
+
+
 def _analyze_mode_to_dict(analyze_mode):
     """Project session.analyze_mode → wire dict for the frontend.  Only
     called when analyze_mode is active (not None)."""
@@ -710,6 +833,39 @@ def state():
             except (ValueError, TypeError):
                 pass
 
+        progress = _progress_to_dict(sweep.progress())
+
+        # Audit mode short-circuits the live-sweep path: we render the
+        # focused stamp's analysis instead of next_candidate, and ship
+        # the scrubber payload for the bottom-of-bar bar.
+        if session.get("audit_mode"):
+            audit_dict, audit_payload = _audit_state_payload(session, sweep, model)
+            if audit_dict is None:
+                # No verified subsegs — drop out of audit and fall through
+                # to the normal caught-up / next_candidate path.
+                session["audit_mode"] = None
+                save_session(session)
+            else:
+                return jsonify({
+                    "all_caught_up": False,
+                    "candidate": audit_payload["candidate"],
+                    "previous":  audit_payload["previous"],
+                    "lines":     audit_payload["lines"],
+                    "natural_view": None,
+                    "override_active": False,
+                    "start_pinned": False,
+                    "end_pinned":   False,
+                    "attn": [],
+                    "current_verdict": None,
+                    "history_count": len(history),
+                    "progress": progress,
+                    "internal_gaps": [],   # suppressed in audit, like analyze_mode
+                    "analyze_mode": None,
+                    "audit_mode": audit_dict,
+                    "scrubber": _audit_scrubber_payload(sweep, model),
+                    "frontier_simulation": bool(session.get("frontier_simulation", False)),
+                })
+
         analyze_mode = session.get("analyze_mode")
         if analyze_mode:
             nxt = _analyze_mode_active_candidate(model, sweep, analyze_mode)
@@ -717,7 +873,6 @@ def state():
                 return jsonify({"all_caught_up": False, "error": "analyze_mode has no blocks"}), 400
         else:
             nxt = sweep.next_candidate()
-        progress = _progress_to_dict(sweep.progress())
 
         if nxt is None:
             return jsonify({
@@ -725,6 +880,8 @@ def state():
                 "history_count": len(history),
                 "progress": progress,
                 "internal_gaps": [_gap_to_dict(g) for g in sweep.gaps()],
+                "audit_mode": None,
+                "scrubber": None,
             })
 
         # Internal gaps with pending gap to proposed candidate surfaced too.
@@ -786,6 +943,8 @@ def state():
             "progress": progress,
             "internal_gaps": internal_gaps,
             "analyze_mode": _analyze_mode_to_dict(analyze_mode) if analyze_mode else None,
+            "audit_mode": None,
+            "scrubber": None,
             "frontier_simulation": bool(session.get("frontier_simulation", False)),
         })
 
@@ -805,6 +964,9 @@ def pin_end():
 
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         cfg, model, sweep = _build_sweep(session)
         nxt = sweep.next_candidate()
         if nxt is None:
@@ -857,6 +1019,9 @@ def pin_start():
 
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         cfg, model, sweep = _build_sweep(session)
         # Reject if addr lands inside an already-verified subseg.
         for s in sweep.verified:
@@ -891,6 +1056,9 @@ def unpin_end():
     override is meaningfully empty, clear it entirely."""
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         override = dict(session.get("ai_override") or {})
         had_end = "candidate_end" in override
         override.pop("candidate_end", None)
@@ -908,6 +1076,9 @@ def unpin_all():
     """Clear the entire ai_override."""
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         had_override = bool(session.get("ai_override"))
         session["ai_override"] = None
         save_session(session)
@@ -951,6 +1122,9 @@ def queue_partner():
         return jsonify({"ok": False, "error": "bad address"}), 400
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         pending = list(session.get("pending_partners") or [])
         if addr in pending:
             pending.remove(addr)
@@ -992,6 +1166,9 @@ def queue_entry():
         return jsonify({"ok": False, "error": "bad address"}), 400
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         if session.get("analyze_mode"):
             return jsonify({
                 "ok": False,
@@ -1064,6 +1241,10 @@ def add_partner():
     if a == b:
         return jsonify({"ok": False, "error": "a function can't partner with itself"}), 400
     with LOCK:
+        session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         ok_a = _add_partner_to_existing_subseg(a, b)
         ok_b = _add_partner_to_existing_subseg(b, a)
     if not ok_a:
@@ -1092,6 +1273,10 @@ def remove_entry():
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "bad address"}), 400
     with LOCK:
+        session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         removed = _remove_entry_from_existing_subseg(main, entry)
     if not removed:
         return jsonify({"ok": False, "error": f"entry 0x{entry:08X} not found on FUN_{main:08X}"}), 404
@@ -1111,10 +1296,121 @@ def unstamp():
     except (ValueError, TypeError):
         return jsonify({"ok": False, "error": "bad address"}), 400
     with LOCK:
+        session = load_session()
+        # Snapshot pre-unstamp neighbors so we can advance audit focus
+        # WITHOUT re-reading yaml after the mutation.  Sweep here reflects
+        # the yaml state BEFORE removal.
+        prev_focus = next_focus = None
+        if session.get("audit_mode"):
+            cfg, model, sweep = _build_sweep(session)
+            starts = [s.start for s in sweep.verified]
+            if addr in starts:
+                i = starts.index(addr)
+                prev_focus = starts[i - 1] if i > 0 else None
+                next_focus = starts[i + 1] if i + 1 < len(starts) else None
         removed = _remove_subseg_from_yaml(addr)
-    if not removed:
-        return jsonify({"ok": False, "error": f"no subseg found with start 0x{addr:08X}"}), 404
+        if not removed:
+            return jsonify({"ok": False, "error": f"no subseg found with start 0x{addr:08X}"}), 404
+        # Audit-mode focus follow-up: prefer prev (keeps audit walks
+        # going backwards-through-time), fall back to next, exit audit
+        # if nothing remains.  Only runs when the unstamped addr was the
+        # current focus.
+        am = session.get("audit_mode") or {}
+        cur = am.get("focus_start")
+        if am and cur == addr:
+            new_focus = prev_focus if prev_focus is not None else next_focus
+            if new_focus is None:
+                session["audit_mode"] = None
+            else:
+                session["audit_mode"] = {"focus_start": new_focus}
+            save_session(session)
     return jsonify({"ok": True, "unstamped": f"0x{addr:08X}"})
+
+
+@app.route("/audit-mode/enter", methods=["POST"])
+def audit_mode_enter():
+    """Enter AUDIT MODE.  Focuses the last (highest-address) verified
+    subseg; the user walks back/forward with ←/→ or clicks the scrubber.
+    Refuses if zero stamps exist."""
+    with LOCK:
+        session = load_session()
+        # Build a one-shot sweep just to read verified.  Cheap.
+        cfg, model, sweep = _build_sweep(session)
+        if not sweep.verified:
+            return jsonify({"ok": False, "error": "no verified subsegs to audit"}), 409
+        focus = sweep.verified[-1].start
+        session["audit_mode"] = {"focus_start": focus}
+        # AUDIT and ai_override / analyze_mode are mutually exclusive;
+        # entering audit clears them so the UI can't land in a mixed state.
+        session["ai_override"] = None
+        session["analyze_mode"] = None
+        save_session(session)
+    return jsonify({"ok": True, "focus_start": f"0x{focus:08X}"})
+
+
+@app.route("/audit-mode/exit", methods=["POST"])
+def audit_mode_exit():
+    """Exit AUDIT MODE — clears session['audit_mode'].  Sweep resumes
+    wherever it was.  Idempotent."""
+    with LOCK:
+        session = load_session()
+        had = bool(session.get("audit_mode"))
+        session["audit_mode"] = None
+        save_session(session)
+    return jsonify({"ok": True, "was_active": had})
+
+
+@app.route("/audit-mode/focus", methods=["POST"])
+def audit_mode_focus():
+    """Jump audit focus to the verified subseg with the given start.
+    Used by scrubber clicks.  Rejects if the address isn't a verified
+    subseg start."""
+    data = request.get_json(force=True)
+    raw = data.get("start")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'start'"}), 400
+    try:
+        addr = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    with LOCK:
+        session = load_session()
+        if not session.get("audit_mode"):
+            return jsonify({"ok": False, "error": "not in audit_mode"}), 409
+        cfg, model, sweep = _build_sweep(session)
+        if not any(s.start == addr for s in sweep.verified):
+            return jsonify({"ok": False, "error": f"0x{addr:08X} is not a verified subseg start"}), 404
+        session["audit_mode"] = {"focus_start": addr}
+        save_session(session)
+    return jsonify({"ok": True, "focus_start": f"0x{addr:08X}"})
+
+
+@app.route("/audit-mode/cycle", methods=["POST"])
+def audit_mode_cycle():
+    """Advance audit focus to the address-adjacent verified subseg.
+    Clamps at the ends (no wrap) — at the last stamp, 'next' is a no-op.
+    Wired to ←/→ keys and the arrow buttons."""
+    data = request.get_json(force=True)
+    direction = data.get("direction")
+    if direction not in ("next", "prev"):
+        return jsonify({"ok": False, "error": "direction must be 'next' or 'prev'"}), 400
+    with LOCK:
+        session = load_session()
+        am = session.get("audit_mode")
+        if not am:
+            return jsonify({"ok": False, "error": "not in audit_mode"}), 409
+        cfg, model, sweep = _build_sweep(session)
+        if not sweep.verified:
+            session["audit_mode"] = None
+            save_session(session)
+            return jsonify({"ok": False, "error": "no verified subsegs"}), 409
+        focus = int(am.get("focus_start") or 0)
+        new_focus = _audit_neighbor_start(sweep.verified, focus, direction)
+        if new_focus is None:
+            return jsonify({"ok": False, "error": "no verified subsegs"}), 409
+        session["audit_mode"] = {"focus_start": new_focus}
+        save_session(session)
+    return jsonify({"ok": True, "focus_start": f"0x{new_focus:08X}"})
 
 
 @app.route("/analyze-mode/enter", methods=["POST"])
@@ -1140,6 +1436,9 @@ def analyze_mode_enter():
     label = data.get("label") or ""
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         session["analyze_mode"] = {
             "blocks": blocks,
             "active_block": 0,
@@ -1191,6 +1490,9 @@ def verdict():
 
     with LOCK:
         session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
         if session.get("analyze_mode"):
             return jsonify({
                 "ok": False,
