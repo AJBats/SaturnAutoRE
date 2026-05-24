@@ -406,6 +406,21 @@ function alignLines(leftLines, rightLines) {
 // which is row-aligned).  Red highlight + "ref: next FUN" tag — same
 // red palette as the `reference: disagrees` banner pill so the two
 // cues are visually linked.
+//
+// Mnemonics whose LAST register operand is read, not written — used to
+// suppress the bare-r15 stack-op highlight on instructions like
+// `cmp/eq r0, r15` (T-flag output, r15 unchanged) or `mul.l r0, r15`
+// (result in MACL, r15 unchanged).  The dest-side r15 highlight is for
+// stack-balance scanning; falsely tagging a compare here would defeat
+// the at-a-glance read.
+const RD_LAST_OPERAND_MNEMS = new Set([
+  'cmp/eq', 'cmp/ge', 'cmp/gt', 'cmp/hi', 'cmp/hs', 'cmp/str',
+  'cmp/pl', 'cmp/pz',
+  'tst',
+  'mul.l', 'muls.w', 'mulu.w',
+  'dmuls.l', 'dmulu.l',
+  'div0s',
+]);
 function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet, showUnpinAll, showUnpinEnd) {
   if (!lines || !lines.length) {
     target.textContent = '';
@@ -539,9 +554,19 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
     // can scan stack manipulations vertically.  Substring replace on the
     // already-escaped mnem is safe — neither `@-r15` nor `@r15+` contain
     // chars that escapeHtml mangles.
-    const mnemHtml = escapeHtml(line.mnem || '')
+    const mnemRaw = line.mnem || '';
+    const mnemHead = mnemRaw.match(/^\S+/)?.[0] || '';
+    let mnemHtml = escapeHtml(mnemRaw)
       .replaceAll('@-r15', '<span class="stack-op">@-r15</span>')
       .replaceAll('@r15+', '<span class="stack-op">@r15+</span>');
+    // Bare-r15 destination highlight, skipped on read-only-last-operand
+    // mnemonics (see RD_LAST_OPERAND_MNEMS).  Lookbehind requires a
+    // whitespace/comma boundary so r15 inside @r15 / @(disp,r15) isn't
+    // matched; lookahead excludes `,` / `+` / `)` so source-r15 in
+    // `mov r15, rN` and pointer-r15 in `@(0xC, r15)` aren't either.
+    if (!RD_LAST_OPERAND_MNEMS.has(mnemHead)) {
+      mnemHtml = mnemHtml.replace(/(?<=[\s,])r15\b(?![,+)])/g, '<span class="stack-op">r15</span>');
+    }
     return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${mnemHtml}</span>${tagPart}</span>`;
   }).join('\n');
   target.innerHTML = html;

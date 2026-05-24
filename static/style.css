@@ -653,9 +653,11 @@ svg.arcs .arc.sticky {
 .line.uncond-indirect .tag { background: #5a2a2a; color: #fdd; }   /* ⇒ exits */
 .line.tail-call .tag       { background: #f55; color: #fff; }      /* ⇒ TAIL? — loudest */
 
-/* Stack push/pop operand soft highlight — `@-r15` / `@r15+` inside
-   the mnem column.  Background box (highlighter-pen effect) so a column
-   of stack ops reads vertically while scanning the listing. */
+/* Stack-pointer-write soft highlight — `@-r15` / `@r15+` (auto-update
+   push/pop), bare `r15` as a write destination (add #imm/rN, r15;
+   mov rN, r15; shll r15; loads into r15; etc.).  Background box
+   (highlighter-pen effect) so a column of stack ops reads vertically
+   while scanning the listing. */
 .line .m .stack-op {
   background: #3a4a2a;
   color: #cea;
