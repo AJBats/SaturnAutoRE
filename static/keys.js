@@ -898,19 +898,27 @@ async function fetchState() {
       } else {
         renderListing(s.lines, primaryListing, true, attnSet, primMidSet, primRefEndSet, overrideActive, !!s.end_pinned);
       }
-      requestAnimationFrame(() => {
-        // Scroll the current candidate's section header into view, but
-        // offset by the sticky-top wrapper's height so the function's
-        // first instruction isn't hidden underneath it after an approve
-        // advances to a new candidate.  Sticky-top height varies with
-        // gap-alert visibility and banner content, so query it live.
-        const target = primaryListing.querySelector('.section-current-header');
-        if (!target) return;
-        const stickyTop = document.getElementById('sticky-top');
-        const stickyHeight = stickyTop ? stickyTop.offsetHeight : 0;
-        const targetRect = target.getBoundingClientRect();
-        window.scrollBy({ top: targetRect.top - stickyHeight, behavior: 'instant' });
-      });
+      // Only snap scroll when the candidate's START changes — i.e.
+      // the user actually moved to a different function (approve
+      // advances sweep, audit-cycle, scrubber click).  In-function
+      // edits (pin start/end, queue alt entry, change attn) keep
+      // the same start; preserving scroll position there avoids
+      // yanking the user away from whatever they were just reading.
+      if (primStart !== LAST_CANDIDATE_START) {
+        requestAnimationFrame(() => {
+          // Scroll the current candidate's section header into view,
+          // offset by the sticky-top wrapper's height so the function's
+          // first instruction isn't hidden underneath it.  Sticky-top
+          // height varies with gap-alert visibility and banner content,
+          // so query it live.
+          const target = primaryListing.querySelector('.section-current-header');
+          if (!target) return;
+          const stickyTop = document.getElementById('sticky-top');
+          const stickyHeight = stickyTop ? stickyTop.offsetHeight : 0;
+          const targetRect = target.getBoundingClientRect();
+          window.scrollBy({ top: targetRect.top - stickyHeight, behavior: 'instant' });
+        });
+      }
     }
 
     if (overrideActive) {
