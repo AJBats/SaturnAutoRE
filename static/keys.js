@@ -1080,6 +1080,25 @@ document.addEventListener('DOMContentLoaded', () => {
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Shift') document.body.classList.add('shift-held');
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
+    // Vertical scroll keys — always drive the window, regardless of
+    // which element has focus.  Without this, Chrome routes the key to
+    // document.activeElement first and falls back to its "nearest
+    // scrollable ancestor" heuristic, which is unreliable when focus
+    // sits on a footer button after a verdict click.
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp'
+        || e.key === 'PageDown' || e.key === 'PageUp') {
+      e.preventDefault();
+      const stickyHeight = document.getElementById('sticky-top')?.offsetHeight || 0;
+      const lineStep = 40;
+      const pageStep = Math.max(80, window.innerHeight - stickyHeight - 40);
+      let dy = 0;
+      if      (e.key === 'ArrowDown') dy =  lineStep;
+      else if (e.key === 'ArrowUp')   dy = -lineStep;
+      else if (e.key === 'PageDown')  dy =  pageStep;
+      else if (e.key === 'PageUp')    dy = -pageStep;
+      window.scrollBy({ top: dy, behavior: 'instant' });
+      return;
+    }
     const analyzeRowVisible = !document.getElementById('analyze-row').classList.contains('hidden');
     const auditRowVisible   = !document.getElementById('audit-row').classList.contains('hidden');
     if (auditRowVisible) {
@@ -1192,6 +1211,37 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Wire arc hover/click delegation once
   wireArcEvents();
+
+  // Vertical wheel → window; horizontal wheel → pane's native scroll.
+  // The panes have overflow:auto for per-pane horizontal scroll +
+  // visual containment of the header text, which makes them scroll
+  // containers in both axes.  Their vertical scrollHeight normally
+  // equals clientHeight (panes grow to content), but sub-pixel
+  // mismatches give them a tiny vertical scroll range that absorbs
+  // wheel events one or two pixels at a time.  Forcing deltaY onto
+  // the window — and keeping deltaX on the pane — keeps both axes
+  // doing what the user expects regardless of that drift.
+  function routePaneWheel(e) {
+    // Shift+wheel: pane horizontal scroll.  Browsers natively translate
+    // deltaY → horizontal scroll under shift, but our deltaY-to-window
+    // route below would otherwise steal it.
+    if (e.shiftKey && Math.abs(e.deltaY) > 0) {
+      e.preventDefault();
+      e.currentTarget.scrollLeft += e.deltaY;
+      return;
+    }
+    if (Math.abs(e.deltaY) > 0) {
+      e.preventDefault();
+      window.scrollBy({ top: e.deltaY, behavior: 'instant' });
+      if (Math.abs(e.deltaX) > 0) {
+        e.currentTarget.scrollLeft += e.deltaX;
+      }
+    }
+    // deltaX-only events (trackpad horizontal swipe) fall through to
+    // native handling — pane scrolls horizontally on its own.
+  }
+  document.getElementById('pane-primary').addEventListener('wheel', routePaneWheel, { passive: false });
+  document.getElementById('pane-natural').addEventListener('wheel', routePaneWheel, { passive: false });
 
   // Initial fetch + poll every 1s.
   fetchState();
