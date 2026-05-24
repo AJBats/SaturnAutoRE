@@ -139,6 +139,9 @@ header#header > #header-content {
 }
 .caught-up { color: #9d9; font-weight: bold; }
 
+/* Audit mode hides progress so the scrubber owns the header width. */
+#progress-content.hidden { display: none; }
+
 /* RPG-style progress: % of race.bin verified */
 .progress {
   display: inline-flex;
@@ -812,11 +815,9 @@ footer button:hover { background: #4a4a4a; }
 .scrubber.hidden { display: none; }
 .scrubber-cell {
   flex: 1 1 0;
-  min-width: 2px;
+  min-width: 0;
   height: 100%;
-  border-right: 1px solid rgba(0,0,0,0.35);
 }
-.scrubber-cell:last-child { border-right: none; }
 .scrubber-cell.verdict-HIGH    { background: #6c6; }
 .scrubber-cell.verdict-MEDIUM  { background: #cb6; }
 .scrubber-cell.verdict-LOW     { background: #c66; }
