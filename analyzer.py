@@ -1107,22 +1107,35 @@ def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
         return []
     braf_reg = (braf_op >> 8) & 0xF
 
+    # Scan back from braf for the dispatch chain: mov.w writing
+    # braf_reg, then mova writing r0.  Window is generous (~30 bytes)
+    # because compilers often interleave unrelated arithmetic between
+    # the table load and the braf — observed in real code with up to
+    # ~7 intervening instructions.  Bail on any branch/jump/return
+    # encountered going back: the dispatch chain has to be straight-
+    # line, so crossing a basic-block boundary means we've left the
+    # dispatch and any mov.w/mova found further back is unrelated.
     movw_seen = False
     table_base = None
-    for back in range(2, 14, 2):
+    for back in range(2, 32, 2):
         addr = braf_pc - back
         if addr < vram:
             break
         op = _read_opcode(binary, vram, addr)
         if op is None:
             continue
+        mnem, _ = _decode_sh2(op, addr)
+        if mnem is not None:
+            head = mnem.split()[0]
+            if head in _BRANCH_MNEMONICS or head in {"jmp", "jsr", "braf", "bsrf", "rts", "rte"}:
+                break
         # mov.w @(R0, Rm), Rn  encoding 0000 nnnn mmmm 1101 — gate
         # the destination on the braf's register so we don't latch a
         # random mov.w that happens to land within the back-scan.
         if (op & 0xF00F) == 0x000D and ((op >> 8) & 0xF) == braf_reg:
             movw_seen = True
             continue
-        # mova @(disp, PC), r0  encoding 11000111 dddddddd
+        # mova @(disp, PC), r0  encoding 11000111 dddddddd.
         if (op & 0xFF00) == 0xC700:
             disp = (op & 0xFF) * 4
             table_base = ((addr + 4) & ~3) + disp
@@ -1142,6 +1155,15 @@ def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
         raw = (binary[off] << 8) | binary[off + 1]
         sval = raw - 0x10000 if raw & 0x8000 else raw
         target = braf_pc + 4 + sval
+        # SH-2 instructions are 2-byte aligned, so an odd target
+        # is impossible — drop those silently.  Helps when the
+        # reference disasm over-labels bytes past the real table
+        # as `.short` data (Pass-E orphan-pool reclassification);
+        # without this filter, instruction bytes decoded as table
+        # entries can produce odd-addressed bogus targets.
+        if target & 1:
+            t += 2
+            continue
         if lo <= target <= hi:
             targets.append(target)
         t += 2
