@@ -348,12 +348,12 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
 
 // Cache of branches to draw — refreshed each render.
 let CURRENT_BRANCHES = [];
-// Set of int addrs queued via /queue-partner on the current candidate.
-// Read by drawArcs to overlay a green dashed leap from any branch
-// whose target matches a queued partner.  Refreshed every /state poll
-// (cheap — small Set) so the arrow appears the instant the user
-// queues a partner, even when the listing isn't re-rendered.
-let CURRENT_PENDING_PARTNERS = new Set();
+// Resolved (start, end) ranges for partners queued via /queue-partner
+// on the current candidate.  Range-based, not start-only, so the
+// partner-pending arc fires for ANY branch whose target lands inside
+// a partner's body — typical case bodies / labels / mid-function
+// merge points.  Refreshed every /state poll.
+let CURRENT_PENDING_PARTNER_RANGES = [];   // [[start, end], ...]
 
 // Diff-style alignment: take two arrays of line objects and return two
 // equal-length arrays where rows for the same VRAM anchor address sit at
@@ -771,8 +771,14 @@ function drawArcs() {
     if (!pz) return MIN_LEFT_MARGIN;
     return pz.getBoundingClientRect().left - listingRect.left;
   }
+  function targetInPartnerRange(addr) {
+    for (const [s, e] of CURRENT_PENDING_PARTNER_RANGES) {
+      if (s <= addr && addr <= e) return true;
+    }
+    return false;
+  }
   CURRENT_BRANCHES.forEach(br => {
-    if (!CURRENT_PENDING_PARTNERS.has(br.target)) return;
+    if (!targetInPartnerRange(br.target)) return;
     const srcEl = srcMap.get(br.src);
     if (!srcEl) return;
     const sX = tickXOf(srcEl) - TICK_INSET;
@@ -951,14 +957,20 @@ async function fetchState() {
     const entriesKey = [...confirmedAddrs, '|', ...pendingAddrs].sort().join(',');
     const entriesChanged = (entriesKey !== LAST_ENTRIES_KEY);
     LAST_ENTRIES_KEY = entriesKey;
-    // Pending-partners set drives the green leap arcs in drawArcs.
-    // Track changes so we can redraw arcs (without a full listing
-    // re-render) when the user queues / unqueues a partner.
+    // Pending-partner ranges drive the green leap arcs in drawArcs.
+    // Server resolves (start, end) for each queued partner addr
+    // (stamped subseg's end, else CFG walker) so range-based target
+    // matching catches branches into ANY part of a partner's body,
+    // not just its exact start.  Tracked for change detection so
+    // queue/unqueue triggers a listing re-render too — the (partner)
+    // caller-kind tags depend on the same data.
     const pendingPartnerAddrs = (s.candidate.pending_partners || []).map(p => p.addr).sort((a, b) => a - b);
     const pendingPartnersKey = pendingPartnerAddrs.join(',');
     const pendingPartnersChanged = (pendingPartnersKey !== LAST_PENDING_PARTNERS_KEY);
     LAST_PENDING_PARTNERS_KEY = pendingPartnersKey;
-    CURRENT_PENDING_PARTNERS = new Set(pendingPartnerAddrs);
+    CURRENT_PENDING_PARTNER_RANGES = (s.candidate.pending_partners || [])
+      .filter(p => p.end != null)
+      .map(p => [p.addr, p.end]);
     // Per-pane midpoint sets — reference's view of where function starts
     // fall INSIDE each pane's candidate range.  Each pane uses its own
     // range so the natural pane (often wider) can highlight midpoints
@@ -982,7 +994,7 @@ async function fetchState() {
     }
     const primRefEndSet = refEndSet(s.candidate);
     const natRefEndSet  = overrideActive ? refEndSet(s.natural_view.candidate) : primRefEndSet;
-    if (primChanged || natChanged || attnChanged || entriesChanged) {
+    if (primChanged || natChanged || attnChanged || entriesChanged || pendingPartnersChanged) {
       if (overrideActive) {
         // Diff-align so rows for the same VRAM anchor address sit at the
         // same Y position across panes.  When a side has a header /
@@ -1020,11 +1032,6 @@ async function fetchState() {
           window.scrollBy({ top: targetRect.top - stickyHeight, behavior: 'instant' });
         });
       }
-    } else if (pendingPartnersChanged) {
-      // No listing re-render path fired, but the partner queue moved.
-      // Redraw arcs against the cached CURRENT_BRANCHES so the green
-      // leap appears/disappears immediately.
-      requestAnimationFrame(drawArcs);
     }
 
     if (overrideActive) {

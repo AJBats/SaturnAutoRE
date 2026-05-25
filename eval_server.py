@@ -719,8 +719,18 @@ def _candidate_to_dict(fa, partners=None, pending_partners=None,
             "midpoints": [_midpoint_to_dict(m) for m in fa.midpoints],
         },
         "partners": [{"addr": p, "addr_hex": f"{p:08X}"} for p in (partners or [])],
+        # pending_partners may arrive as plain int addrs (legacy callers)
+        # or as {addr, end} dicts (when the caller resolved ranges via
+        # `_resolve_partner_end`).  Normalize to the wire format with
+        # both `addr` and `end` populated; `end` is None when the
+        # caller didn't / couldn't resolve.
         "pending_partners": [
-            {"addr": p, "addr_hex": f"{p:08X}"} for p in (pending_partners or [])
+            {
+                "addr": (p["addr"] if isinstance(p, dict) else p),
+                "addr_hex": f"{(p['addr'] if isinstance(p, dict) else p):08X}",
+                "end": (p.get("end") if isinstance(p, dict) else None),
+            }
+            for p in (pending_partners or [])
         ],
         "suggested_partners": list(suggested_partners or []),
         "partner_balanced": bool(getattr(fa, "partner_balanced", False)),
@@ -761,6 +771,19 @@ def _gap_to_dict(g):
         "preceding_name": g.preceding_name,
         "pending": g.pending,
     }
+
+
+def _resolve_partner_end(sweep, addr):
+    """Resolve a queued partner addr to its end addr: stamped subseg's
+    end if verified, else CFG walker via model.analyze_function.
+    Returns None on failure (bogus addr, walker exception)."""
+    for s in sweep.verified:
+        if s.start == addr:
+            return s.end
+    try:
+        return sweep.model.analyze_function(addr).end
+    except Exception:
+        return None
 
 
 def _build_candidate_payload(sweep, candidate_fa, previous_typed,
@@ -820,11 +843,18 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
     # balanced.  Happens AFTER listing emission (listing doesn't use
     # verdict/flags so the order is safe).
     candidate_fa = sweep.apply_partner_awareness(candidate_fa)
+    # Resolve each queued partner's (start, end) range so the client
+    # can draw partner-pending arcs for branches whose target lands
+    # ANYWHERE inside a partner's body, not just at its exact start.
+    pending_partners_resolved = [
+        {"addr": p, "end": _resolve_partner_end(sweep, p)}
+        for p in (pending_partners or [])
+    ]
     return {
         "candidate": _candidate_to_dict(
             candidate_fa,
             partners=partners,
-            pending_partners=pending_partners,
+            pending_partners=pending_partners_resolved,
             suggested_partners=suggestions,
             entries=entries,
             pending_entries=pending_entries,

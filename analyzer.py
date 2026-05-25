@@ -3614,16 +3614,20 @@ class SweepState:
             if target_sub is not None and target_sub.start in partners:
                 return "partner"
         # (d) pending — caller is queued as partner of the current
-        # candidate AND target lands inside the candidate's range.
+        # candidate AND target lands at-or-after the candidate's start.
+        # The lower bound excludes prev/intermediate-section labels
+        # (those targets are in earlier functions, not this candidate's
+        # territory).  There's intentionally NO upper bound so the tag
+        # also fires on trailing-section labels (which extend past
+        # candidate.end and still belong to the candidate's review
+        # context — useful for spotting case-body landings just
+        # outside the proposed boundary).
         # Self-recursion guard: skip when the caller IS the candidate
-        # (user queued the function with itself).  Don't gate on
-        # "caller inside candidate range" — a real partner whose own
-        # start happens to fall inside an absorbed candidate range is
-        # still a legitimate partner relationship.
+        # (user queued the function with itself).
         if (self._pending_partner_target_range is not None
                 and caller_start in self.pending_partners):
-            ts, te = self._pending_partner_target_range
-            if ts <= target_addr <= te and caller_start != ts:
+            ts, _te = self._pending_partner_target_range
+            if target_addr >= ts and caller_start != ts:
                 return "partner"
         return "stamped"
 
