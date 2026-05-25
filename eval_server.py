@@ -778,7 +778,25 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
             partners = list(s.partners or [])
             entries = list(s.entries or [])
             break
-    suggestions = sweep.suggested_partners(candidate_fa)
+    # UI partner suggestions come from back-references only: stamps
+    # whose `partners` list already includes this candidate's start,
+    # i.e. functions that asserted "this is my partner" before we
+    # got here.  Surfacing them lets the human partner back with one
+    # click (the /verdict approve also auto-back-refs them on its
+    # own, but having the button gives explicit visibility while
+    # reviewing the candidate).  The analyzer's heuristic-based
+    # sweep.suggested_partners is still used internally for the
+    # walker-stop tooltip's partner_ranges, but isn't surfaced
+    # here — it produced too many false positives to be worth the
+    # button noise.
+    suggestions = []
+    for s in sweep.verified:
+        if candidate_fa.start in (s.partners or []):
+            suggestions.append({
+                "addr": s.start,
+                "addr_hex": f"{s.start:08X}",
+                "reason": f"FUN_{s.start:08X} already lists this function as a partner — click to mirror the link.",
+            })
     # Trailing-zone warnings: surface a yellow flag when the candidate
     # ends right before case targets of an existing stamped dispatcher
     # — strong signal that the boundary is too short.
