@@ -3444,6 +3444,7 @@ class SweepState:
                  analyze_mode: Optional[dict] = None,
                  frontier_simulation: bool = False,
                  pending_entries: Optional[dict] = None,
+                 pending_partners: Optional[list] = None,
                  ):
         self.model = model
         self.yaml_cfg = yaml_cfg
@@ -3554,6 +3555,22 @@ class SweepState:
         self._analyze_block_starts = {
             int(b["start"]) for b in (self.analyze_mode.get("blocks") or [])
         }
+        # Session-level pending partner addrs (queued via /queue-partner,
+        # not yet committed to yaml).  `_caller_kind` treats them as
+        # "partner" relationships when the caller-side is one of them
+        # AND the target address falls anywhere inside the current
+        # candidate's range (set by `listing()` only when invoked for
+        # the live candidate — audit panes pass is_live_candidate=False
+        # so the queue isn't mis-attributed to a focused stamp).
+        # Range-based, not exact-start, because callers reach mid-
+        # function addresses too (switch case bodies, merge points,
+        # etc.).
+        self.pending_partners = {int(p) for p in (pending_partners or [])}
+        self._pending_partner_target_range: Optional[tuple] = None  # (start, end)
+        # SweepState is rebuilt per /state poll in eval_server (see
+        # _build_sweep), so _call_sources_of_cache and the pending-
+        # partner state below are always fresh per request — never
+        # reused across pending_partners mutations.
 
     def _caller_kind(self, caller_start: int, target_addr: int) -> str:
         """Classify a caller for the "Called from" label.
@@ -3562,14 +3579,19 @@ class SweepState:
             starts (we're exploring a multi-block synthetic function and
             this is another block of it)
           - "partner" — caller and target are paired via the yaml
-            partners mechanism.  Three resolution paths, since either
-            side might be the one currently being viewed (unstamped
-            candidate):
+            partners mechanism OR via a session-queued partnership.
+            Four resolution paths, since either side might be the
+            one currently being viewed (unstamped candidate):
               (a) target is stamped, caller is listed in target's partners
               (b) caller is stamped, target_addr appears verbatim in
                   caller's partners list
               (c) caller is stamped, target_addr falls inside a stamped
                   subseg whose start is in caller's partners list
+              (d) caller is in `pending_partners` AND target falls inside
+                  the current candidate's range — previews the partnership
+                  before /verdict approve commits it.  The range is set
+                  by listing() only when rendering the live candidate
+                  (audit panes pass is_live_candidate=False).
           - "stamped" — anything else (regular cross-function call)
         """
         if caller_start in self._analyze_block_starts:
@@ -3590,6 +3612,18 @@ class SweepState:
             if target_addr in partners:
                 return "partner"
             if target_sub is not None and target_sub.start in partners:
+                return "partner"
+        # (d) pending — caller is queued as partner of the current
+        # candidate AND target lands inside the candidate's range.
+        # Self-recursion guard: skip when the caller IS the candidate
+        # (user queued the function with itself).  Don't gate on
+        # "caller inside candidate range" — a real partner whose own
+        # start happens to fall inside an absorbed candidate range is
+        # still a legitimate partner relationship.
+        if (self._pending_partner_target_range is not None
+                and caller_start in self.pending_partners):
+            ts, te = self._pending_partner_target_range
+            if ts <= target_addr <= te and caller_start != ts:
                 return "partner"
         return "stamped"
 
@@ -3999,6 +4033,38 @@ class SweepState:
             _harvest(sub.start, sub.end)
         for b in (self.analyze_mode.get("blocks") or []):
             _harvest(int(b["start"]), int(b["end"]))
+        # Pending partners — harvest each queued partner's branches as
+        # if it were stamped, so "Called from FUN_X (partner)" hint
+        # labels can preview before /verdict approve materializes the
+        # partnership.  Mirrors the analyze-mode block harvest above.
+        # Range resolution: stamped subseg's end if verified, else CFG
+        # walker via model.analyze_function (covers the common case
+        # where the queued partner isn't stamped yet — exactly when
+        # the preview is most useful).
+        binary_end = self.model.vram + len(self.model.binary)
+        for p in self.pending_partners:
+            # Guard: 2-byte aligned + within binary range.  CFG walker
+            # called below trusts `p` is a real function start, so a
+            # bogus addr (mis-click, stale yaml, misaligned hex) could
+            # produce a runaway walk that harvests garbage branches.
+            if (p & 1) or not (self.model.vram <= p < binary_end):
+                continue
+            # Skip if `p` falls strictly INSIDE another verified
+            # subseg — likely a mis-click on a mid-function address;
+            # the containing subseg is harvested separately.  Allow
+            # `p == s.start` (the common back-ref case) since we
+            # use the subseg's exact end below.
+            if any(s.start < p <= s.end for s in self.verified):
+                continue
+            end = next(
+                (s.end for s in self.verified if s.start == p), None,
+            )
+            if end is None:
+                try:
+                    end = self.model.analyze_function(p).end
+                except Exception:
+                    continue
+            _harvest(p, end)
 
         self._call_sources_of_cache = result
         return result
@@ -4187,6 +4253,7 @@ class SweepState:
                 candidate: FunctionAnalysis,
                 previous: Optional[VerifiedSubseg],
                 attn: Optional[list] = None,
+                is_live_candidate: bool = True,
                 ) -> list:
         """Build the four-section row list for one pane.
 
@@ -4208,6 +4275,16 @@ class SweepState:
         _emit_raw_bytes + _emit_section_header.
         """
         attn_set = set(attn or [])
+        # `_caller_kind` consults this range to recognize queued
+        # partners whose calls land anywhere inside the candidate
+        # (path "(d)" in its docstring).  Only set for the LIVE
+        # candidate — audit panes pass is_live_candidate=False since
+        # `pending_partners` is global session state but conceptually
+        # tied to whatever the next-approve target is, not whichever
+        # stamp the audit walk happens to be focused on.
+        self._pending_partner_target_range = (
+            (candidate.start, candidate.end) if is_live_candidate else None
+        )
 
         # Resolve the candidate's suggested-partner ranges once, so the
         # walker-stop tooltip can disclose when a flagged tail-call target

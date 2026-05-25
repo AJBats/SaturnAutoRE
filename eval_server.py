@@ -348,6 +348,7 @@ def _build_sweep(session):
         analyze_mode=session.get("analyze_mode"),
         frontier_simulation=session.get("frontier_simulation", False),
         pending_entries=session.get("pending_entries") or {},
+        pending_partners=session.get("pending_partners") or [],
     )
 
 
@@ -495,6 +496,7 @@ def _audit_state_payload(session, sweep, model):
     payload = _build_candidate_payload(
         sweep, fa, prev,
         attn=None, pending_partners=None, pending_entries=None,
+        is_live_candidate=False,
     )
     audit_dict = {
         "focus_start": focus_start,
@@ -763,14 +765,21 @@ def _gap_to_dict(g):
 
 def _build_candidate_payload(sweep, candidate_fa, previous_typed,
                               attn=None, pending_partners=None,
-                              pending_entries=None):
+                              pending_entries=None,
+                              is_live_candidate=True):
     """Build the per-pane payload (banner + listing rows).  Mirrors
     eval_server._build_candidate_payload's output shape.
 
     Partners (from yaml) are looked up by candidate's start; pending
     partners (session-queued) are passed in by the caller.
+
+    `is_live_candidate` forwards to sweep.listing so the analyzer
+    knows whether to apply the pending-partners caller-tag for this
+    pane.  Audit panes pass False — the queue is tied to the next-
+    approve target, not whichever stamp the audit walk focuses on.
     """
-    rows = sweep.listing(candidate_fa, previous=previous_typed, attn=attn)
+    rows = sweep.listing(candidate_fa, previous=previous_typed, attn=attn,
+                          is_live_candidate=is_live_candidate)
     partners = []
     entries = []
     for s in sweep.verified:
@@ -936,6 +945,7 @@ def state():
             ):
                 natural_view = _build_candidate_payload(
                     sweep, nat.function, nat.previous, attn=attn_addrs,
+                    is_live_candidate=False,
                 )
 
         # "What verdict did I last leave this candidate at" — surfaced so the
