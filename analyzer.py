@@ -4347,6 +4347,15 @@ class SweepState:
                 self._emit_raw_rows(rows, next_id, gap_start, gap_end, Section.INTERMEDIATE)
 
         # ----- 3. Current section (the candidate) -----
+        # Extend the candidate's reachable set + branch metadata with
+        # what a CFG walk from queued-partner call targets reaches /
+        # collects.  Without this, code reached only via a partner-side
+        # dispatch shows up as `unreach` AND its bras lose their branch
+        # metadata (no partner-leap arcs) — distracting noise when the
+        # user has explicitly queued the partnership and the
+        # relationship is exactly what reaches the code.
+        extra_reach, extra_branches = self._partner_extended_walk(candidate)
+        extended_reachable = set(candidate.reachable) | extra_reach if extra_reach else candidate.reachable
         size = candidate.end - candidate.start + 1
         self._emit_section_header(
             rows, next_id, Section.CURRENT,
@@ -4355,7 +4364,12 @@ class SweepState:
             f"verdict: {candidate.verdict.value}",
             anchor_addr=candidate.start,
         )
-        self._emit_function_rows(rows, next_id, candidate, Section.CURRENT, attn_set, candidate, partner_ranges)
+        self._emit_function_rows(
+            rows, next_id, candidate, Section.CURRENT, attn_set,
+            candidate, partner_ranges,
+            reachable_set=extended_reachable,
+            extra_branches=extra_branches,
+        )
 
         # ----- 4. Trailing section (TRAILING_BYTES past candidate end) -----
         trailing_start = candidate.end + 1
@@ -4399,7 +4413,62 @@ class SweepState:
             unpin_action=unpin,
         ))
 
-    def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate, partner_ranges=None):
+    def _partner_extended_walk(self, candidate: FunctionAnalysis):
+        """Return (reachable, branches) augmenting `candidate.reachable`
+        and `candidate.branches` with what a CFG walk reaches/collects
+        from queued-partner call targets that land inside the candidate.
+
+        Without this, switch case bodies and direct-call landing pads
+        reached only via a queued partner's outgoing flow show up as
+        `unreach` rows AND lose their branch metadata (no partner-leap
+        arcs on their bras) — the local walker seeded only from
+        candidate.start never visited them.  Treating queued-partner
+        targets as additional walker seeds gives the same visual
+        effect as if the user had pre-declared them as alt entries.
+
+        Single _control_flow_walk pass with all extra seeds, so
+        transitive reach (target → its internal flow → next exit) is
+        included naturally.  Returns (empty_set, empty_list) when
+        there are no in-range partner targets so the caller can skip
+        the union.
+        """
+        extra_seeds: list = []
+        for p in self.pending_partners:
+            try:
+                p_fa = self.model.analyze_function(p)
+            except Exception:
+                continue
+            for b in p_fa.branches:
+                if b.target is not None and not b.internal:
+                    if candidate.start <= b.target <= candidate.end:
+                        extra_seeds.append(b.target)
+            # Walk switch_clusters by ADDRESS RANGE, not via
+            # p_fa.indirect_calls — the latter only contains dispatchers
+            # the local walker actually reached from p.start, which
+            # excludes dispatchers reached only via alt entries (common
+            # on unstamped partners where no alt entries are declared
+            # yet).  Range-based catches every dispatcher inside the
+            # partner's body.
+            for dispatcher_pc, tgts in self.model.switch_clusters.items():
+                if not (p <= dispatcher_pc <= p_fa.end):
+                    continue
+                for t in tgts:
+                    if candidate.start <= t <= candidate.end:
+                        extra_seeds.append(t)
+        if not extra_seeds:
+            return set(), []
+        extra_seeds = list(set(extra_seeds))
+        extra_reach, _, extra_branches, _ = _control_flow_walk(
+            self.model.binary, self.model.vram,
+            start=extra_seeds[0],
+            hard_limit_addr=candidate.end,
+            pool_priors=self.model.pool_priors_dict(),
+            extra_starts=extra_seeds[1:] if len(extra_seeds) > 1 else None,
+        )
+        return extra_reach, extra_branches
+
+    def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate, partner_ranges=None,
+                             reachable_set=None, extra_branches=None):
         """Translate FunctionAnalysis + pool sets into ListingRows for [fa.start, fa.end].
 
         SINGLE RESPONSIBILITY: lookup, not decide.  Reads pre-decided
@@ -4419,6 +4488,14 @@ class SweepState:
         prologue_lo, prologue_hi = fa.prologue_range
         epi_lo, epi_hi = fa.epilogue_range if fa.epilogue_range else (None, None)
         branches_at = {b.src: b for b in fa.branches}
+        # Merge in any extra branches the caller collected (e.g. from
+        # a partner-extended walk): keys not already in branches_at
+        # get added so partner-walked bras get their branch metadata
+        # and the client can draw partner-leap arcs on them.
+        if extra_branches:
+            for b in extra_branches:
+                if b.src not in branches_at and b.target is not None:
+                    branches_at[b.src] = b
 
         # Decoration sets: midpoints and ref-end derived from this
         # function's analysis (NOT the displayed candidate's), so prev-
@@ -4638,8 +4715,12 @@ class SweepState:
             # from the function entry.  Pool/data handled above; what
             # remains here is genuine dead-or-data that decode_sh2
             # happened to spell as a valid mnemonic.  Zero indent so it
-            # doesn't appear nested under live code.
-            if addr not in fa.reachable:
+            # doesn't appear nested under live code.  `reachable_set`
+            # overrides `fa.reachable` when caller wants extended reach
+            # (e.g. current section seeds from queued-partner call
+            # targets); defaults to fa.reachable for prev section.
+            reach = reachable_set if reachable_set is not None else fa.reachable
+            if addr not in reach:
                 row.is_unreachable = True
                 row.indent = 0
                 row.tag = "unreach"
