@@ -1083,13 +1083,19 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
 
 def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
                                  func_start=None, hard_limit=None):
-    """Recognize the GCC SH-2 switch-dispatch idiom around `braf_pc`.
+    """Recognize the SH-2 switch-dispatch idiom around `braf_pc`.
 
     Idiom (within ~12 bytes before braf):
-        mova @(disp,PC), r0
-        mov.w @(r0,rN), r0
-        braf r0
+        mova @(disp,PC), r0           ; r0 = table base
+        mov.w @(r0, rIdx), rDisp      ; rDisp = sign-extended *(r0 + rIdx)
+        braf rDisp                    ; PC += rDisp
         <delay slot>
+
+    `rDisp` is whatever the mov.w writes to and the braf reads from —
+    GCC's canonical form uses r0 for both, but compilers also emit
+    forms that route through r1 (or any other GP reg).  The detector
+    locks `rDisp` to the braf's register and matches a mov.w with
+    that same destination.
 
     Returns list[int] of target addresses (possibly empty).
     """
@@ -1100,8 +1106,6 @@ def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
     if braf_op is None or (braf_op & 0xF0FF) != 0x0023:
         return []
     braf_reg = (braf_op >> 8) & 0xF
-    if braf_reg != 0:
-        return []
 
     movw_seen = False
     table_base = None
@@ -1112,8 +1116,10 @@ def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
         op = _read_opcode(binary, vram, addr)
         if op is None:
             continue
-        # mov.w @(r0, rM), r0  encoding 0000 0000 mmmm 1101
-        if (op & 0xF00F) == 0x000D and ((op >> 8) & 0xF) == 0:
+        # mov.w @(R0, Rm), Rn  encoding 0000 nnnn mmmm 1101 — gate
+        # the destination on the braf's register so we don't latch a
+        # random mov.w that happens to land within the back-scan.
+        if (op & 0xF00F) == 0x000D and ((op >> 8) & 0xF) == braf_reg:
             movw_seen = True
             continue
         # mova @(disp, PC), r0  encoding 11000111 dddddddd
