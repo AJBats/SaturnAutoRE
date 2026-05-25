@@ -330,6 +330,40 @@ header#header > #header-content {
 .tag.tag-ref-end {
   color: #e8a;
 }
+
+/* Shift-held / Ctrl-held hex address hover affordance.
+   - Shift (analyze-mode/add): amber outline + tail tint, echoing
+     the analyze-mode banner palette so the visual ties to "this
+     enters analyze mode".  (Alt was the original choice but
+     Firefox eats Alt for menu-bar focus.)  Shift also drives the
+     pin-zone gold/queue-entry affordance — different target, no
+     conflict; the cursor tells you which action fires.
+   - Ctrl (queue-partner): teal-green, echoing the + Partner
+     button and the partners chip.
+   Target selectors are intentionally narrow — `.a:hover` and
+   `.hex-ref:hover` only — so the affordance appears on actual
+   click targets, not anywhere on the row. */
+body.shift-held .line .a:hover,
+body.shift-held .hex-ref:hover,
+body.ctrl-held  .line .a:hover,
+body.ctrl-held  .hex-ref:hover {
+  border-radius: 0.15em;
+  padding: 0 0.15em;
+  cursor: pointer;
+  font-weight: bold;
+}
+body.shift-held .line .a:hover,
+body.shift-held .hex-ref:hover {
+  outline: 1.5px solid #c93;
+  color: #fc8;
+  background: rgba(204, 153, 51, 0.12);
+}
+body.ctrl-held .line .a:hover,
+body.ctrl-held .hex-ref:hover {
+  outline: 1.5px solid #6cb073;
+  color: #9ed;
+  background: rgba(108, 176, 115, 0.12);
+}
 /* Walker-stop confidence on bra/jmp/braf rows.  Color-codes the rank
    suffix the analyzer attached when it decided whether to halt or
    absorb across a branch target.  Hover the tag for the tooltip with
@@ -505,6 +539,25 @@ svg.arcs .arc.arc-backward { stroke-dasharray: 4 3; }
 /* Sticky gets a slight glow */
 svg.arcs .arc.sticky {
   filter: drop-shadow(0 0 4px currentColor);
+}
+
+/* Partner-pending leap — green dashed arrow from any branch whose
+   target is in the queued-partner set.  Bows left + extends off-
+   screen in the partner's direction; the destination intentionally
+   isn't terminated because partners can sit anywhere in the binary
+   (sometimes 96kB away).  Color matches the partner chip + button
+   palette so the visual ties to "this is a partner action". */
+svg.arcs .arc-partner-pending {
+  fill: none;
+  stroke: #9ed;
+  stroke-width: 2;
+  stroke-dasharray: 4 2;
+  stroke-opacity: 0.85;
+  filter: drop-shadow(0 0 3px rgba(158, 221, 221, 0.4));
+}
+svg.arcs .arc-partner-pending-dot {
+  fill: #9ed;
+  fill-opacity: 0.95;
 }
 
 .line { display: block; padding-left: 0.2em; }

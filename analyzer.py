@@ -333,10 +333,11 @@ class ListingRow:
     # ----- Indent depth (capped for display in renderer)
     indent: int = 0
 
-    # ----- Branch metadata (for arc drawing — only set on instructions/pools with internal targets)
+    # ----- Branch metadata (for arc drawing)
     branch_target: Optional[int] = None
     branch_direction: Optional[str] = None  # 'forward' / 'backward'
     branch_type: Optional[str] = None        # 'cond' / 'uncond'
+    branch_internal: Optional[bool] = None   # target sits inside this function?  external branches use this to opt out of the normal arc renderer (client-side) while still feeding overlay arcs like the partner-pending leap.
 
     # ----- Indirect-target resolution annotation ("⇒ FUN_X" inline tail)
     indirect_resolved_label: str = ""    # "FUN_0602AB10" or "0x06037000" — empty if not applicable
@@ -4561,8 +4562,15 @@ class SweepState:
             if b is not None and b.target is not None:
                 row.branch_target = b.target
                 row.branch_direction = b.direction
-                if b.internal:
-                    row.branch_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
+                # branch_type reflects the mnemonic itself (cond vs
+                # uncond) regardless of whether the target lands inside
+                # or outside the function — external branches still
+                # need the metadata so client-side overlays (e.g. the
+                # green partner-pending leap arc) can recognize them.
+                # branch_internal lets the client opt those externals
+                # out of the normal arc renderer.
+                row.branch_type = "cond" if b.mnem in {"bf", "bt", "bf/s", "bt/s"} else "uncond"
+                row.branch_internal = b.internal
                 if b.internal:
                     row.margin = "↓" if b.target > b.src else "↑"
                 else:

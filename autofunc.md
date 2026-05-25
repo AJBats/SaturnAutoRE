@@ -230,6 +230,14 @@ before committing partners.
   — define the synthetic multi-block candidate. No yaml mutation,
   no history. The UI's `analyze_mode` slot is populated and the
   candidate view switches to multi-block.
+- **`POST /analyze-mode/add {"start": "0x..."}`** — incremental
+  entry point used by the UI's alt-click on a hex address. Server
+  computes the block end (stamped subseg's end if verified, else
+  CFG walker via `model.analyze_function`). When analyze mode is
+  not yet active, enters with two blocks — live candidate as
+  block 1, alt-clicked addr as block 2. When already active,
+  appends; toggles a block out if its start is already present;
+  clears the mode entirely on toggling away the last block.
 - **`POST /analyze-mode/cycle {"direction": "next" | "prev"}`** —
   navigate between blocks (also wired to ←/→ keys in the UI).
 - **`POST /analyze-mode/clear`** — exit analyze mode. Sweep resumes.

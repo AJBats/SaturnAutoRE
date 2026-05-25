@@ -16,6 +16,11 @@ let LAST_ENTRIES_KEY = '';
 // so an external yaml edit that changes a stamp's boundary forces
 // a rebuild (the tooltip carries the end hex).
 let LAST_SCRUBBER_KEY = '';
+// Identity of the current candidate's pending-partners set.  Used to
+// fire a standalone drawArcs() when the user queues/unqueues a
+// partner without changing boundaries (which would otherwise miss
+// the listing-change re-render).
+let LAST_PENDING_PARTNERS_KEY = '';
 // Last audit focus address from /state.  Used by the unstamp handler
 // instead of reading `.scrubber-cell.focused` from DOM, which can lag
 // server state if a focus POST is in flight.
@@ -343,6 +348,12 @@ function renderCandidateBanner(target, candidate, prev, paneLabel) {
 
 // Cache of branches to draw — refreshed each render.
 let CURRENT_BRANCHES = [];
+// Set of int addrs queued via /queue-partner on the current candidate.
+// Read by drawArcs to overlay a green dashed leap from any branch
+// whose target matches a queued partner.  Refreshed every /state poll
+// (cheap — small Set) so the arrow appears the instant the user
+// queues a partner, even when the listing isn't re-rendered.
+let CURRENT_PENDING_PARTNERS = new Set();
 
 // Diff-style alignment: take two arrays of line objects and return two
 // equal-length arrays where rows for the same VRAM anchor address sit at
@@ -539,6 +550,7 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
         target: line.branch.target,
         type: line.branch.type,
         direction: line.branch.direction,
+        internal: line.branch.internal,
       });
     }
     // Pin-zone: small `+` in the leftmost margin on row hover.
@@ -573,6 +585,16 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
     if (!RD_LAST_OPERAND_MNEMS.has(mnemHead)) {
       mnemHtml = mnemHtml.replace(/(?<=[\s,])r15\b(?![,+)])/g, '<span class="stack-op">r15</span>');
     }
+    // Wrap 0xXXXXXXXX hex addresses in the mnem (branch/jump targets)
+    // as click targets for alt (analyze-mode/add) and ctrl (queue-
+    // partner).  data-addr carries the decoded int so handlers don't
+    // re-parse the text.  Only matches exactly 8 hex digits — short
+    // immediates like `#0xFF` and displacements like `@(0xC, r15)`
+    // aren't addresses, so they stay un-wrapped.
+    mnemHtml = mnemHtml.replace(
+      /\b0x[0-9A-Fa-f]{8}\b/g,
+      m => `<span class="hex-ref" data-addr="${parseInt(m.slice(2), 16)}">${m}</span>`
+    );
     return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${mnemHtml}</span>${tagPart}</span>`;
   }).join('\n');
   target.innerHTML = html;
@@ -653,6 +675,12 @@ function drawArcs() {
   // Compute geometry for each branch
   const arcs = [];
   CURRENT_BRANCHES.forEach((br, idx) => {
+    // External branches (target outside this function) are still in
+    // CURRENT_BRANCHES so overlay renderers like the partner-pending
+    // leap can match them — skip them here so the normal arc renderer
+    // doesn't draw stray lines when the trailing/intermediate section
+    // happens to include the target addr.
+    if (br.internal === false) return;
     const srcEl = srcMap.get(br.src);
     const tgtEl = tgtMap.get(br.target) || srcMap.get(br.target);
     if (!srcEl || !tgtEl) return;
@@ -726,6 +754,40 @@ function drawArcs() {
     // Arrowhead at target — triangle pointing RIGHT into the target line
     parts.push(`<polygon class="arc-head arc-${arc.type}" data-arc-id="${arc.id}" points="${tX},${tY} ${tX-6},${tY-4} ${tX-6},${tY+4}" />`);
   }
+
+  // Partner-pending leaps — green dashed arrow from any branch whose
+  // target is in the queued-partner set, bowing left into the pin-
+  // zone margin and extending off-screen in the partner's direction.
+  // We don't try to terminate the arc at the partner: partners can
+  // be 96kB+ away, and even when they're close the "queued, not yet
+  // stamped" semantic reads more clearly as a leap "toward" rather
+  // than a connection "to".  The bow anchors on the row's `.pin-zone`
+  // X (leftmost margin of the line) so the swing depth is consistent
+  // regardless of indent level.  No arrowhead — the curve direction
+  // itself (down vs up) reads as the travel-direction signal.
+  const PARTNER_TAIL_DY = 220; // path tail extends this far past source
+  function pinZoneXOf(lineEl) {
+    const pz = lineEl.querySelector('.pin-zone');
+    if (!pz) return MIN_LEFT_MARGIN;
+    return pz.getBoundingClientRect().left - listingRect.left;
+  }
+  CURRENT_BRANCHES.forEach(br => {
+    if (!CURRENT_PENDING_PARTNERS.has(br.target)) return;
+    const srcEl = srcMap.get(br.src);
+    if (!srcEl) return;
+    const sX = tickXOf(srcEl) - TICK_INSET;
+    const sY = midYOf(srcEl);
+    const dirSign = (br.target > br.src) ? 1 : -1;
+    const bowX  = Math.max(MIN_LEFT_MARGIN, pinZoneXOf(srcEl) + 2);
+    const tailY = sY + dirSign * PARTNER_TAIL_DY;
+    // Cubic bezier: leaves src horizontally to the left, then curves
+    // down/up toward the tail end.  Tail clips out on the listing
+    // pane's overflow when long enough — exactly the "leaps off" feel.
+    const d = `M ${sX} ${sY} C ${bowX} ${sY}, ${bowX} ${tailY}, ${bowX + 4} ${tailY}`;
+    parts.push(`<path class="arc-partner-pending" d="${d}" />`);
+    parts.push(`<circle class="arc-partner-pending-dot" cx="${sX}" cy="${sY}" r="3" />`);
+  });
+
   svg.innerHTML = parts.join('');
 }
 
@@ -889,6 +951,14 @@ async function fetchState() {
     const entriesKey = [...confirmedAddrs, '|', ...pendingAddrs].sort().join(',');
     const entriesChanged = (entriesKey !== LAST_ENTRIES_KEY);
     LAST_ENTRIES_KEY = entriesKey;
+    // Pending-partners set drives the green leap arcs in drawArcs.
+    // Track changes so we can redraw arcs (without a full listing
+    // re-render) when the user queues / unqueues a partner.
+    const pendingPartnerAddrs = (s.candidate.pending_partners || []).map(p => p.addr).sort((a, b) => a - b);
+    const pendingPartnersKey = pendingPartnerAddrs.join(',');
+    const pendingPartnersChanged = (pendingPartnersKey !== LAST_PENDING_PARTNERS_KEY);
+    LAST_PENDING_PARTNERS_KEY = pendingPartnersKey;
+    CURRENT_PENDING_PARTNERS = new Set(pendingPartnerAddrs);
     // Per-pane midpoint sets — reference's view of where function starts
     // fall INSIDE each pane's candidate range.  Each pane uses its own
     // range so the natural pane (often wider) can highlight midpoints
@@ -950,6 +1020,11 @@ async function fetchState() {
           window.scrollBy({ top: targetRect.top - stickyHeight, behavior: 'instant' });
         });
       }
+    } else if (pendingPartnersChanged) {
+      // No listing re-render path fired, but the partner queue moved.
+      // Redraw arcs against the cached CURRENT_BRANCHES so the green
+      // leap appears/disappears immediately.
+      requestAnimationFrame(drawArcs);
     }
 
     if (overrideActive) {
@@ -1030,6 +1105,49 @@ document.addEventListener('DOMContentLoaded', () => {
   // header → POST /unpin-end to clear the active ai_override entirely.
   // Both handlers delegate from the same listing-wrap listener.
   document.getElementById('listing-wrap').addEventListener('click', async (e) => {
+    // Shift/Ctrl on a hex address → /analyze-mode/add (shift) or
+    // /queue-partner (ctrl).  Only fires when the click target is a
+    // hex element (.hex-ref span inside the mnem, or the .a address
+    // column on the row) — shift+click on .pin-zone falls through
+    // to the existing queue-entry handler below.  Alt was tried first
+    // for analyze but Firefox eats it for menu-bar focus.
+    if (e.shiftKey || e.ctrlKey) {
+      const ref = e.target.closest('.hex-ref');
+      const addrCol = ref ? null : e.target.closest('.line .a');
+      if (ref || addrCol) {
+        let addr = null;
+        if (ref) {
+          addr = parseInt(ref.dataset.addr, 10);
+        } else {
+          const line = addrCol.closest('.line[data-addr]');
+          if (line) addr = parseInt(line.dataset.addr, 10);
+        }
+        if (addr != null && !Number.isNaN(addr) && addr > 0) {
+          e.preventDefault();
+          const addrHex = '0x' + addr.toString(16).toUpperCase().padStart(8, '0');
+          // Shift wins when both are held — analyze is the more
+          // common scrubbing action.
+          const url = e.shiftKey ? '/analyze-mode/add' : '/queue-partner';
+          const body = e.shiftKey ? {start: addrHex} : {partner: addrHex};
+          const r = await fetch(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body),
+          });
+          const data = await r.json();
+          if (!data.ok) {
+            setStatus(`${url.slice(1)} failed: ` + (data.error || 'unknown'));
+            return;
+          }
+          fetchState();
+        }
+        return;  // handled (or no-op on missing addr) — don't fall through
+      }
+      // Modifier held but target isn't a hex element — let the pin-zone
+      // / unpin-btn paths below take over (e.g. shift+click on .pin-zone
+      // = queue alt entry).
+    }
+
     const unpin = e.target.closest('.unpin-btn');
     if (unpin) {
       // Scope tells us which endpoint to call: "all" clears the whole
@@ -1117,7 +1235,8 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Shift') document.body.classList.add('shift-held');
+    if (e.key === 'Shift')   document.body.classList.add('shift-held');
+    if (e.key === 'Control') document.body.classList.add('ctrl-held');
     if (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT') return;
     // Vertical scroll keys — always drive the window, regardless of
     // which element has focus.  Without this, Chrome routes the key to
@@ -1161,10 +1280,12 @@ document.addEventListener('DOMContentLoaded', () => {
   // blur — without the blur handler, alt-tabbing away while holding
   // shift leaves the body class stuck on.
   document.addEventListener('keyup', (e) => {
-    if (e.key === 'Shift') document.body.classList.remove('shift-held');
+    if (e.key === 'Shift')   document.body.classList.remove('shift-held');
+    if (e.key === 'Control') document.body.classList.remove('ctrl-held');
   });
   window.addEventListener('blur', () => {
     document.body.classList.remove('shift-held');
+    document.body.classList.remove('ctrl-held');
   });
 
   // Analyze-mode button wiring.

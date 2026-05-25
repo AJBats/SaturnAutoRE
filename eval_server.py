@@ -643,6 +643,7 @@ def _row_to_dict(row):
             "target": row.branch_target,
             "type": row.branch_type,
             "direction": row.branch_direction,
+            "internal": row.branch_internal,
         }
     # Walker-stop confidence on bra/jmp/braf rows — drives tag tooltip
     # in the frontend.  Only set for instruction rows the walker
@@ -1479,6 +1480,97 @@ def analyze_mode_clear():
         session["analyze_mode"] = None
         save_session(session)
     return jsonify({"ok": True, "was_active": had})
+
+
+@app.route("/analyze-mode/add", methods=["POST"])
+def analyze_mode_add():
+    """Alt-click entrypoint: add a block to analyze mode by start addr.
+    Server computes the block end from the stamped subseg's end if
+    that addr is already verified, else from the CFG walker
+    (model.analyze_function).
+
+    If not yet in analyze mode, enters with two blocks — the live
+    candidate as block 1, the alt-clicked addr as block 2 (the
+    'current function is the first block' rule).  If already in
+    analyze mode, appends; toggles a block out if its start is
+    already present, and clears the mode entirely when the last
+    block is toggled away.
+    """
+    data = request.get_json(force=True)
+    raw = data.get("start")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'start'"}), 400
+    try:
+        addr = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+
+    with LOCK:
+        session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
+        cfg, model, sweep = _build_sweep(session)
+
+        # End comes from yaml if stamped, else CFG walker.
+        end = None
+        for s in sweep.verified:
+            if s.start == addr:
+                end = s.end
+                break
+        if end is None:
+            fa = model.analyze_function(addr)
+            end = fa.end
+
+        am = session.get("analyze_mode")
+        if not am:
+            nxt = sweep.next_candidate()
+            if nxt is None:
+                return jsonify({"ok": False, "error": "no current candidate to anchor analyze mode"}), 400
+            if addr == nxt.function.start:
+                return jsonify({
+                    "ok": False,
+                    "error": "alt-click on the current candidate is a no-op — click a different address",
+                }), 400
+            blocks = [
+                {"start": nxt.function.start, "end": nxt.function.end},
+                {"start": addr, "end": end},
+            ]
+            session["analyze_mode"] = {
+                "blocks": blocks,
+                "active_block": 1,
+                "label": "alt-click",
+            }
+            action = "entered"
+        else:
+            blocks = [dict(b) for b in (am.get("blocks") or [])]
+            existing_idx = next(
+                (i for i, b in enumerate(blocks) if int(b["start"]) == addr),
+                None,
+            )
+            if existing_idx is not None:
+                blocks.pop(existing_idx)
+                if not blocks:
+                    session["analyze_mode"] = None
+                    action = "cleared"
+                else:
+                    am["blocks"] = blocks
+                    am["active_block"] = min(am.get("active_block", 0), len(blocks) - 1)
+                    session["analyze_mode"] = am
+                    action = "removed"
+            else:
+                blocks.append({"start": addr, "end": end})
+                am["blocks"] = blocks
+                am["active_block"] = len(blocks) - 1  # focus the newly-added block
+                session["analyze_mode"] = am
+                action = "added"
+        save_session(session)
+    return jsonify({
+        "ok": True,
+        "action": action,
+        "addr": f"0x{addr:08X}",
+        "block_count": len(blocks) if action != "cleared" else 0,
+    })
 
 
 @app.route("/verdict", methods=["POST"])
