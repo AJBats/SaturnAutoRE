@@ -997,15 +997,23 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
                                       func_start=None, hard_limit=None):
     """Recognize the GCC SH-2 indirect switch-dispatch idiom around `jmp_pc`.
 
-    Idiom (within ~8 instructions before the jmp):
+    Two variants, same overall shape:
+
+    A. Index pre-scaled then added to base:
         mov.l @(disp,PC), rN     ; rN = address of the jump table
         ...                       ; (shll2 / add r_idx, rN / etc.)
-        mov.l @rN, rN             ; rN = table[idx]
-        jmp @rN                   ; transfer
+        mov.l @rN, rN             ; rN = table[idx]   <-- src==dst==rN
+        jmp @rN
 
-    The pool word's value is the table start.  The table is a run of
-    4-byte case body addresses; we walk forward stopping at the first
-    entry whose value isn't in vram range or isn't 2-byte aligned.
+    B. Indexed load (Duff's-device-style, no scale needed because the
+        index is already a byte offset):
+        mov.l @(disp,PC), rN     ; rN = table base
+        mov.l @(r0, rN), rN      ; rN = table[r0]    <-- @(r0,rN),rN
+        jmp @rN
+
+    Either pattern's pool word holds the table start.  The table is a
+    run of 4-byte case body addresses; we walk forward stopping at the
+    first entry whose value isn't in vram range or isn't 2-byte aligned.
 
     Returns list[int] of in-range case body addresses (filtered to
     [func_start, hard_limit] if those are supplied).
@@ -1033,10 +1041,22 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
             continue
 
         # mov.l @rM, rN: 0110 NNNN MMMM 0010 — looking for src==dst==reg
+        # (variant A: index pre-scaled and added to base via shll2/add)
         if (op & 0xF00F) == 0x6002:
             src = (op >> 4) & 0xF
             dst = (op >> 8) & 0xF
             if src == reg and dst == reg:
+                mov_l_via_rn_seen = True
+                continue
+
+        # mov.l @(r0,Rm), Rn: 0000 NNNN MMMM 1110 — looking for
+        # m==n==reg (variant B: indexed load with r0 as the offset
+        # register, no separate add/shift step — Duff's-device-style
+        # dispatchers that branch off a pre-aligned byte count).
+        if (op & 0xF00F) == 0x000E:
+            base = (op >> 4) & 0xF
+            dst = (op >> 8) & 0xF
+            if base == reg and dst == reg:
                 mov_l_via_rn_seen = True
                 continue
 
