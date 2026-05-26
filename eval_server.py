@@ -441,23 +441,43 @@ def _audit_neighbor_start(verified_sorted, focus_start, direction):
     return focus_start
 
 
+def _audit_sorted_subsegs(sweep):
+    """Unified sorted list of code + data subsegs for audit-mode
+    navigation.  Audit walks both kinds — the user might want to
+    unstamp a misclassified data range just as much as revisit a
+    code stamp."""
+    return sorted(
+        list(sweep.verified) + list(sweep.verified_data),
+        key=lambda s: s.start,
+    )
+
+
 def _audit_scrubber_payload(sweep, model):
     """Project every verified subseg → {start, hexes, name, size, verdict}.
     Verdict reuses the analyzer's cached analyze_function + partner-aware
     bump so the scrubber colors match what the user sees in the banner
     when they click that cell.  Fast because analyze_function is cached
-    process-lifetime and pre-warmed at startup."""
+    process-lifetime and pre-warmed at startup.
+
+    Data subsegs use the synthetic Verdict.DATA so the scrubber cell
+    can color them distinctly from code stamps."""
     out = []
-    for sub in sweep.verified:
-        fa = model.analyze_function(sub.start, hint_end=sub.end)
-        fa = sweep.apply_partner_awareness(fa)
+    for sub in _audit_sorted_subsegs(sweep):
+        if sub.type == "data":
+            verdict = "DATA"
+            name = f"DATA_{sub.start:08X}"
+        else:
+            fa = model.analyze_function(sub.start, hint_end=sub.end)
+            fa = sweep.apply_partner_awareness(fa)
+            verdict = fa.verdict.value
+            name = f"FUN_{sub.start:08X}"
         out.append({
             "start": sub.start,
             "start_hex": f"{sub.start:08X}",
             "end_hex": f"{sub.end:08X}",
-            "name": f"FUN_{sub.start:08X}",
+            "name": name,
             "size": sub.end - sub.start + 1,
-            "verdict": fa.verdict.value,
+            "verdict": verdict,
         })
     return out
 
@@ -473,7 +493,7 @@ def _audit_state_payload(session, sweep, model):
     persisted by the next mutating endpoint or by audit_mode/focus when
     the user navigates.  The in-memory mutation on `session` is harmless
     because /state never calls save_session on this object."""
-    verified = sweep.verified  # already sorted by start in SweepState.__init__
+    verified = _audit_sorted_subsegs(sweep)  # unified code + data list
     if not verified:
         return None, None
     focus_start = _audit_mode_active(session)
@@ -487,16 +507,53 @@ def _audit_state_payload(session, sweep, model):
     prev_start = starts[i - 1] if i > 0 else None
     next_start = starts[i + 1] if i + 1 < len(starts) else None
 
-    # When frontier_simulation is ON, drop the saved-end cap so the
-    # walker runs to natural CFG termination — answers "what would the
-    # walker do today if this were the next unswept function?".  When
-    # OFF, hint_end clamps to the saved end and we backfill in case
-    # the walker would have terminated early on its own.
-    frontier = bool(session.get("frontier_simulation"))
-    hint_end = None if frontier else sub.end
-    fa = model.analyze_function(sub.start, hint_end=hint_end)
-    if not frontier and fa.end != sub.end:
-        fa = dataclasses.replace(fa, end=sub.end)
+    if sub.type == "data":
+        # Synthetic FA for a focused data subseg — start/end + Verdict.DATA
+        # is enough for listing() to short-circuit into raw-row emission,
+        # for the banner to render a "DATA" verdict tag, and for the
+        # unstamp button to fire on focus_start.
+        fa = analyzer.FunctionAnalysis(
+            start=sub.start,
+            end=sub.end,
+            prologue_range=(None, None),
+            prologue_saved=[],
+            prologue_stack=0,
+            prologue_restored=[],
+            prologue_restored_extras=[],
+            epilogue_range=None,
+            final_exit=None,
+            delay_slot=None,
+            branches=[],
+            conditional_returns=[],
+            pool_targets=[],
+            reachable=set(),
+            indirect_calls=[],
+            verdict=analyzer.Verdict.DATA,
+            yellow_flags=[],
+            green_flags=[],
+            flag_tooltips={},
+            indent_depths={},
+            indirect_resolutions={},
+            reference=None,
+            midpoints=[],
+            evidence=analyzer.FunctionEvidence(
+                static_callers=0,
+                cross_module_callers=0,
+                runtime_hits=0,
+            ),
+            phantom_hint=None,
+        )
+    else:
+        # When frontier_simulation is ON, drop the saved-end cap so the
+        # walker runs to natural CFG termination — answers "what would
+        # the walker do today if this were the next unswept function?".
+        # When OFF, hint_end clamps to the saved end and we backfill in
+        # case the walker would have terminated early on its own.
+        frontier = bool(session.get("frontier_simulation"))
+        hint_end = None if frontier else sub.end
+        fa = model.analyze_function(sub.start, hint_end=hint_end)
+        if not frontier and fa.end != sub.end:
+            fa = dataclasses.replace(fa, end=sub.end)
     payload = _build_candidate_payload(
         sweep, fa, prev,
         attn=None, pending_partners=None, pending_entries=None,
@@ -1382,7 +1439,7 @@ def unstamp():
         prev_focus = next_focus = None
         if session.get("audit_mode"):
             cfg, model, sweep = _build_sweep(session)
-            starts = [s.start for s in sweep.verified]
+            starts = [s.start for s in _audit_sorted_subsegs(sweep)]
             if addr in starts:
                 i = starts.index(addr)
                 prev_focus = starts[i - 1] if i > 0 else None
@@ -1415,9 +1472,10 @@ def audit_mode_enter():
         session = load_session()
         # Build a one-shot sweep just to read verified.  Cheap.
         cfg, model, sweep = _build_sweep(session)
-        if not sweep.verified:
+        all_subsegs = _audit_sorted_subsegs(sweep)
+        if not all_subsegs:
             return jsonify({"ok": False, "error": "no verified subsegs to audit"}), 409
-        focus = sweep.verified[-1].start
+        focus = all_subsegs[-1].start
         session["audit_mode"] = {"focus_start": focus}
         # AUDIT and ai_override / analyze_mode are mutually exclusive;
         # entering audit clears them so the UI can't land in a mixed state.
@@ -1457,7 +1515,8 @@ def audit_mode_focus():
         if not session.get("audit_mode"):
             return jsonify({"ok": False, "error": "not in audit_mode"}), 409
         cfg, model, sweep = _build_sweep(session)
-        if not any(s.start == addr for s in sweep.verified):
+        all_subsegs = _audit_sorted_subsegs(sweep)
+        if not any(s.start == addr for s in all_subsegs):
             return jsonify({"ok": False, "error": f"0x{addr:08X} is not a verified subseg start"}), 404
         session["audit_mode"] = {"focus_start": addr}
         save_session(session)
@@ -1479,12 +1538,13 @@ def audit_mode_cycle():
         if not am:
             return jsonify({"ok": False, "error": "not in audit_mode"}), 409
         cfg, model, sweep = _build_sweep(session)
-        if not sweep.verified:
+        all_subsegs = _audit_sorted_subsegs(sweep)
+        if not all_subsegs:
             session["audit_mode"] = None
             save_session(session)
             return jsonify({"ok": False, "error": "no verified subsegs"}), 409
         focus = int(am.get("focus_start") or 0)
-        new_focus = _audit_neighbor_start(sweep.verified, focus, direction)
+        new_focus = _audit_neighbor_start(all_subsegs, focus, direction)
         if new_focus is None:
             return jsonify({"ok": False, "error": "no verified subsegs"}), 409
         session["audit_mode"] = {"focus_start": new_focus}

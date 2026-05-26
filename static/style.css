@@ -226,6 +226,7 @@ header#header > #header-content {
 .verdict-MEDIUM  { background: #4a432a; color: #dc9; }
 .verdict-LOW     { background: #4a2a2a; color: #d99; }
 .verdict-UNKNOWN { background: #333; color: #999; }
+.verdict-DATA    { background: #2a3a4a; color: #9cf; }
 
 /* Awaiting AI banner */
 .awaiting-banner {
@@ -888,6 +889,7 @@ footer button:hover { background: #4a4a4a; }
 .scrubber-cell.verdict-MEDIUM  { background: #cb6; }
 .scrubber-cell.verdict-LOW     { background: #c66; }
 .scrubber-cell.verdict-UNKNOWN { background: #555; }
+.scrubber-cell.verdict-DATA    { background: #69b; }   /* data subseg — blue, distinct from code verdicts */
 .scrubber-cell:hover { filter: brightness(1.35); }
 .scrubber-cell.focused {
   outline: 2px solid #fff;

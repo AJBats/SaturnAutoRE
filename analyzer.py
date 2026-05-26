@@ -172,6 +172,7 @@ class Verdict(str, Enum):
     MEDIUM = "MEDIUM"
     LOW = "LOW"
     UNKNOWN = "UNKNOWN"
+    DATA = "DATA"      # synthetic verdict for data subsegs (audit mode)
 
 
 @dataclass
@@ -4331,11 +4332,15 @@ class SweepState:
         return gaps
 
     def progress(self) -> Progress:
-        """Sum verified code subseg bytes vs total binary size.
+        """Sum verified subseg bytes (code + data) vs total binary size.
+        Data ranges count toward 'done' just as much as code stamps —
+        a declared data block is no longer unclassified territory.
 
         Mirrors eval_server._compute_progress.
         """
-        verified_bytes = sum(s.end - s.start + 1 for s in self.verified)
+        code_bytes = sum(s.end - s.start + 1 for s in self.verified)
+        data_bytes = sum(s.end - s.start + 1 for s in self.verified_data)
+        verified_bytes = code_bytes + data_bytes
         total_bytes = len(self.model.binary)
         pct = (verified_bytes / total_bytes * 100.0) if total_bytes else 0.0
         return Progress(
@@ -4556,22 +4561,33 @@ class SweepState:
         # metadata (no partner-leap arcs) — distracting noise when the
         # user has explicitly queued the partnership and the
         # relationship is exactly what reaches the code.
-        extra_reach, extra_branches = self._partner_extended_walk(candidate)
-        extended_reachable = set(candidate.reachable) | extra_reach if extra_reach else candidate.reachable
+        # Synthetic data candidates (audit mode focused on a data
+        # subseg) skip the CFG walk entirely — they're declared
+        # literal bytes, not code.  Header + raw rows only.
         size = candidate.end - candidate.start + 1
-        self._emit_section_header(
-            rows, next_id, Section.CURRENT,
-            f"PROPOSED  FUN_{candidate.start:08X}  "
-            f"0x{candidate.start:08X} → 0x{candidate.end:08X}  ({size} bytes)  "
-            f"verdict: {candidate.verdict.value}",
-            anchor_addr=candidate.start,
-        )
-        self._emit_function_rows(
-            rows, next_id, candidate, Section.CURRENT, attn_set,
-            candidate, partner_ranges,
-            reachable_set=extended_reachable,
-            extra_branches=extra_branches,
-        )
+        if candidate.verdict == Verdict.DATA:
+            self._emit_section_header(
+                rows, next_id, Section.CURRENT,
+                f"DATA  0x{candidate.start:08X} → 0x{candidate.end:08X}  ({size} bytes)",
+                anchor_addr=candidate.start,
+            )
+            self._emit_raw_rows(rows, next_id, candidate.start, candidate.end, Section.CURRENT)
+        else:
+            extra_reach, extra_branches = self._partner_extended_walk(candidate)
+            extended_reachable = set(candidate.reachable) | extra_reach if extra_reach else candidate.reachable
+            self._emit_section_header(
+                rows, next_id, Section.CURRENT,
+                f"PROPOSED  FUN_{candidate.start:08X}  "
+                f"0x{candidate.start:08X} → 0x{candidate.end:08X}  ({size} bytes)  "
+                f"verdict: {candidate.verdict.value}",
+                anchor_addr=candidate.start,
+            )
+            self._emit_function_rows(
+                rows, next_id, candidate, Section.CURRENT, attn_set,
+                candidate, partner_ranges,
+                reachable_set=extended_reachable,
+                extra_branches=extra_branches,
+            )
 
         # ----- 4. Trailing section (TRAILING_BYTES past candidate end) -----
         trailing_start = candidate.end + 1
