@@ -573,6 +573,17 @@ svg.arcs .arc-partner-pending-dot {
 .line .b { color: #8a8; margin-right: 1em; }
 .line .m { color: #ddd; }
 .line .lbl { color: #9cf; }
+/* Tentative instruction decode on pool rows — a faint preview of
+   what the bytes WOULD mean if read as code.  Dim + italic so it
+   reads as "speculative annotation", not actual code.  Lets the
+   user scan a pool block and spot real functions hiding in data
+   classification (4F 22 → sts.l pr,@-r15 jumps out). */
+.line .tentative-decode {
+  color: #556;
+  font-style: italic;
+  margin-left: 1.2em;
+  font-size: 92%;
+}
 
 /* Section headers — distinct banner per section */
 .line.section-prev-header,

@@ -342,6 +342,15 @@ class ListingRow:
     # ----- Indirect-target resolution annotation ("⇒ FUN_X" inline tail)
     indirect_resolved_label: str = ""    # "FUN_0602AB10" or "0x06037000" — empty if not applicable
 
+    # ----- Tentative instruction decode for pool/raw rows
+    # When set, the 16-bit value at this addr decodes as a valid SH-2
+    # mnemonic, but the address is currently classified as pool data.
+    # Renderer shows this in a pale "preview" color after the .2byte
+    # text so the human can peek at whether the bytes might actually
+    # be code mis-classified as data.  None when the bytes don't
+    # decode to a recognizable mnem (genuinely non-code data).
+    tentative_decode: Optional[str] = None
+
     # ----- Walker-stop confidence (only set on bra/jmp/braf rows the
     # walker considered as potential tail-call exits).  Renderer reads
     # `tag_tooltip` for hover-text and may color/style the tag based on
@@ -2124,6 +2133,48 @@ class BinaryModel:
         # → classify as POOL2.
         self._classify_orphan_pool()
 
+        # ----- Prologue-pattern scan -----
+        # Binary-wide scan for `sts.l pr, @-r15` (0x4F22) — the
+        # near-universal SH-2 function prologue opener.  Records
+        # every match as a "suspected function entry."  SweepState
+        # filters these against known fn-entry signals at /state
+        # time; the residue (matches that have NO known signal AND
+        # aren't inside a verified subseg) is surfaced as a hint
+        # label in the listing — the user gets a discovery channel
+        # for functions the reference disasm mis-classified as data.
+        # False-positive rate is low: random 16-bit values match
+        # 0x4F22 at 1/65536, so a 1MB binary yields ~7-8 chance
+        # matches.  The label says "Suspected" so chance matches
+        # read as noise, not authoritative claims.
+        bin_data = self.binary
+        bin_len = len(bin_data)
+        sus: set = set()
+        i = 0
+        while i + 1 < bin_len:
+            if bin_data[i] == 0x4F and bin_data[i + 1] == 0x22:
+                sus.add(self.vram + i)
+            i += 2
+        self.suspected_fn_entries = sus
+
+        # ----- Pool4-pointer-target scan -----
+        # Every POOL4 literal whose value falls inside the binary
+        # range and is 2-byte aligned is a candidate function
+        # pointer (some code does `mov.l @(d,PC),rN; jsr @rN` with
+        # this address as the target).  Distinct from the prologue
+        # scan above — catches LEAF functions that don't save PR
+        # (so they don't start with 0x4F22) but ARE called
+        # indirectly through a function-pointer literal.  Surfaced
+        # as a separate hint label in the listing.  False-positive
+        # mode: a pool4 literal can also point at DATA (string,
+        # array, struct, LUT base) rather than code — the hint
+        # label says "could be data table" so the user verifies.
+        self.pool4_pointer_targets = {
+            pw.value for pw in self.pool_words.values()
+            if pw.size == 4
+            and self.vram <= pw.value < self.vram + bin_len
+            and (pw.value & 1) == 0
+        }
+
         # ----- Phase B: re-scan static_callers with enriched pool skip -----
         # Pass E reclassified additional bytes as POOL2/POOL4 (jump
         # tables, lookup tables, orphan runs between known pools).  The
@@ -3501,6 +3552,28 @@ class SweepState:
         ]
         self.verified.sort(key=lambda s: s.start)
 
+        # Data subsegs — declared regions of literal data (LUTs, jump
+        # tables, padding) that don't undergo CFG analysis.  Forward-
+        # sweep treats them as covered (skips past their end like it
+        # does for code stamps); the listing renders them in the prev
+        # section with raw row emission rather than function decode.
+        # Kept separate from `self.verified` so existing code paths
+        # (alt_entry validation, partners, callers, etc.) keep their
+        # code-only invariants without per-call type checks.
+        self.verified_data = [
+            VerifiedSubseg(
+                start=s["start"],
+                end=s["end"],
+                type=s.get("type", "data"),
+                file=s.get("file", ""),
+                partners=[],
+                entries=[],
+            )
+            for s in (yaml_cfg.get("subsegments") or [])
+            if s.get("type") == "data"
+        ]
+        self.verified_data.sort(key=lambda s: s.start)
+
         # Validate `entries:` lists and derive alt_entry_main.  Each alt
         # entry must sit strictly inside its owning subseg's (start, end]
         # (alt != start, but alt == end is fine — single-instruction
@@ -3577,6 +3650,46 @@ class SweepState:
         self._analyze_block_starts = {
             int(b["start"]) for b in (self.analyze_mode.get("blocks") or [])
         }
+        # Filter `model.suspected_fn_entries` (prologue-pattern matches
+        # binary-wide) down to the "interesting" residue: matches that
+        # have NO existing function-entry signal AND aren't inside any
+        # verified subseg.  These are addresses where the prologue
+        # opcode `sts.l pr, @-r15` appears but our reference/caller/
+        # switch-target detection didn't recognize them — strong
+        # candidates for code that the reference mis-classified as
+        # data.  Surfaced as a hint label in row emission.
+        _known_fn_entries = set(self.model.reference_starts)
+        _known_fn_entries.update(
+            a for a, c in self.model.static_callers.items() if c > 0
+        )
+        _known_fn_entries.update(
+            a for a, c in self.model.cross_module_callers.items() if c > 0
+        )
+        _known_fn_entries.update(self.model.switch_targets)
+        _verified_ranges = [(s.start, s.end) for s in self.verified]
+        self.suspected_fn_entry_hints: set = set()
+        for a in self.model.suspected_fn_entries:
+            if a in _known_fn_entries:
+                continue
+            if any(s <= a <= e for s, e in _verified_ranges):
+                continue
+            self.suspected_fn_entry_hints.add(a)
+        # Pool4-pointer hints: same residue filter, different signal
+        # source.  Surfaces leaf functions (no PR save) that are only
+        # called via `mov.l (pool), rN; jsr @rN`.
+        self.pool4_target_hints: set = set()
+        for a in self.model.pool4_pointer_targets:
+            if a in _known_fn_entries:
+                continue
+            if any(s <= a <= e for s, e in _verified_ranges):
+                continue
+            # Skip if also a prologue-pattern hit — the prologue label
+            # is the more specific signal and we want only one label
+            # per addr.
+            if a in self.suspected_fn_entry_hints:
+                continue
+            self.pool4_target_hints.add(a)
+
         # Session-level pending partner addrs (queued via /queue-partner,
         # not yet committed to yaml).  `_caller_kind` treats them as
         # "partner" relationships when the caller-side is one of them
@@ -3652,6 +3765,40 @@ class SweepState:
             if target_addr >= ts and caller_start != ts:
                 return "partner"
         return "stamped"
+
+    def check_suspected_fn_entries_inside(self, fa: FunctionAnalysis) -> list:
+        """Return yellow-flag strings listing any suspected function
+        entries (prologue-pattern or pool4-pointer) that fall inside
+        the candidate's [start, end] range.  In a runaway candidate
+        — say a 17KB over-extended stamp — the hints in the listing
+        are easy to miss because the user has to scroll thousands of
+        lines.  This surfaces them on the banner with their hex
+        addresses so the user can navigate straight to them.
+
+        One flag per hint type; both can fire on the same candidate.
+        """
+        flags = []
+        prologue_in = sorted(
+            a for a in self.suspected_fn_entry_hints
+            if fa.start <= a <= fa.end and a != fa.start
+        )
+        pool4_in = sorted(
+            a for a in self.pool4_target_hints
+            if fa.start <= a <= fa.end and a != fa.start
+        )
+        if prologue_in:
+            addrs = ", ".join(f"0x{a:08X}" for a in prologue_in[:8])
+            extra = f" + {len(prologue_in) - 8} more" if len(prologue_in) > 8 else ""
+            flags.append(
+                f"prologue-pattern hits inside candidate ({len(prologue_in)}): {addrs}{extra}"
+            )
+        if pool4_in:
+            addrs = ", ".join(f"0x{a:08X}" for a in pool4_in[:8])
+            extra = f" + {len(pool4_in) - 8} more" if len(pool4_in) > 8 else ""
+            flags.append(
+                f"pool4-pointer hits inside candidate ({len(pool4_in)}): {addrs}{extra}"
+            )
+        return flags
 
     def check_trailing_zone_case_targets(self, fa: FunctionAnalysis,
                                           trailing_window: int = 200) -> list:
@@ -3767,10 +3914,19 @@ class SweepState:
         """
         if self.frontier_simulation:
             return None
+        # Both code AND data subsegs cap the walker — a declared data
+        # region is just as much "already classified" as a stamped
+        # function for the purpose of "don't walk past here."
         next_start = min(
             (s.start for s in self.verified if s.start > start),
             default=None,
         )
+        data_next = min(
+            (s.start for s in self.verified_data if s.start > start),
+            default=None,
+        )
+        if data_next is not None and (next_start is None or data_next < next_start):
+            next_start = data_next
         return None if next_start is None else next_start - 1
 
     def suggested_partners(self, fa: FunctionAnalysis) -> list:
@@ -4214,12 +4370,22 @@ class SweepState:
         static_callers = model.static_callers
         cross_module_callers = model.cross_module_callers
 
+        # Unified view of code + data subsegs (sorted by start) — both
+        # count as "covered territory" for the forward sweep.  Data
+        # subsegs serve as iteration anchors too: the sweep needs to
+        # scan past a declared data range to find the next function.
+        all_subsegs = sorted(
+            self.verified + self.verified_data, key=lambda s: s.start,
+        )
+
         def _covered_by_existing(addr):
-            """True if addr falls inside any verified subseg's [start, end]
-            range — not just at a start.  Catches the case where forward
-            sweep latches on a prologue inside a function that was
-            ai_overridden to start a few bytes earlier."""
-            for s in self.verified:
+            """True if addr falls inside any verified (code OR data)
+            subseg's [start, end] range — not just at a start.
+            Catches the case where forward sweep latches on a prologue
+            inside a function that was ai_overridden to start a few
+            bytes earlier, AND prevents the sweep from re-proposing
+            addresses inside a declared data region."""
+            for s in all_subsegs:
                 if s.start <= addr <= s.end:
                     return True
             return False
@@ -4228,7 +4394,7 @@ class SweepState:
         # by any declared subseg, look for a function there first.  Handles
         # both the bootstrap case (no anchors yet) and re-review of the
         # very first function after an /unstamp at the binary head.
-        if not self.verified or self.verified[0].start > vram:
+        if not all_subsegs or all_subsegs[0].start > vram:
             next_start = _scan_for_next_prologue(
                 binary, vram, vram, binary_end,
                 reference_starts=reference_starts,
@@ -4241,7 +4407,7 @@ class SweepState:
                 )
                 return NextCandidate(previous=None, function=fa)
 
-        for prev in self.verified:
+        for prev in all_subsegs:
             next_start = _scan_for_next_prologue(
                 binary, vram, prev.end + 1, binary_end,
                 reference_starts=reference_starts,
@@ -4253,14 +4419,15 @@ class SweepState:
             if _covered_by_existing(next_start):
                 # Already inside an existing verified subseg — keep iterating.
                 continue
-            # Pick the ACTUAL immediately-preceding subseg, not the iteration's
-            # `prev`.  The scan can walk past an unsignaled-but-verified subseg
-            # (e.g. a 4-byte alternate-entry stub with no callers + no reference
-            # FUN_<addr>: declaration) and land on a candidate further out.  In
-            # that case the `prev` we're iterating from is stale — the real
-            # previous-verified-subseg is the one that hugs next_start.
+            # Pick the ACTUAL immediately-preceding subseg (code or data),
+            # not the iteration's `prev`.  The scan can walk past an
+            # unsignaled-but-verified subseg (e.g. a 4-byte alternate-
+            # entry stub with no callers + no reference FUN_<addr>:
+            # declaration) and land on a candidate further out.  In
+            # that case the `prev` we're iterating from is stale — the
+            # real previous-verified-subseg is the one that hugs next_start.
             actual_prev = max(
-                (s for s in self.verified if s.end < next_start),
+                (s for s in all_subsegs if s.end < next_start),
                 key=lambda s: s.end,
                 default=prev,
             )
@@ -4335,26 +4502,39 @@ class SweepState:
 
         # ----- 1. Previous section (if a prev subseg is provided) -----
         if previous is not None:
-            # Analyze prev with hint_end = yaml's stamped end so the
-            # analysis honors the human's recorded boundary.  Then force
-            # .end to the yaml end so the displayed range matches what
-            # the splitter will emit (analyzer's CFG-walk may stop short
-            # at a delay slot, but the eval_tool's display must reflect
-            # what race.s shows, not what oracle's heuristic considers
-            # "reachable code only").
-            prev_fa = self.model.analyze_function(
-                previous.start, hint_end=previous.end,
-            )
-            prev_fa.end = previous.end
-
             size = previous.end - previous.start + 1
-            self._emit_section_header(
-                rows, next_id, Section.PREV,
-                f"VERIFIED  FUN_{previous.start:08X}  "
-                f"0x{previous.start:08X} → 0x{previous.end:08X}  ({size} bytes)",
-                anchor_addr=previous.start,
-            )
-            self._emit_function_rows(rows, next_id, prev_fa, Section.PREV, attn_set, candidate, partner_ranges)
+            if previous.type == "data":
+                # Data subsegs render as raw byte rows — no CFG walk,
+                # no prologue/epilogue/reachability decoration.  The
+                # bytes are declared literal data; running the
+                # analyzer on them would produce nonsense decode.
+                self._emit_section_header(
+                    rows, next_id, Section.PREV,
+                    f"VERIFIED DATA  "
+                    f"0x{previous.start:08X} → 0x{previous.end:08X}  ({size} bytes)",
+                    anchor_addr=previous.start,
+                )
+                self._emit_raw_rows(rows, next_id, previous.start, previous.end, Section.PREV)
+            else:
+                # Analyze prev with hint_end = yaml's stamped end so the
+                # analysis honors the human's recorded boundary.  Then force
+                # .end to the yaml end so the displayed range matches what
+                # the splitter will emit (analyzer's CFG-walk may stop short
+                # at a delay slot, but the eval_tool's display must reflect
+                # what race.s shows, not what oracle's heuristic considers
+                # "reachable code only").
+                prev_fa = self.model.analyze_function(
+                    previous.start, hint_end=previous.end,
+                )
+                prev_fa.end = previous.end
+
+                self._emit_section_header(
+                    rows, next_id, Section.PREV,
+                    f"VERIFIED  FUN_{previous.start:08X}  "
+                    f"0x{previous.start:08X} → 0x{previous.end:08X}  ({size} bytes)",
+                    anchor_addr=previous.start,
+                )
+                self._emit_function_rows(rows, next_id, prev_fa, Section.PREV, attn_set, candidate, partner_ranges)
 
             # ----- 2. Intermediate section (gap between prev end and candidate start) -----
             if previous.end + 1 < candidate.start:
@@ -4547,6 +4727,28 @@ class SweepState:
             else:
                 pin = PinAction.PIN_END
 
+            # ----- Suspected function entry (prologue-pattern hint)
+            # When this address matches `sts.l pr, @-r15` and our
+            # standard fn-entry signals didn't flag it, surface as a
+            # candidate function start.  Useful for finding code
+            # that the reference disasm mis-classified as data.
+            if addr in self.suspected_fn_entry_hints:
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Suspected function entry (prologue pattern — verify):",
+                ))
+            elif addr in self.pool4_target_hints:
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Suspected function entry (pool4 pointer — could be data table):",
+                ))
+
             # ----- Alt entry label
             # When this address is a declared alt entry of the function
             # being rendered, emit an ENTRY: marker so the multi-entry
@@ -4650,6 +4852,7 @@ class SweepState:
             if addr in pool2:
                 off = addr - vram
                 v = (binary[off] << 8) | binary[off+1]
+                tent_mnem, _ = _decode_sh2(v, addr)
                 row = ListingRow(
                     row_id=next_id(),
                     kind=RowKind.POOL2,
@@ -4663,6 +4866,7 @@ class SweepState:
                     is_midpoint=is_mid,
                     is_ref_end=is_ref_end,
                     pin_action=pin,
+                    tentative_decode=tent_mnem,
                 )
                 b = branches_at.get(addr)
                 if b is not None and b.target is not None and b.internal:
@@ -4918,6 +5122,27 @@ class SweepState:
             if off + 1 >= len(binary):
                 break
 
+            # Suspected function entry (prologue-pattern hint).  Same
+            # check as in _emit_function_rows — surfaces in trailing /
+            # intermediate sections too so reference-mis-classified
+            # functions sitting in pool zones get flagged.
+            if addr in self.suspected_fn_entry_hints:
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Suspected function entry (prologue pattern — verify):",
+                ))
+            elif addr in self.pool4_target_hints:
+                rows.append(ListingRow(
+                    row_id=next_id(),
+                    kind=RowKind.LABEL,
+                    section=section,
+                    addr=addr,
+                    label="Suspected function entry (pool4 pointer — could be data table):",
+                ))
+
             # Trailing-zone case-target hint.  When this address is a
             # known outstanding case target of a stamped dispatcher,
             # emit a label suggesting the analyzer's boundary may be
@@ -4982,6 +5207,7 @@ class SweepState:
                 continue
             if kind is ByteKind.POOL2 and addr + 1 <= end and off + 1 < len(binary):
                 value = (binary[off] << 8) | binary[off+1]
+                tent_mnem, _ = _decode_sh2(value, addr)
                 rows.append(ListingRow(
                     row_id=next_id(),
                     kind=RowKind.POOL2,
@@ -4990,6 +5216,7 @@ class SweepState:
                     bytes_hex=" ".join(f"{binary[off+i]:02X}" for i in range(2)),
                     text=f".2byte 0x{value:04X}",
                     label=f".L_pool_{addr:08X}",
+                    tentative_decode=tent_mnem,
                 ))
                 addr += 2
                 continue

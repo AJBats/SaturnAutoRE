@@ -595,7 +595,15 @@ function renderListing(lines, target, isPrimary, attnSet, midpointSet, refEndSet
       /\b0x[0-9A-Fa-f]{8}\b/g,
       m => `<span class="hex-ref" data-addr="${parseInt(m.slice(2), 16)}">${m}</span>`
     );
-    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${mnemHtml}</span>${tagPart}</span>`;
+    // Tentative instruction decode for POOL2 rows — pale-color
+    // preview of "what these bytes would mean as code", so the
+    // user can spot real functions hiding in data classification.
+    // Server only sets this on pool rows whose bytes decode to a
+    // valid SH-2 mnem.
+    const tentPart = line.tentative_decode
+      ? `<span class="tentative-decode">${escapeHtml(line.tentative_decode)}</span>`
+      : '';
+    return `<span class="line ${cls}" data-addr="${line.addr || ''}" data-bytes-len="${bytesLen}" data-indent="${indent}">${pinPart}<span class="margin">${escapeHtml(margin)}</span><span class="a">${addrHtml}</span><span class="b">${escapeHtml(line.bytes || '')}</span>${indentSpan}${labelPart}<span class="m">${mnemHtml}</span>${tentPart}${tagPart}</span>`;
   }).join('\n');
   target.innerHTML = html;
   if (isPrimary) {
@@ -910,8 +918,6 @@ async function fetchState() {
       primaryBanner.innerHTML = '';
       naturalPane.classList.add('hidden');
       naturalBanner.classList.add('hidden');
-      document.getElementById('btn-reject').classList.remove('pressed');
-      document.getElementById('btn-unsure').classList.remove('pressed');
       setStatus(`history: ${s.history_count}`);
       LAST_CANDIDATE_START = null;
       LAST_CANDIDATE_END = null;
@@ -1050,28 +1056,21 @@ async function fetchState() {
     LAST_NATURAL_END     = natEnd;
     setStatus(`history: ${s.history_count}`);
 
-    // Reflect "what verdict did I last press on this candidate" so the
-    // human can see at a glance what state they left it in before
-    // talking to the AI (no textbox UI — the verdict click IS the
-    // record).  Cleared on candidate advance because the new candidate
-    // has no prior verdict yet.
-    const btnReject = document.getElementById('btn-reject');
-    const btnUnsure = document.getElementById('btn-unsure');
-    btnReject.classList.toggle('pressed', s.current_verdict === 'rejected');
-    btnUnsure.classList.toggle('pressed', s.current_verdict === 'unsure');
   } catch (e) {
     setStatus('connection lost — is the server running?');
   }
 }
 
-async function submitVerdict(verdict) {
+async function submitVerdict(verdict, opts) {
   // Feedback is no longer collected in the UI — the human verbally
-  // explains reject/unsure reasoning to the AI, which records it
-  // verbatim into the session.json history entry's `feedback` list.
+  // explains diagnose-worthy candidates to the AI, which records it
+  // verbatim into the session.json history entry's `feedback` field.
+  const body = {verdict, feedback: ''};
+  if (opts && opts.type) body.type = opts.type;
   const r = await fetch('/verdict', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({verdict, feedback: ''}),
+    body: JSON.stringify(body),
   });
   const data = await r.json();
   if (!data.ok) {
@@ -1083,8 +1082,7 @@ async function submitVerdict(verdict) {
 
 document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-approve').addEventListener('click', () => submitVerdict('approved'));
-  document.getElementById('btn-reject').addEventListener('click',  () => submitVerdict('rejected'));
-  document.getElementById('btn-unsure').addEventListener('click',  () => submitVerdict('unsure'));
+  document.getElementById('btn-approve-data').addEventListener('click', () => submitVerdict('approved', {type: 'data'}));
 
   // Partner buttons (delegated — re-rendered on every state poll).
   document.getElementById('partner-buttons').addEventListener('click', async (e) => {
@@ -1279,8 +1277,7 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     if (e.key === '1') { e.preventDefault(); document.getElementById('btn-approve').click(); }
-    else if (e.key === '2') { e.preventDefault(); document.getElementById('btn-reject').click(); }
-    else if (e.key === '3') { e.preventDefault(); document.getElementById('btn-unsure').click(); }
+    else if (e.key === '2') { e.preventDefault(); document.getElementById('btn-approve-data').click(); }
   });
   // Shift-held state lets CSS recolor pin-zone hover gold (= queue alt
   // entry semantics) inside the candidate.  Drop on keyup AND window

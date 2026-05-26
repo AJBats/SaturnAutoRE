@@ -123,12 +123,16 @@ def _remove_subseg_from_yaml(start_addr):
     return removed
 
 
-def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None):
+def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None,
+                            subseg_type="code"):
     """Insert a subseg block at the address-sorted position.
 
     Subsegs are kept in start-address order on disk so the file reads
     top-to-bottom in memory order.  Inserts before the first existing
     subseg whose start > new start; appends if none qualifies.
+
+    `subseg_type` is "code" (default) or "data".  Partners/entries are
+    code-only — silently ignored when subseg_type == "data".
     """
     text = open(STATE["yaml_path"]).read()
     if not text.endswith("\n"):
@@ -137,13 +141,13 @@ def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None):
 
     block = (
         f"  - start: 0x{start_addr:08X}\n"
-        f"    type:  code\n"
+        f"    type:  {subseg_type}\n"
         f"    end:   0x{end_addr:08X}\n"
     )
-    if partners:
+    if subseg_type == "code" and partners:
         partners_list = ", ".join(f"0x{p:08X}" for p in sorted(set(partners)))
         block += f"    partners: [{partners_list}]\n"
-    if entries:
+    if subseg_type == "code" and entries:
         entries_list = ", ".join(f"0x{e:08X}" for e in sorted(set(entries)))
         block += f"    entries: [{entries_list}]\n"
 
@@ -652,6 +656,12 @@ def _row_to_dict(row):
     # examined as potential tail calls.
     if row.tag_tooltip and is_function_section:
         out["tag_tooltip"] = row.tag_tooltip
+    # Tentative instruction decode on POOL2 rows — lets the client
+    # show a pale "preview" of what the bytes WOULD mean if they
+    # were code, so the user can spot real functions hiding in
+    # data classification.
+    if row.tentative_decode:
+        out["tentative_decode"] = row.tentative_decode
     if row.stop_confidence and is_function_section:
         out["stop_confidence"] = row.stop_confidence
     # Structured callers on "Called from FUN_X" label rows — lets the
@@ -837,6 +847,16 @@ def _build_candidate_payload(sweep, candidate_fa, previous_typed,
         candidate_fa = dataclasses.replace(
             candidate_fa,
             yellow_flags=list(candidate_fa.yellow_flags) + trailing_flags,
+        )
+    # In-candidate suspected-entry warnings: lists hex addresses of
+    # prologue / pool4 hits inside the candidate.  Critical for big
+    # runaway stamps where the listing is thousands of lines and
+    # the user would otherwise have to hunt for the inline hints.
+    inside_flags = sweep.check_suspected_fn_entries_inside(candidate_fa)
+    if inside_flags:
+        candidate_fa = dataclasses.replace(
+            candidate_fa,
+            yellow_flags=list(candidate_fa.yellow_flags) + inside_flags,
         )
     # Apply partner-aware verdict: suppress imbalance flags when the
     # combined stack frame across this function + its partners is
@@ -1637,6 +1657,18 @@ def verdict():
     v = data.get("verdict")
     if v not in ("approved", "rejected", "unsure"):
         return jsonify({"ok": False, "error": "bad verdict"}), 400
+    # Optional `type` selects code vs data subseg.  data-type verdicts
+    # only make sense paired with "approved" — reject/unsure of a data
+    # range isn't meaningful (data is binary yes/no on the candidate
+    # range).  Default code preserves the historical behavior.
+    verdict_type = data.get("type", "code")
+    if verdict_type not in ("code", "data"):
+        return jsonify({"ok": False, "error": "type must be 'code' or 'data'"}), 400
+    if verdict_type == "data" and v != "approved":
+        return jsonify({
+            "ok": False,
+            "error": "data verdict only supports 'approved' (reject/unsure don't apply to data ranges)",
+        }), 400
 
     with LOCK:
         session = load_session()
@@ -1690,7 +1722,24 @@ def verdict():
                 "candidate_end": nxt.function.end,
                 "feedback": "",
                 "ts": time.time(),
+                "type": verdict_type,
             })
+
+        # Data subseg short-circuit: skip the partner / entry / auto-
+        # back-ref / overlap-absorption machinery (those are code-only
+        # concepts).  Just record the data range to yaml and return.
+        if verdict_type == "data":
+            _insert_subseg_in_yaml(
+                nxt.function.start, nxt.function.end,
+                subseg_type="data",
+            )
+            save_session(session)
+            return jsonify({
+                "ok": True,
+                "type": "data",
+                "range": [f"0x{nxt.function.start:08X}", f"0x{nxt.function.end:08X}"],
+            })
+
         # Auto-unstamp any subsegs whose range overlaps the new one.
         # When a dispatcher's switch absorption (or a manually pinned
         # wider boundary) extends past stamps previously made for case
