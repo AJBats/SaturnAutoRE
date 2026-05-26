@@ -269,15 +269,19 @@ def _remove_entry_from_existing_subseg(subseg_start, entry):
 
 
 def _find_overlapping_subsegs(new_start, new_end, exclude_start=None):
-    """Return [(start, end), ...] for code subsegs whose [start, end]
-    intersects [new_start, new_end].  When `exclude_start` is given,
-    a subseg with exactly that start is omitted (used to ignore the
-    candidate's own pre-existing entry when re-stamping).
+    """Return [(start, end), ...] for ANY subsegs (code OR data)
+    whose [start, end] intersects [new_start, new_end].  When
+    `exclude_start` is given, a subseg with exactly that start is
+    omitted (used to ignore the candidate's own pre-existing entry
+    when re-stamping).  Both kinds are returned because a new wider
+    stamp also has to clear away a previously-stamped data range
+    that falls inside it — otherwise the yaml ends up with a code
+    function silently overlapping a data subseg.
     """
     cfg = _load_yaml_cfg()
     overlaps = []
     for sub in cfg.get("subsegments", []):
-        if sub.get("type") != "code":
+        if sub.get("type") not in ("code", "data"):
             continue
         s = int(sub["start"])
         e = int(sub["end"])
@@ -383,8 +387,10 @@ def _analyze_mode_active_candidate(model, sweep, analyze_mode):
 
     fa = model.analyze_multi_block(blocks, active_block=active)
 
+    # Walk both code AND data subsegs — the immediate prev anchor
+    # might be a declared data range adjacent to the analyze block.
     previous = None
-    for s in sweep.verified:
+    for s in sweep.all_subsegs:
         if s.end < start and (previous is None or s.end > previous.end):
             previous = s
     if previous is not None and (start - previous.end - 1) > _ANALYZE_PREV_MAX_GAP:
@@ -445,11 +451,8 @@ def _audit_sorted_subsegs(sweep):
     """Unified sorted list of code + data subsegs for audit-mode
     navigation.  Audit walks both kinds — the user might want to
     unstamp a misclassified data range just as much as revisit a
-    code stamp."""
-    return sorted(
-        list(sweep.verified) + list(sweep.verified_data),
-        key=lambda s: s.start,
-    )
+    code stamp.  Thin wrapper around `SweepState.all_subsegs`."""
+    return sweep.all_subsegs
 
 
 def _audit_scrubber_payload(sweep, model):
@@ -1116,14 +1119,16 @@ def pin_end():
                           f"start 0x{nxt.function.start:08X}"),
             }), 400
         # Reject if next_start lands STRICTLY INSIDE an already-verified
-        # subseg.  Pinning AT an existing stamp's start is fine — that's
-        # the user saying "my candidate ends right before this next
-        # function begins," which is exactly the adjacency we want.
-        for s in sweep.verified:
+        # subseg (code OR data).  Pinning AT an existing stamp's start
+        # is fine — that's the user saying "my candidate ends right
+        # before this next function/data block begins," which is
+        # exactly the adjacency we want.
+        for s in sweep.all_subsegs:
             if s.start < next_start <= s.end:
+                kind_label = "DATA" if s.type == "data" else "FUN"
                 return jsonify({
                     "ok": False,
-                    "error": f"next_start 0x{next_start:08X} is inside verified subseg FUN_{s.start:08X}",
+                    "error": f"next_start 0x{next_start:08X} is inside verified subseg {kind_label}_{s.start:08X}",
                 }), 400
 
         override = dict(session.get("ai_override") or {})
@@ -1159,16 +1164,20 @@ def pin_start():
         if blocked is not None:
             return blocked
         cfg, model, sweep = _build_sweep(session)
-        # Reject if addr lands inside an already-verified subseg.
-        for s in sweep.verified:
+        # Reject if addr lands inside an already-verified subseg
+        # (code OR data).
+        for s in sweep.all_subsegs:
             if s.start <= addr <= s.end:
+                kind_label = "DATA" if s.type == "data" else "FUN"
                 return jsonify({
                     "ok": False,
-                    "error": f"addr 0x{addr:08X} is inside verified subseg FUN_{s.start:08X}",
+                    "error": f"addr 0x{addr:08X} is inside verified subseg {kind_label}_{s.start:08X}",
                 }), 400
-        # Find immediately-preceding verified subseg.
+        # Find immediately-preceding verified subseg (code OR data)
+        # so the override's prev anchor matches what the listing
+        # will actually display.
         prev = max(
-            (s for s in sweep.verified if s.end < addr),
+            (s for s in sweep.all_subsegs if s.end < addr),
             key=lambda s: s.end,
             default=None,
         )
@@ -1331,13 +1340,14 @@ def queue_entry():
                     "error": (f"entry 0x{addr:08X} must sit strictly inside the "
                               f"current candidate (0x{cand_start:08X}, 0x{cand_end:08X}]"),
                 }), 400
-            for s in sweep.verified:
+            for s in sweep.all_subsegs:
                 if s.start == cand_start:
                     continue
                 if s.start <= addr <= s.end:
+                    kind_label = "DATA" if s.type == "data" else "FUN"
                     return jsonify({
                         "ok": False,
-                        "error": f"entry 0x{addr:08X} falls inside another stamped subseg FUN_{s.start:08X}",
+                        "error": f"entry 0x{addr:08X} falls inside another stamped subseg {kind_label}_{s.start:08X}",
                     }), 400
             bucket.append(addr)
             action = "added"
@@ -1650,6 +1660,18 @@ def analyze_mode_add():
             return blocked
         cfg, model, sweep = _build_sweep(session)
 
+        # Reject if `addr` is a declared data subseg's start — analyze
+        # mode runs CFG analysis on the block, and data subsegs are
+        # explicitly NOT code.  Treating them as analyze blocks
+        # produces garbage decode.
+        for s in sweep.verified_data:
+            if s.start == addr:
+                return jsonify({
+                    "ok": False,
+                    "error": (f"0x{addr:08X} is a declared data subseg "
+                              f"(DATA_{s.start:08X}); analyze mode is for code"),
+                }), 400
+
         # End comes from yaml if stamped, else CFG walker.
         end = None
         for s in sweep.verified:
@@ -1835,8 +1857,12 @@ def verdict():
         queued = list(all_pending_entries.get(main_hex) or [])
         valid_entries: list = []
         dropped_entries: list = []
+        # Drop entries that fall in ANY other verified subseg (code OR
+        # data).  An alt entry into a declared data block is always a
+        # mis-stamp regardless of whether the data range is in
+        # sweep.verified (code) or sweep.verified_data.
         verified_other_ranges = [
-            (s.start, s.end) for s in sweep.verified
+            (s.start, s.end) for s in sweep.all_subsegs
             if s.start != nxt.function.start
         ]
         for e in queued:

@@ -3574,6 +3574,15 @@ class SweepState:
             if s.get("type") == "data"
         ]
         self.verified_data.sort(key=lambda s: s.start)
+        # Unified view of both kinds, sorted by start.  Used anywhere
+        # we ask a "coverage" question — is this addr inside any
+        # declared subseg? what's the next/previous declared boundary?
+        # — without caring which type.  Code-only invariants (partner
+        # logic, alt entries, callers) keep using `self.verified`.
+        self.all_subsegs = sorted(
+            list(self.verified) + list(self.verified_data),
+            key=lambda s: s.start,
+        )
 
         # Validate `entries:` lists and derive alt_entry_main.  Each alt
         # entry must sit strictly inside its owning subseg's (start, end]
@@ -3589,9 +3598,11 @@ class SweepState:
                     continue
                 if e in self.alt_entry_main:
                     continue
-                # Reject if inside any OTHER verified subseg.
+                # Reject if inside any OTHER verified subseg (code OR
+                # data — an alt entry pointing into a declared data
+                # range is always a mis-stamp).
                 if any(other.start <= e <= other.end
-                       for other in self.verified if other is not sub):
+                       for other in self.all_subsegs if other is not sub):
                     continue
                 kept.append(e)
                 self.alt_entry_main[e] = sub.start
@@ -3615,10 +3626,12 @@ class SweepState:
                     continue
                 if e in self.alt_entry_main:
                     continue
-                # Reject if inside any verified subseg that ISN'T the
-                # pending main itself (the main may or may not be in
-                # `self.verified` — unstamped candidates aren't).
-                if any(s.start <= e <= s.end and s.start != main for s in self.verified):
+                # Reject if inside any verified subseg (code OR data)
+                # that ISN'T the pending main itself.  The main may or
+                # may not be in `self.verified` — unstamped candidates
+                # aren't.  A pending entry inside a declared data
+                # range is always a mis-stamp.
+                if any(s.start <= e <= s.end and s.start != main for s in self.all_subsegs):
                     continue
                 self.alt_entry_main[e] = main
 
@@ -3667,7 +3680,13 @@ class SweepState:
             a for a, c in self.model.cross_module_callers.items() if c > 0
         )
         _known_fn_entries.update(self.model.switch_targets)
-        _verified_ranges = [(s.start, s.end) for s in self.verified]
+        # Hint filter: suppress prologue-pattern / pool4-pointer hints
+        # whose addr falls inside ANY declared subseg — including data
+        # subsegs.  Real data blobs (LUTs etc.) often contain byte
+        # patterns that coincidentally match prologue opcodes; without
+        # the data check the listing fills with bogus "Suspected
+        # function entry" labels inside known literal data.
+        _verified_ranges = [(s.start, s.end) for s in self.all_subsegs]
         self.suspected_fn_entry_hints: set = set()
         for a in self.model.suspected_fn_entries:
             if a in _known_fn_entries:
@@ -4233,11 +4252,13 @@ class SweepState:
             if (p & 1) or not (self.model.vram <= p < binary_end):
                 continue
             # Skip if `p` falls strictly INSIDE another verified
-            # subseg — likely a mis-click on a mid-function address;
-            # the containing subseg is harvested separately.  Allow
-            # `p == s.start` (the common back-ref case) since we
-            # use the subseg's exact end below.
-            if any(s.start < p <= s.end for s in self.verified):
+            # subseg (code OR data) — likely a mis-click on a mid-
+            # function or mid-data address; the containing subseg is
+            # harvested separately for code, and partners aren't
+            # meaningful for data anyway.  Allow `p == s.start`
+            # (the common back-ref case) since we use the subseg's
+            # exact end below.
+            if any(s.start < p <= s.end for s in self.all_subsegs):
                 continue
             end = next(
                 (s.end for s in self.verified if s.start == p), None,
@@ -4281,8 +4302,8 @@ class SweepState:
 
     def gaps(self, proposed_start: Optional[int] = None) -> list:
         """Find every uncovered byte range BETWEEN consecutive verified
-        code subsegs PLUS the pending gap between the latest verified
-        subseg and the currently-proposed candidate (if any).
+        subsegs (code OR data) PLUS the pending gap between the latest
+        verified subseg and the currently-proposed candidate (if any).
 
         Why include the pending gap: when forward-sweep can't find a real
         function in a zone (no reference label, no prologue, no callers),
@@ -4300,9 +4321,17 @@ class SweepState:
           True  = gap is between latest-stamped and current proposal
                   (would be created on approval)
         """
+        # Walk the unified code + data subseg list — both types count
+        # as 'covered territory'.  A stamped data range right between
+        # two code stamps closes that gap; missing it here would
+        # falsely fire the red gap banner.
+        all_subsegs = sorted(
+            list(self.verified) + list(self.verified_data),
+            key=lambda s: s.start,
+        )
         gaps = []
         prev = None
-        for s in self.verified:
+        for s in all_subsegs:
             if prev is not None and s.start > prev.end + 1:
                 gap_start = prev.end + 1
                 gap_end = s.start - 1
@@ -4311,7 +4340,10 @@ class SweepState:
                     end=gap_end,
                     size=gap_end - gap_start + 1,
                     preceding_start=prev.start,
-                    preceding_name=f"FUN_{prev.start:08X}",
+                    preceding_name=(
+                        f"DATA_{prev.start:08X}" if prev.type == "data"
+                        else f"FUN_{prev.start:08X}"
+                    ),
                     pending=False,
                 ))
             prev = s
@@ -4326,7 +4358,10 @@ class SweepState:
                     end=gap_end,
                     size=gap_end - gap_start + 1,
                     preceding_start=prev.start,
-                    preceding_name=f"FUN_{prev.start:08X}",
+                    preceding_name=(
+                        f"DATA_{prev.start:08X}" if prev.type == "data"
+                        else f"FUN_{prev.start:08X}"
+                    ),
                     pending=True,
                 ))
         return gaps
