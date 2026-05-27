@@ -1111,6 +1111,160 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
     return targets
 
 
+def _detect_byte_indexed_jmp_switch_targets(binary, vram, jmp_pc,
+                                             binary_end=None,
+                                             func_start=None,
+                                             hard_limit=None):
+    """Recognize the byte-indexed indirect jmp switch dispatch idiom.
+
+    Pattern (within ~24 bytes before jmp; specific dataflow):
+        mov.l @(d,PC), rT       ; rT = byte_table_base
+        add rIdx, rT            ; rT += idx (byte offset within table)
+        mov.b @rT, rT           ; rT = sign-extended byte at table[idx]
+        mov.l @(d,PC), rJ       ; rJ = code_base
+        add rT, rJ              ; rJ = code_base + signed_byte_offset
+        jmp @rJ
+
+    Each table entry is a signed byte (-128..127) added to a base
+    code address.  Targets thus all lie within +/-128 bytes of
+    code_base.  Useful for compact dispatchers where the case bodies
+    are arranged in a short contiguous range, the cap on case body
+    span is 128 bytes.
+
+    Table-end heuristic when walking:
+      - odd byte value -> invalid (SH-2 addrs are 2-byte aligned), stop
+      - target out of vram -> stop
+      - 256-entry cap (sanity)
+    The odd-byte stop usually terminates at the right place because
+    instruction bytes following the table tend to be opcodes whose
+    first byte has bit 0 set in many cases.
+
+    Returns list[int] of in-range case body addresses (filtered to
+    [func_start, hard_limit] when supplied).
+    """
+    if binary_end is None:
+        binary_end = vram + len(binary) - 1
+
+    jmp_op = _read_opcode(binary, vram, jmp_pc)
+    if jmp_op is None or (jmp_op & 0xF0FF) != 0x402B:
+        return []
+    rJ = (jmp_op >> 8) & 0xF
+
+    # Back-scan: collect every relevant instruction's metadata.  We
+    # don't enforce a strict order — too brittle across compilers — but
+    # we DO require all required pieces to be present with consistent
+    # register dataflow.
+    mov_l_loads: dict = {}   # dst_reg -> pool_addr (first hit wins)
+    adds: list = []          # list of (src, dst) for `add rA, rB`
+    byte_load_src = None
+    byte_load_dest = None
+    for back in range(2, 26, 2):
+        addr = jmp_pc - back
+        if addr < vram:
+            break
+        op = _read_opcode(binary, vram, addr)
+        if op is None:
+            continue
+        # add rA, rB: 0011 nnnn mmmm 1100
+        if (op & 0xF00F) == 0x300C:
+            m = (op >> 4) & 0xF
+            n = (op >> 8) & 0xF
+            adds.append((m, n))
+            continue
+        # mov.l @(d,PC), rDst: 1101 dddd ssssssss
+        if (op & 0xF000) == 0xD000:
+            dst = (op >> 8) & 0xF
+            disp = op & 0xFF
+            pool_addr = ((addr + 4) & 0xFFFFFFFC) + disp * 4
+            mov_l_loads.setdefault(dst, pool_addr)
+            continue
+        # mov.b @rM, rN: 0110 nnnn mmmm 0000 (sign-extended byte load)
+        if (op & 0xF00F) == 0x6000:
+            if byte_load_dest is None:
+                byte_load_dest = (op >> 8) & 0xF
+                byte_load_src = (op >> 4) & 0xF
+            continue
+
+    if byte_load_dest is None:
+        return []
+
+    # Identify rT candidates from `add rT, rJ` (dst == rJ).
+    rT_candidates = [src for src, dst in adds if dst == rJ]
+    if not rT_candidates:
+        return []
+    if rJ not in mov_l_loads:
+        return []
+    code_base_pool = mov_l_loads[rJ]
+    if not (vram <= code_base_pool <= binary_end):
+        return []
+    poff = code_base_pool - vram
+    if poff + 3 >= len(binary):
+        return []
+    code_base = (
+        (binary[poff] << 24) | (binary[poff + 1] << 16)
+        | (binary[poff + 2] << 8) | binary[poff + 3]
+    )
+    if not (vram <= code_base <= binary_end) or (code_base & 1):
+        return []
+
+    # Find an rT that fits the full pattern: mov.b dest is rT, the
+    # byte_load_src holds the byte_table_base (loaded via mov.l), and
+    # somewhere there's `add rIdx, rT` (or `add rIdx, byte_load_src`
+    # when src != dest).
+    for rT in rT_candidates:
+        if byte_load_dest != rT:
+            continue
+        # The register that ACTUALLY held the byte_table_base at the
+        # mov.b — the same register or a different one depending on
+        # compiler choice.
+        addr_reg = byte_load_src
+        if addr_reg not in mov_l_loads:
+            continue
+        byte_table_pool = mov_l_loads[addr_reg]
+        if byte_table_pool == code_base_pool:
+            continue  # two distinct pool loads required
+        if not (vram <= byte_table_pool <= binary_end):
+            continue
+        bpoff = byte_table_pool - vram
+        if bpoff + 3 >= len(binary):
+            continue
+        byte_table_base = (
+            (binary[bpoff] << 24) | (binary[bpoff + 1] << 16)
+            | (binary[bpoff + 2] << 8) | binary[bpoff + 3]
+        )
+        if not (vram <= byte_table_base <= binary_end):
+            continue
+        # Require `add rIdx, addr_reg` somewhere — addr_reg has to be
+        # advanced past the table base by an index for the indirect
+        # load to make sense.
+        if not any(dst == addr_reg for _src, dst in adds):
+            continue
+
+        # Walk the byte table forward.
+        lo = func_start if func_start is not None else vram
+        hi = hard_limit if hard_limit is not None else binary_end
+        targets = []
+        t = byte_table_base
+        MAX_ENTRIES = 256
+        while (t - byte_table_base) < MAX_ENTRIES:
+            toff = t - vram
+            if toff >= len(binary):
+                break
+            b = binary[toff]
+            sval = b - 256 if b >= 128 else b
+            target = code_base + sval
+            if target & 1:
+                break  # odd target = invalid SH-2 addr; table ended
+            if not (vram <= target <= binary_end):
+                break
+            if lo <= target <= hi:
+                targets.append(target)
+            t += 1
+        return targets
+
+    return []
+
+
 def _detect_braf_switch_targets(binary, vram, braf_pc, pool_priors,
                                  func_start=None, hard_limit=None):
     """Recognize the SH-2 switch-dispatch idiom around `braf_pc`.
@@ -1323,6 +1477,13 @@ def _control_flow_walk(binary, vram, start, hard_limit_addr, pool_priors=None,
                             binary, vram, pc,
                             func_start=start, hard_limit=hard_limit_addr,
                         )
+                        if not case_targets:
+                            # Byte-indexed indirect jmp (signed-byte
+                            # offset table) — see helper docstring.
+                            case_targets = _detect_byte_indexed_jmp_switch_targets(
+                                binary, vram, pc,
+                                func_start=start, hard_limit=hard_limit_addr,
+                            )
                     if case_targets:
                         for tgt in case_targets:
                             branches.append(Branch(
@@ -3235,12 +3396,17 @@ class BinaryModel:
         self.switch_dispatcher_of = {}
         pool_priors = self.pool_priors_dict()
         for jmp_pc in range(vram, binary_end, 2):
-            # mov.l + jmp @rN idiom
+            # mov.l + jmp @rN idiom (variants A/B)
             tgts = self._detect_mov_l_jmp_switch_targets(jmp_pc)
             if not tgts:
                 # mova + braf rN idiom (alt form)
                 tgts = _detect_braf_switch_targets(
                     binary, vram, jmp_pc, pool_priors,
+                )
+            if not tgts:
+                # byte-indexed jmp idiom (signed-byte offset table)
+                tgts = _detect_byte_indexed_jmp_switch_targets(
+                    binary, vram, jmp_pc, binary_end=binary_end,
                 )
             if not tgts:
                 continue
