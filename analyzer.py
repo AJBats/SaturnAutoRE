@@ -4857,7 +4857,50 @@ class SweepState:
             )
             if cand is not None:
                 return cand
+            # No findable function start remains in the window, but the
+            # window may still have UNCOVERED bytes (prologue-less leaf
+            # functions, code the reference didn't label, or trailing
+            # data/padding from an over-generous window end).  A declared
+            # window is the user's assertion that the whole range matters,
+            # so we must NOT silently advance over leftover bytes — surface
+            # the first uncovered address as a candidate so the human can
+            # stamp it (function or data) or conclude the window end is
+            # wrong.  hint_end=window_end bounds the walk's branch
+            # enqueueing (so a garbage start can't run away), but a
+            # straight-line function body still completes to its natural
+            # terminator — so a real function whose body crosses the
+            # boundary renders in full, extending past window_end.  That
+            # overshoot IS the signal that the declared end is too small.
+            # Open-ended windows (no end) have no bounded remainder, so
+            # they advance as before.
+            if window_end is not None:
+                first_uncovered = self._first_uncovered_in(seed, window_end)
+                if first_uncovered is not None:
+                    fa = model.analyze_function(first_uncovered, hint_end=window_end)
+                    prev = max(
+                        (s for s in all_subsegs if s.end < first_uncovered),
+                        key=lambda s: s.end,
+                        default=None,
+                    )
+                    if prev is not None and prev.end + 1 != first_uncovered:
+                        prev = None
+                    return NextCandidate(previous=prev, function=fa)
         return None
+
+    def _first_uncovered_in(self, lo: int, hi: int) -> Optional[int]:
+        """Lowest address in [lo, hi] not inside any verified subseg
+        (code OR data), or None if [lo, hi] is fully covered.  Walks the
+        start-sorted unified subseg list with a coverage cursor."""
+        pos = lo
+        for s in sorted(self.all_subsegs, key=lambda s: s.start):
+            if s.end < pos:
+                continue
+            if s.start > pos:
+                return pos  # uncovered gap before this subseg
+            pos = s.end + 1
+            if pos > hi:
+                return None
+        return pos if pos <= hi else None
 
     # ------------------------------------------------------------------
     # Phase 6 — listing model

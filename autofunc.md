@@ -246,14 +246,26 @@ Semantics:
   before islands existed (sweep from vram, every inter-subseg gap
   illegal).  Full coverage is the degenerate case of one island at vram.
 - **Declaration order is work order.**  The sweep proposes from the
-  first declared island that still yields an in-window candidate, then
-  auto-advances to the next.  All windows done = "all caught up".
-- **`end` is soft.**  A function straddling the end stamps normally;
-  the window completes when its whole [seed, end] range is covered, or
-  when the next findable function starts past `end`.  To keep sweeping
-  past a declared end, raise it in the yaml.  An entry without `end`
-  (or a bare `- 0x...` addr) is an open-ended window that never
-  auto-completes.
+  first declared island that still yields a candidate, then auto-
+  advances to the next.  A window only auto-advances when its whole
+  [seed, end] range is COVERED — never while it still has uncovered
+  bytes.  All windows fully covered = "all caught up".
+- **Nothing inside a window is silently skipped.**  If forward-sweep
+  finds no function-start signal (prologue / reference label / caller)
+  in the remaining window, but uncovered bytes remain, the tool
+  surfaces the first uncovered address as a candidate anyway — a
+  declared window is the user's assertion that the whole range matters.
+  This catches prologue-less leaf functions and code the reference
+  didn't label.  If that leftover is really data/padding, "approve as
+  data" stamps it (covers it → window completes); if it's a function
+  whose body crosses the boundary, it renders in full past `end`,
+  which is the signal the declared end is too small.
+- **`end` is soft.**  A function straddling the end stamps normally
+  (pin-end past the boundary).  To keep sweeping past a declared end,
+  raise it in the yaml.  An entry without `end` (or a bare `- 0x...`
+  addr) is an open-ended window: it has no bounded remainder, so it
+  advances when no function-start signal is found (no leftover
+  surfacing).
 - Every stamp belongs to the island with the **greatest seed at or
   below its start**.  A gap between consecutive stamps is legal iff an
   island seed sits inside it (it spans an island boundary); gaps
