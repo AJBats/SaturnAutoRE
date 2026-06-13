@@ -30,7 +30,14 @@ function setStatus(text) {
   document.getElementById('status').textContent = text;
 }
 
-function progressHtml(p) {
+// Last 5 hex digits of an 8-digit address — island chips drop the
+// constant 0x060 prefix to keep four windows on one header line.
+// Full addresses live in the chip tooltip.
+function shortAddr(hex) {
+  return hex ? hex.slice(-5) : '';
+}
+
+function progressHtml(p, activeSeed) {
   if (!p) return '';
   // Floor-truncate, not round.  toFixed(2) rounds half-up, so 99.9953%
   // displays as "100.00%" — that's the worst time to lose precision,
@@ -42,11 +49,54 @@ function progressHtml(p) {
   const v = p.verified_bytes.toLocaleString();
   const t = p.total_bytes.toLocaleString();
   // Tiny inline bar — width = pct, RPG-style fill
+  // Island projects (windowed coverage) get a per-island strip — the
+  // whole-binary percent alone would misleadingly read "0.9%" when the
+  // actual goal is a handful of verified windows.  Legacy full-coverage
+  // projects (no islands declared) render exactly as before.
+  let islands = '';
+  if (p.islands && p.islands.length) {
+    // Which window the sweep is working: the session-activated island,
+    // else the first incomplete one (mirrors the server's work order).
+    const active = (activeSeed != null)
+      ? activeSeed
+      : (p.islands.find(i => !i.complete) || {}).seed;
+    islands = p.islands.map(i => {
+      const merged = i.merged_with_prev
+        ? '<span class="island-merged" title="earlier coverage has swept into this seed — one contiguous region">⛓</span>'
+        : '';
+      let label, cls = 'island-chip';
+      if (i.target_bytes) {
+        // Bounded window: honest per-window percent (floor, like the
+        // global bar — never 100% unless actually complete, and a
+        // complete window always reads 100% even when some covering
+        // bytes are bookkept under a merged neighbor island).
+        const status = i.complete
+          ? '✓'
+          : Math.min(99, Math.floor(i.verified_bytes / i.target_bytes * 100)) + '%';
+        if (i.complete) cls += ' island-complete';
+        label = `${shortAddr(i.seed_hex)}→${shortAddr(i.end_hex)} · ${status}`;
+      } else {
+        label = i.frontier_end_hex
+          ? `${shortAddr(i.seed_hex)}→${shortAddr(i.frontier_end_hex)}+ · ${i.verified_bytes.toLocaleString()} b`
+          : `${shortAddr(i.seed_hex)} · unswept`;
+      }
+      if (i.seed === active) cls += ' island-active';
+      const tip = `island 0x${i.seed_hex}`
+        + (i.end_hex ? ` → 0x${i.end_hex}` : ' (open-ended)')
+        + (i.seed === active ? ' (active)' : '')
+        + `: ${i.verified_bytes.toLocaleString()} bytes verified`
+        + (i.target_bytes ? ` of ~${i.target_bytes.toLocaleString()} windowed` : '')
+        + (i.frontier_end_hex ? `, frontier 0x${i.frontier_end_hex}` : ', unswept');
+      return `<span class="${cls}" title="${tip}">${merged}${label}</span>`;
+    }).join('');
+    islands = `<span class="island-strip">${islands}</span>`;
+  }
   return `
-    <span class="progress" title="${v} / ${t} bytes of race.bin verified">
+    <span class="progress" title="${v} / ${t} bytes of the binary verified">
       <span class="progress-bar"><span class="progress-fill" style="width:${pct}%"></span></span>
       <span class="progress-pct">${pct}%</span>
       <span class="progress-bytes">${v} / ${t} bytes</span>
+      ${islands}
     </span>
   `;
 }
@@ -232,12 +282,15 @@ function renderAuditStatus(audit, candidate) {
 function renderProgress(s) {
   const el = document.getElementById('progress-content');
   if (s.all_caught_up) {
+    const msg = (s.progress && s.progress.islands && s.progress.islands.length)
+      ? 'All declared islands are caught up. Seed another island (or raise a window\'s end in yaml) to continue.'
+      : 'All verified subsegs are caught up. Add a manual anchor in yaml to continue forward-sweep.';
     el.innerHTML = `
-      <span class="caught-up">All verified subsegs are caught up. Add a manual anchor in yaml to continue forward-sweep.</span>
-      ${progressHtml(s.progress)}
+      <span class="caught-up">${msg}</span>
+      ${progressHtml(s.progress, s.active_island)}
     `;
   } else {
-    el.innerHTML = progressHtml(s.progress);
+    el.innerHTML = progressHtml(s.progress, s.active_island);
   }
 }
 

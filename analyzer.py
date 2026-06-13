@@ -401,6 +401,11 @@ class Progress:
     verified_bytes: int
     total_bytes: int
     pct: float
+    # Per-island breakdown (empty in legacy full-coverage mode).  One
+    # dict per declared seed: {seed, verified_bytes, frontier_end,
+    # merged_with_prev}.  Islands are open-ended windows, so there's no
+    # honest per-island percentage — report bytes + extent instead.
+    islands: list = field(default_factory=list)
 
 
 @dataclass
@@ -3705,6 +3710,7 @@ class SweepState:
                  frontier_simulation: bool = False,
                  pending_entries: Optional[dict] = None,
                  pending_partners: Optional[list] = None,
+                 active_island: Optional[int] = None,
                  ):
         self.model = model
         self.yaml_cfg = yaml_cfg
@@ -3769,6 +3775,38 @@ class SweepState:
             list(self.verified) + list(self.verified_data),
             key=lambda s: s.start,
         )
+
+        # Islands — verified-coverage windows seeded at human/AI-chosen
+        # addresses, with legally-unswept territory before/between/after
+        # them.  Yaml shape: top-level `islands:` list of
+        # `{seed, end}` entries (end optional → open-ended window; a
+        # bare addr is shorthand for the same).  Missing/empty list =
+        # legacy full-coverage semantics (one implicit island at vram:
+        # head-of-binary sweep, every inter-subseg gap illegal) —
+        # existing yamls behave byte-identically.
+        #
+        # Every subseg belongs to the island with the greatest seed at
+        # or below its start; a gap between consecutive subsegs is
+        # legal iff an island seed sits in (prev.end, next.start].
+        #
+        # DECLARATION ORDER IS WORK ORDER: the sweep proposes from the
+        # first declared island whose window isn't covered yet, then
+        # auto-advances to the next.  `end` is soft — a function
+        # straddling it stamps normally; the window just completes.
+        self.islands = []
+        for entry in (yaml_cfg.get("islands") or []):
+            if isinstance(entry, dict):
+                seed = _coerce_addr(entry.get("seed", entry.get("start")))
+                end = entry.get("end")
+                end = _coerce_addr(end) if end is not None else None
+            else:
+                seed, end = _coerce_addr(entry), None
+            self.islands.append({"seed": seed, "end": end})
+        self.island_seeds = sorted({i["seed"] for i in self.islands})
+        # Which island the sweep prefers right now.  Session-supplied
+        # (set by /island/seed and updated on approve); folded into
+        # _island_work_order.
+        self.active_island = active_island
 
         # Validate `entries:` lists and derive alt_entry_main.  Each alt
         # entry must sit strictly inside its owning subseg's (start, end]
@@ -4483,6 +4521,49 @@ class SweepState:
         return self._forward_sweep_candidate()
 
     # ------------------------------------------------------------------
+    # Public — islands
+    # ------------------------------------------------------------------
+
+    def island_of(self, addr: int) -> Optional[int]:
+        """Seed of the island `addr` belongs to: the greatest seed at or
+        below addr.  None when no islands are declared (legacy mode) or
+        addr precedes the first seed."""
+        seed = None
+        for s in self.island_seeds:
+            if s <= addr:
+                seed = s
+            else:
+                break
+        return seed
+
+    def _island_boundary_between(self, prev_end: int, next_start: int) -> bool:
+        """True iff an island seed sits in (prev_end, next_start] — the
+        uncovered range between a stamp ending at prev_end and the next
+        stamp/candidate at next_start spans an island boundary, so it's
+        legally-unswept territory rather than an internal gap.  Seeds
+        interior to already-merged coverage never satisfy this (they're
+        at or below prev_end).  Always False in legacy mode."""
+        return any(prev_end < s <= next_start for s in self.island_seeds)
+
+    def _island_work_order(self) -> list:
+        """Islands in the order the sweep should try them: the
+        session-activated island first (explicit user/AI choice), then
+        yaml declaration order.  Declaration order IS the priority
+        queue — declare the most important window first.  The sweep
+        takes the first island that still yields an in-window
+        candidate, so completed windows fall through automatically."""
+        ordered, seen = [], set()
+        for isl in self.islands:
+            if isl["seed"] == self.active_island and isl["seed"] not in seen:
+                ordered.append(isl)
+                seen.add(isl["seed"])
+        for isl in self.islands:
+            if isl["seed"] not in seen:
+                ordered.append(isl)
+                seen.add(isl["seed"])
+        return ordered
+
+    # ------------------------------------------------------------------
     # Public — gap detection + progress
     # ------------------------------------------------------------------
 
@@ -4502,6 +4583,12 @@ class SweepState:
         excluded — that's the unswept frontier ahead of forward-sweep,
         not a gap.
 
+        Island semantics: an uncovered range that spans an island
+        boundary (a declared seed sits inside it) is legally-unswept
+        territory between islands, not a gap — suppressed for both the
+        existing and pending variants.  With no islands declared,
+        nothing is suppressed (legacy full-coverage behavior).
+
         Returns list[Gap].  Each `pending` field:
           False = gap already exists in the yaml (a real bug to backfill)
           True  = gap is between latest-stamped and current proposal
@@ -4518,7 +4605,8 @@ class SweepState:
         gaps = []
         prev = None
         for s in all_subsegs:
-            if prev is not None and s.start > prev.end + 1:
+            if (prev is not None and s.start > prev.end + 1
+                    and not self._island_boundary_between(prev.end, s.start)):
                 gap_start = prev.end + 1
                 gap_end = s.start - 1
                 gaps.append(Gap(
@@ -4534,9 +4622,21 @@ class SweepState:
                 ))
             prev = s
 
-        # Pending gap between latest verified and the proposed candidate.
-        if proposed_start is not None and prev is not None:
-            if proposed_start > prev.end + 1:
+        # Pending gap between the proposal and the subseg immediately
+        # preceding it — NOT the globally-last subseg, which is the
+        # wrong anchor whenever stamps exist past the active frontier
+        # (a later island, or a gap-fill proposal).  Skip when the
+        # range is already reported as an existing gap above (the
+        # proposal sits inside a real gap; one banner entry is enough).
+        if proposed_start is not None:
+            prev = max(
+                (s for s in all_subsegs if s.end < proposed_start),
+                key=lambda s: s.end,
+                default=None,
+            )
+            if (prev is not None and proposed_start > prev.end + 1
+                    and not self._island_boundary_between(prev.end, proposed_start)
+                    and not any(g.start == prev.end + 1 for g in gaps)):
                 gap_start = prev.end + 1
                 gap_end = proposed_start - 1
                 gaps.append(Gap(
@@ -4564,10 +4664,51 @@ class SweepState:
         verified_bytes = code_bytes + data_bytes
         total_bytes = len(self.model.binary)
         pct = (verified_bytes / total_bytes * 100.0) if total_bytes else 0.0
+
+        # Per-island breakdown, in declaration (= work) order.  Stamps
+        # group by greatest-seed-at-or-below-start; merged_with_prev
+        # marks a seed that earlier coverage has swept into (a stamp
+        # ends at/past seed-1), so the UI can render the joined region
+        # as one.  Bounded islands get target_bytes + complete so the
+        # UI can show honest per-window percentages.
+        def _range_covered(lo, hi):
+            """True iff every byte of [lo, hi] sits inside some subseg.
+            Walks the start-sorted unified list with a coverage cursor."""
+            pos = lo
+            for s in self.all_subsegs:
+                if s.end < pos:
+                    continue
+                if s.start > pos:
+                    return False
+                pos = s.end + 1
+                if pos > hi:
+                    return True
+            return pos > hi
+
+        islands = []
+        for isl in self.islands:
+            seed, end = isl["seed"], isl["end"]
+            stamps = [s for s in self.all_subsegs if self.island_of(s.start) == seed]
+            islands.append({
+                "seed": seed,
+                "end": end,
+                "verified_bytes": sum(s.end - s.start + 1 for s in stamps),
+                "frontier_end": max((s.end for s in stamps), default=None),
+                "target_bytes": (end - seed + 1) if end is not None else None,
+                # Complete = the whole window is covered, no matter which
+                # island the covering stamps are ASSIGNED to (a merge
+                # sweeping across this window covers it just the same).
+                "complete": end is not None and _range_covered(seed, end),
+                "merged_with_prev": any(
+                    s.start < seed and s.end + 1 >= seed for s in self.all_subsegs
+                ),
+            })
+
         return Progress(
             verified_bytes=verified_bytes,
             total_bytes=total_bytes,
             pct=pct,
+            islands=islands,
         )
 
     # ------------------------------------------------------------------
@@ -4616,52 +4757,106 @@ class SweepState:
                     return True
             return False
 
-        # Head-of-binary case: if the binary's first address isn't covered
-        # by any declared subseg, look for a function there first.  Handles
-        # both the bootstrap case (no anchors yet) and re-review of the
-        # very first function after an /unstamp at the binary head.
-        if not all_subsegs or all_subsegs[0].start > vram:
-            next_start = _scan_for_next_prologue(
-                binary, vram, vram, binary_end,
-                reference_starts=reference_starts,
-                static_callers=static_callers,
-                cross_module_callers=cross_module_callers,
-            )
-            if next_start is not None and not _covered_by_existing(next_start):
+        def _propose_from(subseg_iter, window_end=None):
+            """Scan forward from each subseg in `subseg_iter` for the
+            next uncovered function-start.  `window_end` bounds the
+            proposal: a candidate starting past it means this window's
+            territory is fully covered (the next function belongs to
+            whatever lies beyond), so return None and let the caller
+            advance to the next island."""
+            for prev in subseg_iter:
+                next_start = _scan_for_next_prologue(
+                    binary, vram, prev.end + 1, binary_end,
+                    reference_starts=reference_starts,
+                    static_callers=static_callers,
+                    cross_module_callers=cross_module_callers,
+                )
+                if next_start is None:
+                    continue
+                if _covered_by_existing(next_start):
+                    # Already inside an existing verified subseg — keep iterating.
+                    continue
+                if window_end is not None and next_start > window_end:
+                    return None
+                # Pick the ACTUAL immediately-preceding subseg (code or data),
+                # not the iteration's `prev`.  The scan can walk past an
+                # unsignaled-but-verified subseg (e.g. a 4-byte alternate-
+                # entry stub with no callers + no reference FUN_<addr>:
+                # declaration) and land on a candidate further out.  In
+                # that case the `prev` we're iterating from is stale — the
+                # real previous-verified-subseg is the one that hugs next_start.
+                actual_prev = max(
+                    (s for s in all_subsegs if s.end < next_start),
+                    key=lambda s: s.end,
+                    default=prev,
+                )
                 fa = model.analyze_function(
                     next_start, hint_end=self._cap_from_next_stamp(next_start),
                 )
-                return NextCandidate(previous=None, function=fa)
+                return NextCandidate(previous=actual_prev, function=fa)
+            return None
 
-        for prev in all_subsegs:
-            next_start = _scan_for_next_prologue(
-                binary, vram, prev.end + 1, binary_end,
-                reference_starts=reference_starts,
-                static_callers=static_callers,
-                cross_module_callers=cross_module_callers,
-            )
-            if next_start is None:
-                continue
-            if _covered_by_existing(next_start):
-                # Already inside an existing verified subseg — keep iterating.
-                continue
-            # Pick the ACTUAL immediately-preceding subseg (code or data),
-            # not the iteration's `prev`.  The scan can walk past an
-            # unsignaled-but-verified subseg (e.g. a 4-byte alternate-
-            # entry stub with no callers + no reference FUN_<addr>:
-            # declaration) and land on a candidate further out.  In
-            # that case the `prev` we're iterating from is stale — the
-            # real previous-verified-subseg is the one that hugs next_start.
-            actual_prev = max(
-                (s for s in all_subsegs if s.end < next_start),
-                key=lambda s: s.end,
-                default=prev,
-            )
-            fa = model.analyze_function(
-                next_start, hint_end=self._cap_from_next_stamp(next_start),
-            )
-            return NextCandidate(previous=actual_prev, function=fa)
+        if not self.islands:
+            # Legacy full-coverage mode — head-of-binary case: if the
+            # binary's first address isn't covered by any declared
+            # subseg, look for a function there first.  Handles both
+            # the bootstrap case (no anchors yet) and re-review of the
+            # very first function after an /unstamp at the binary head.
+            if not all_subsegs or all_subsegs[0].start > vram:
+                next_start = _scan_for_next_prologue(
+                    binary, vram, vram, binary_end,
+                    reference_starts=reference_starts,
+                    static_callers=static_callers,
+                    cross_module_callers=cross_module_callers,
+                )
+                if next_start is not None and not _covered_by_existing(next_start):
+                    fa = model.analyze_function(
+                        next_start, hint_end=self._cap_from_next_stamp(next_start),
+                    )
+                    return NextCandidate(previous=None, function=fa)
+            return _propose_from(all_subsegs)
 
+        # Island mode: work the islands in priority order (activated
+        # island first, then declaration order), taking the first one
+        # that still yields an in-window candidate.  Completed windows
+        # — and windows whose remaining territory holds no findable
+        # function — fall through to the next island automatically.
+        for isl in self._island_work_order():
+            seed, window_end = isl["seed"], isl["end"]
+            # An uncovered seed proposes EXACTLY there — the human/AI
+            # chose the address; no prologue scan second-guesses it.
+            # Covers both the fresh-island case and re-review after
+            # /unstamp of an island's first stamp (the seed is durable
+            # in yaml, so the sweep returns to it instead of falling
+            # back to the binary head).
+            if not _covered_by_existing(seed):
+                fa = model.analyze_function(
+                    seed, hint_end=self._cap_from_next_stamp(seed),
+                )
+                # Prev anchor only when coverage hugs the seed exactly
+                # (merge-imminent); anything farther back is separated
+                # by legally-unswept territory, not an intermediate
+                # pool/padding zone the listing should raw-render.
+                prev = max(
+                    (s for s in all_subsegs if s.end < seed),
+                    key=lambda s: s.end,
+                    default=None,
+                )
+                if prev is not None and prev.end + 1 != seed:
+                    prev = None
+                return NextCandidate(previous=prev, function=fa)
+            # Seed covered → sweep from the island's coverage onward.
+            # Subsegs entirely before the seed belong to other islands;
+            # scanning from them would drag the candidate back into (or
+            # before) territory this window never claimed.  Later
+            # islands' stamps stay in the list so a frontier that
+            # reaches them skips past (coverage merge).
+            cand = _propose_from(
+                (s for s in all_subsegs if s.end >= seed),
+                window_end=window_end,
+            )
+            if cand is not None:
+                return cand
         return None
 
     # ------------------------------------------------------------------
@@ -4725,6 +4920,25 @@ class SweepState:
             i = row_id[0]
             row_id[0] += 1
             return i
+
+        # ----- 0. Preceding context (no stamped predecessor) -----
+        # An island-seed candidate (or any candidate with no prev
+        # subseg) would otherwise start the listing cold at its first
+        # instruction.  Show the TRAILING_BYTES bytes before it as raw
+        # rows — the same courtesy the trailing section extends past
+        # the end — so the human can judge whether the proposed start
+        # is really a boundary, and pin-start earlier if not (an
+        # island's seed auto-snaps down on approve).
+        if previous is None and candidate.start > self.model.vram:
+            ctx_start = max(self.model.vram, candidate.start - TRAILING_BYTES)
+            ctx_end = candidate.start - 1
+            self._emit_section_header(
+                rows, next_id, Section.INTERMEDIATE,
+                f"PRECEDING (unswept)  0x{ctx_start:08X} → 0x{ctx_end:08X}  "
+                f"({ctx_end - ctx_start + 1} bytes before candidate)",
+                anchor_addr=ctx_start,
+            )
+            self._emit_raw_rows(rows, next_id, ctx_start, ctx_end, Section.INTERMEDIATE)
 
         # ----- 1. Previous section (if a prev subseg is provided) -----
         if previous is not None:

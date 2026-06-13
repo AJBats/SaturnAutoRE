@@ -38,6 +38,10 @@ app = Flask(
     template_folder=str(SCRIPT_DIR / "templates"),
     static_folder=str(SCRIPT_DIR / "static"),
 )
+# Dev-style tool: never let the browser cache keys.js/style.css past a
+# reload — a stale cached renderer silently mis-displays new payload
+# fields (ETag revalidation still avoids re-downloading unchanged files).
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 STATE = {
     "yaml_path": None,
@@ -61,6 +65,7 @@ def _empty_session():
         "audit_mode": None,       # {"focus_start": int} when active; None otherwise
         "pending_partners": [],   # addrs queued via /queue-partner; applied on next approve
         "pending_entries": {},    # {main_hex: [addr, ...]} queued via /queue-entry; applied on next approve
+        "active_island": None,    # seed addr the forward sweep works from; None = legacy/fallback
     }
 
 
@@ -139,6 +144,18 @@ def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None,
         text += "\n"
     lines = text.splitlines(keepends=True)
 
+    # Normalize an inline-empty `subsegments: []` to block form — the
+    # fresh-project shape.  Appending a `  - start:` block after the
+    # inline empty list produces unparseable yaml.
+    subsegments_line = None
+    for i, line in enumerate(lines):
+        stripped = line.rstrip("\r\n")
+        if stripped.startswith("subsegments:"):
+            subsegments_line = i
+            if stripped[len("subsegments:"):].strip() == "[]":
+                lines[i] = "subsegments:\n"
+            break
+
     block = (
         f"  - start: 0x{start_addr:08X}\n"
         f"    type:  {subseg_type}\n"
@@ -151,10 +168,12 @@ def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None,
         entries_list = ", ".join(f"0x{e:08X}" for e in sorted(set(entries)))
         block += f"    entries: [{entries_list}]\n"
 
-    insert_at = len(lines)
+    insert_at = None
+    last_subseg_line = None
     for i, line in enumerate(lines):
         stripped = line.rstrip("\r\n")
         if stripped.startswith("  - start: 0x"):
+            last_subseg_line = i
             try:
                 existing = int(stripped.split("0x", 1)[1], 16)
             except (ValueError, IndexError):
@@ -162,10 +181,67 @@ def _insert_subseg_in_yaml(start_addr, end_addr, partners=None, entries=None,
             if existing > start_addr:
                 insert_at = i
                 break
+    if insert_at is None:
+        if last_subseg_line is not None:
+            # Append after the last subseg's body lines — NOT at EOF,
+            # which could land inside a later top-level block.
+            insert_at = last_subseg_line + 1
+            while insert_at < len(lines) and lines[insert_at].startswith("    "):
+                insert_at += 1
+        elif subsegments_line is not None:
+            insert_at = subsegments_line + 1
+        else:
+            insert_at = len(lines)
 
     lines.insert(insert_at, block)
     with open(STATE["yaml_path"], "w") as f:
         f.writelines(lines)
+
+
+def _write_islands_to_yaml(islands):
+    """Rewrite the top-level `islands:` block to match `islands` —
+    a list of {'seed': int, 'end': int|None} dicts whose order is
+    preserved verbatim (declaration order IS the sweep's work order).
+    Always placed immediately above the `subsegments:` line so subseg
+    appends never land inside it.
+
+    Island entries use `seed:` (not `start:`) so the subseg yaml
+    scanners — which match `  - start: 0x` anywhere in the file —
+    can never confuse an island entry for a subseg."""
+    text = open(STATE["yaml_path"]).read()
+    if not text.endswith("\n"):
+        text += "\n"
+    lines = text.splitlines(keepends=True)
+
+    # Drop any existing islands block (header + entry/field lines —
+    # also consumes legacy bare `  - 0x...` seed entries).
+    out = []
+    i = 0
+    while i < len(lines):
+        if lines[i].rstrip("\r\n").startswith("islands:"):
+            i += 1
+            while i < len(lines) and (
+                lines[i].startswith("  - ") or lines[i].startswith("    ")
+            ):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+
+    if islands:
+        block = ["islands:\n"]
+        for isl in islands:
+            block.append(f"  - seed: 0x{isl['seed']:08X}\n")
+            if isl.get("end") is not None:
+                block.append(f"    end:  0x{isl['end']:08X}\n")
+        idx = next(
+            (j for j, l in enumerate(out) if l.rstrip("\r\n").startswith("subsegments:")),
+            len(out),
+        )
+        out[idx:idx] = block
+
+    with open(STATE["yaml_path"], "w") as f:
+        f.writelines(out)
 
 
 def _add_partner_to_existing_subseg(subseg_start, new_partner):
@@ -357,6 +433,7 @@ def _build_sweep(session):
         frontier_simulation=session.get("frontier_simulation", False),
         pending_entries=session.get("pending_entries") or {},
         pending_partners=session.get("pending_partners") or [],
+        active_island=session.get("active_island"),
     )
 
 
@@ -825,6 +902,26 @@ def _progress_to_dict(p):
         "verified_bytes": p.verified_bytes,
         "total_bytes": p.total_bytes,
         "pct": p.pct,
+        "islands": [
+            {
+                "seed": isl["seed"],
+                "seed_hex": f"{isl['seed']:08X}",
+                "end": isl["end"],
+                "end_hex": (
+                    f"{isl['end']:08X}" if isl["end"] is not None else None
+                ),
+                "verified_bytes": isl["verified_bytes"],
+                "target_bytes": isl["target_bytes"],
+                "complete": isl["complete"],
+                "frontier_end": isl["frontier_end"],
+                "frontier_end_hex": (
+                    f"{isl['frontier_end']:08X}"
+                    if isl["frontier_end"] is not None else None
+                ),
+                "merged_with_prev": isl["merged_with_prev"],
+            }
+            for isl in p.islands
+        ],
     }
 
 
@@ -1002,6 +1099,7 @@ def state():
                     "audit_mode": audit_dict,
                     "scrubber": _audit_scrubber_payload(sweep, model),
                     "frontier_simulation": bool(session.get("frontier_simulation", False)),
+                    "active_island": session.get("active_island"),
                 })
 
         analyze_mode = session.get("analyze_mode")
@@ -1020,6 +1118,7 @@ def state():
                 "internal_gaps": [_gap_to_dict(g) for g in sweep.gaps()],
                 "audit_mode": None,
                 "scrubber": None,
+                "active_island": session.get("active_island"),
             })
 
         # Internal gaps with pending gap to proposed candidate surfaced too.
@@ -1085,6 +1184,7 @@ def state():
             "audit_mode": None,
             "scrubber": None,
             "frontier_simulation": bool(session.get("frontier_simulation", False)),
+            "active_island": session.get("active_island"),
         })
 
 
@@ -1228,6 +1328,148 @@ def unpin_all():
         session["ai_override"] = None
         save_session(session)
     return jsonify({"ok": True, "had_override": had_override})
+
+
+@app.route("/island/seed", methods=["POST"])
+def island_seed():
+    """Open (or re-activate) a coverage island at an arbitrary address.
+    Writes the seed to the yaml's top-level `islands:` list — durable
+    project state, like subsegments — and makes it the active island so
+    the forward sweep proposes a candidate exactly there.  Unswept
+    territory before/after an island is legal (no red gap banner);
+    gaps WITHIN an island fire as always."""
+    data = request.get_json(force=True)
+    raw = data.get("addr")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'addr'"}), 400
+    try:
+        addr = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+    raw_end = data.get("end")
+    end = None
+    if raw_end is not None:
+        try:
+            end = analyzer._coerce_addr(raw_end)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "bad 'end' address"}), 400
+
+    with LOCK:
+        session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
+        cfg, model, sweep = _build_sweep(session)
+        # Validation applies only to NEW seeds — re-activating an
+        # existing island (to switch the sweep back to its frontier)
+        # must work even after stamps have covered its seed address.
+        created = addr not in sweep.island_seeds
+        if created:
+            if addr & 1:
+                return jsonify({"ok": False, "error": f"addr 0x{addr:08X} is odd — SH-2 code is 2-byte aligned"}), 400
+            binary_end = model.vram + len(model.binary) - 1
+            if not (model.vram <= addr <= binary_end):
+                return jsonify({
+                    "ok": False,
+                    "error": f"addr 0x{addr:08X} outside binary range 0x{model.vram:08X}–0x{binary_end:08X}",
+                }), 400
+            if end is not None and not (addr < end <= binary_end):
+                return jsonify({
+                    "ok": False,
+                    "error": f"end 0x{end:08X} must be after seed 0x{addr:08X} and inside the binary",
+                }), 400
+            for s in sweep.all_subsegs:
+                if s.start <= addr <= s.end:
+                    kind_label = "DATA" if s.type == "data" else "FUN"
+                    return jsonify({
+                        "ok": False,
+                        "error": f"addr 0x{addr:08X} is inside verified subseg {kind_label}_{s.start:08X}",
+                    }), 400
+            # Append — new islands queue at the END of the work order.
+            _write_islands_to_yaml(list(sweep.islands) + [{"seed": addr, "end": end}])
+        session["active_island"] = addr
+        session["ai_override"] = None  # the seed IS the new view; a stale pin would mask it
+        save_session(session)
+    return jsonify({"ok": True, "seed": f"0x{addr:08X}", "created": created})
+
+
+@app.route("/island/remove", methods=["POST"])
+def island_remove():
+    """Backout for a mis-seeded island.  Refused when the seed is
+    load-bearing for gap legality (removing it would turn legally-
+    unswept territory into internal gaps).  Merged-interior seeds are
+    always removable — coverage is contiguous through them."""
+    data = request.get_json(force=True)
+    raw = data.get("seed")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'seed'"}), 400
+    try:
+        seed = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+
+    with LOCK:
+        session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
+        cfg, model, sweep = _build_sweep(session)
+        if seed not in sweep.island_seeds:
+            return jsonify({"ok": False, "error": f"0x{seed:08X} is not a declared island seed"}), 400
+        remaining = [i for i in sweep.islands if i["seed"] != seed]
+        assigned = [s for s in sweep.all_subsegs if sweep.island_of(s.start) == seed]
+        gaps_before = len(sweep.gaps())
+        # Per-request object; mutate-and-check is safe.
+        sweep.island_seeds = sorted({i["seed"] for i in remaining})
+        # Two ways a removal can corrupt state: stamps assigned to this
+        # seed end up belonging to NO island (frontier unreachable), or
+        # legally-unswept territory turns into internal gaps.  Merged-
+        # interior seeds pass both — their stamps reassign to the
+        # earlier island and coverage is contiguous through them.
+        orphaned = [s for s in assigned if sweep.island_of(s.start) is None]
+        if orphaned or len(sweep.gaps()) > gaps_before:
+            return jsonify({
+                "ok": False,
+                "error": f"island 0x{seed:08X} has verified stamps that depend on its seed — "
+                         f"/unstamp them first",
+            }), 400
+        _write_islands_to_yaml(remaining)
+        if session.get("active_island") == seed:
+            session["active_island"] = None
+        save_session(session)
+    return jsonify({"ok": True, "removed": f"0x{seed:08X}"})
+
+
+def _island_post_approve(session, sweep, start, end):
+    """Island maintenance after a stamp lands in yaml.  `sweep` is the
+    pre-approve state (built before the subseg insert).
+
+    Two duties:
+      - Auto-snap: when the active island's FIRST stamp starts a few
+        bytes before its seed (the human pinned an earlier start after
+        seeding), rewrite the seed down to the stamp's start so the
+        stamp stays assigned to its island.  Only fires for the active
+        island's first stamp — a stamp swept in from a PREVIOUS island
+        that crosses a later seed is a coverage merge, and the interior
+        seed stays put.
+      - Keep session.active_island tracking the island just worked, so
+        approving inside another island's territory switches the sweep
+        there naturally.
+    """
+    if not sweep.island_seeds:
+        return
+    active = session.get("active_island")
+    if (active in sweep.island_seeds and start < active <= end
+            and not any(sweep.island_of(s.start) == active for s in sweep.all_subsegs)):
+        _write_islands_to_yaml([
+            {**i, "seed": start} if i["seed"] == active else i
+            for i in sweep.islands
+        ])
+        session["active_island"] = start
+        return
+    isl = sweep.island_of(start)
+    if isl is not None:
+        session["active_island"] = isl
 
 
 @app.route("/frontier/toggle", methods=["POST"])
@@ -1815,6 +2057,7 @@ def verdict():
                 nxt.function.start, nxt.function.end,
                 subseg_type="data",
             )
+            _island_post_approve(session, sweep, nxt.function.start, nxt.function.end)
             save_session(session)
             return jsonify({
                 "ok": True,
@@ -1888,6 +2131,7 @@ def verdict():
         for p in all_partners:
             _add_partner_to_existing_subseg(p, nxt.function.start)
 
+        _island_post_approve(session, sweep, nxt.function.start, nxt.function.end)
         session["pending_partners"] = []   # clear queue after approve
         all_pending_entries.pop(main_hex, None)
         session["pending_entries"] = all_pending_entries

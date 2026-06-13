@@ -26,6 +26,11 @@ Minimum required:
    subsegments: []                    # forward-sweep starts from vram
    ```
 
+   For **windowed verification** (a few regions of interest in a large
+   binary, everything else legally unswept), see "Islands" below — the
+   yaml gains a top-level `islands:` list and the sweep starts from
+   seeds instead of vram.
+
 Recommended additions (richer banner signals + cleaner rendering):
 
 3. **Reference disassembly.** A second-opinion `.s` tree to compare
@@ -218,6 +223,72 @@ flow:
   drop an alt entry from a stamped subseg's `entries:` list.
   Backout-only; for adds use `/queue-entry`.
 
+### Islands (windowed coverage)
+
+For binaries where the goal is a few verified windows rather than full
+coverage.  An island is a verified-coverage window seeded at a chosen
+address, with legally-unswept territory before/between/after islands.
+Declare all the windows up front and the tool forward-sweeps through
+them like it sweeps a full-coverage binary.
+
+```yaml
+islands:          # top-level, sibling of subsegments (keep it ABOVE them)
+  - seed: 0x0602C690      # declaration order = work order
+    end:  0x06030100      # soft target; omit for an open-ended window
+  - seed: 0x06027344
+    end:  0x060275FF
+subsegments: [...]
+```
+
+Semantics:
+
+- **No `islands:` key = legacy full-coverage mode**, byte-identical to
+  before islands existed (sweep from vram, every inter-subseg gap
+  illegal).  Full coverage is the degenerate case of one island at vram.
+- **Declaration order is work order.**  The sweep proposes from the
+  first declared island that still yields an in-window candidate, then
+  auto-advances to the next.  All windows done = "all caught up".
+- **`end` is soft.**  A function straddling the end stamps normally;
+  the window completes when its whole [seed, end] range is covered, or
+  when the next findable function starts past `end`.  To keep sweeping
+  past a declared end, raise it in the yaml.  An entry without `end`
+  (or a bare `- 0x...` addr) is an open-ended window that never
+  auto-completes.
+- Every stamp belongs to the island with the **greatest seed at or
+  below its start**.  A gap between consecutive stamps is legal iff an
+  island seed sits inside it (it spans an island boundary); gaps
+  *within* an island fire the red banner exactly as before.
+- An uncovered seed proposes a candidate exactly at the seed (no
+  prologue scan second-guesses the human's address); a covered seed
+  sweeps forward from the island's coverage.  Seeds are durable in
+  yaml — `/unstamp` of an island's first stamp returns the candidate
+  to the seed, not to the binary head.
+- When an island's sweep reaches a later island's stamps, coverage
+  **merges**: no banner, the frontier skips past, and the interior
+  seed stays in yaml harmlessly (progress reports it
+  `merged_with_prev`; a window covered by a merged neighbor still
+  reports `complete`).
+- On approve, if the active island's first stamp starts a few bytes
+  *before* its seed (start was pinned earlier after seeding), the seed
+  **auto-snaps down** to the stamp's start.
+- `progress.islands` in `/state` reports per-island `{seed_hex,
+  end_hex, verified_bytes, target_bytes, complete, frontier_end_hex,
+  merged_with_prev}` in declaration order — whole-binary percent alone
+  would misread on island projects.
+
+Endpoints:
+
+- **`POST /island/seed {"addr": "0x...", "end": "0x..."}`** — open a
+  new island (writes `{seed, end}` to yaml; `end` optional, appended
+  at the END of the work order) **or re-activate an existing one** by
+  addr (jumps the sweep to that island ahead of declaration order;
+  validation is skipped for known seeds so a covered seed still
+  activates).  Clears any `ai_override`.
+- **`POST /island/remove {"seed": "0x..."}`** — backout for a
+  mis-seeded island.  Refused if stamps depend on the seed (they'd be
+  orphaned or legal unswept space would become internal gaps);
+  merged-interior seeds are always removable.
+
 ### Analyze mode (multi-block exploration)
 
 Switch dispatchers can have case bodies that live at disjoint
@@ -270,7 +341,9 @@ boundary-defining instruction.
 
 1. **No internal gaps.** The red banner fires whenever there's
    uncovered bytes between two stamps (or between latest stamp and
-   proposed candidate). Address the gap before advancing.
+   proposed candidate). Address the gap before advancing.  On island
+   projects this applies *within* each island — unswept territory
+   between islands is legal (see "Islands").
 2. **No auto-approve.** Human verdicts, you diagnose.
 3. **Trailing pool stamps with the function.** When a function ends
    with a pool it references (constants loaded via PC-relative

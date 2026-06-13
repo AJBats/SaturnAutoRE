@@ -150,6 +150,7 @@ header#header > #header-content {
   margin-left: auto;
   font-size: 11px;
   color: #aaa;
+  flex-wrap: wrap;        /* island chips wrap rather than clip */
 }
 .progress-bar {
   display: inline-block;
@@ -169,6 +170,40 @@ header#header > #header-content {
 }
 .progress-pct { color: #cfc; font-weight: bold; }
 .progress-bytes { color: #777; }
+
+/* Island strip — per-window coverage chips (island projects only).
+   Chips are compact (last-5-digit addresses; full info in tooltip) to
+   keep several windows on one header line; flex-wrap is the fallback
+   so a chip is never clipped off the right edge. */
+.island-strip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  margin-left: 0.6em;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.island-chip {
+  padding: 0.1em 0.5em;
+  border: 1px solid #3a5a7a;
+  border-radius: 0.2em;
+  background: #16222e;
+  color: #8ab4d4;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.island-merged { color: #6cc36c; margin-right: 0.3em; }
+.island-chip.island-complete {
+  border-color: #4d8a4d;
+  background: #16281a;
+  color: #8fcf8f;
+}
+/* The window the sweep is currently working */
+.island-chip.island-active {
+  border-color: #d4b85a;
+  background: #2a2416;
+  color: #e8d49a;
+}
 
 /* Reference agreement tag — green/red/gray by verdict */
 .reference {
