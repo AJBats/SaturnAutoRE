@@ -1440,6 +1440,135 @@ def island_remove():
     return jsonify({"ok": True, "removed": f"0x{seed:08X}"})
 
 
+@app.route("/island/edit", methods=["POST"])
+def island_edit():
+    """Edit an existing island's boundaries in place — raise/lower its
+    soft `end`, or move its `seed` — without hand-editing the yaml.
+    Identify the island by its CURRENT `seed`; declaration (= work)
+    order is preserved.
+
+    Body fields:
+      - "seed":  REQUIRED — current seed of the island to edit.
+      - "end":   OPTIONAL — new soft end.  Pass a "0x..." address to
+                 retarget, or null to make the window open-ended.  Omit
+                 the key entirely to leave the end unchanged.
+      - "new_seed": OPTIONAL — move the window's start to this address.
+
+    The soft `end` has no structural constraint (a function straddling
+    it just stamps past it), so an end-only edit always succeeds.  A
+    seed move is validated like a fresh seed AND rejected — same as
+    /island/remove — if it would orphan verified stamps or turn
+    legally-unswept territory into internal gaps; /unstamp them first."""
+    data = request.get_json(force=True)
+    raw = data.get("seed")
+    if raw is None:
+        return jsonify({"ok": False, "error": "missing 'seed'"}), 400
+    try:
+        seed = analyzer._coerce_addr(raw)
+    except (ValueError, TypeError):
+        return jsonify({"ok": False, "error": "bad address"}), 400
+
+    # `end` present-but-null means "make open-ended"; absent means "leave
+    # as-is" — so key presence, not value, decides whether we touch it.
+    change_end = "end" in data
+    new_end = None
+    if change_end and data.get("end") is not None:
+        try:
+            new_end = analyzer._coerce_addr(data.get("end"))
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "bad 'end' address"}), 400
+
+    raw_new_seed = data.get("new_seed")
+    change_seed = raw_new_seed is not None
+    new_seed = None
+    if change_seed:
+        try:
+            new_seed = analyzer._coerce_addr(raw_new_seed)
+        except (ValueError, TypeError):
+            return jsonify({"ok": False, "error": "bad 'new_seed' address"}), 400
+
+    if not change_end and not change_seed:
+        return jsonify({"ok": False, "error": "nothing to edit — pass 'end' and/or 'new_seed'"}), 400
+
+    with LOCK:
+        session = load_session()
+        blocked = _audit_guard_response(session)
+        if blocked is not None:
+            return blocked
+        cfg, model, sweep = _build_sweep(session)
+        if seed not in sweep.island_seeds:
+            return jsonify({"ok": False, "error": f"0x{seed:08X} is not a declared island seed"}), 400
+
+        binary_end = model.vram + len(model.binary) - 1
+        moving = change_seed and new_seed != seed
+        eff_seed = new_seed if moving else seed
+
+        # Validate a genuine seed move like a fresh seed (an unchanged or
+        # no-op move skips this — a covered seed staying put is legal).
+        if moving:
+            if new_seed & 1:
+                return jsonify({"ok": False, "error": f"new_seed 0x{new_seed:08X} is odd — SH-2 code is 2-byte aligned"}), 400
+            if not (model.vram <= new_seed <= binary_end):
+                return jsonify({
+                    "ok": False,
+                    "error": f"new_seed 0x{new_seed:08X} outside binary range 0x{model.vram:08X}–0x{binary_end:08X}",
+                }), 400
+            if new_seed in sweep.island_seeds:
+                return jsonify({"ok": False, "error": f"new_seed 0x{new_seed:08X} is already an island seed"}), 400
+            for s in sweep.all_subsegs:
+                if s.start <= new_seed <= s.end:
+                    kind_label = "DATA" if s.type == "data" else "FUN"
+                    return jsonify({
+                        "ok": False,
+                        "error": f"new_seed 0x{new_seed:08X} is inside verified subseg {kind_label}_{s.start:08X}",
+                    }), 400
+
+        if new_end is not None and not (eff_seed < new_end <= binary_end):
+            return jsonify({
+                "ok": False,
+                "error": f"end 0x{new_end:08X} must be after seed 0x{eff_seed:08X} and inside the binary",
+            }), 400
+
+        # Rebuild the island list preserving declaration order, swapping
+        # only the edited entry's seed/end.
+        edited = []
+        for isl in sweep.islands:
+            if isl["seed"] == seed:
+                edited.append({
+                    "seed": eff_seed,
+                    "end": new_end if change_end else isl["end"],
+                })
+            else:
+                edited.append({"seed": isl["seed"], "end": isl["end"]})
+
+        # A seed move changes island_of()/gap legality; guard it exactly
+        # like /island/remove does.  An end-only edit can't (end is soft
+        # and unused by gap detection), so it needs no structural check.
+        if moving:
+            gaps_before = len(sweep.gaps())
+            sweep.island_seeds = sorted({i["seed"] for i in edited})
+            orphaned = [s for s in sweep.all_subsegs if sweep.island_of(s.start) is None]
+            if orphaned or len(sweep.gaps()) > gaps_before:
+                return jsonify({
+                    "ok": False,
+                    "error": f"moving seed 0x{seed:08X} → 0x{new_seed:08X} would orphan verified "
+                             f"stamps or open internal gaps — /unstamp them first",
+                }), 400
+
+        _write_islands_to_yaml(edited)
+        # Moving a seed redefines the window's view; if it was the active
+        # one, follow it and drop any stale pin (mirrors /island/seed).
+        if moving and session.get("active_island") == seed:
+            session["active_island"] = eff_seed
+            session["ai_override"] = None
+        save_session(session)
+    return jsonify({
+        "ok": True,
+        "seed": f"0x{eff_seed:08X}",
+        "end": f"0x{new_end:08X}" if new_end is not None else None,
+    })
+
+
 def _island_post_approve(session, sweep, start, end):
     """Island maintenance after a stamp lands in yaml.  `sweep` is the
     pre-approve state (built before the subseg insert).

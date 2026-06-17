@@ -262,7 +262,7 @@ Semantics:
   which is the signal the declared end is too small.
 - **`end` is soft.**  A function straddling the end stamps normally
   (pin-end past the boundary).  To keep sweeping past a declared end,
-  raise it in the yaml.  An entry without `end` (or a bare `- 0x...`
+  raise it with `/island/edit` (or in the yaml).  An entry without `end` (or a bare `- 0x...`
   addr) is an open-ended window: it has no bounded remainder, so it
   advances when no function-start signal is found (no leftover
   surfacing).
@@ -300,6 +300,21 @@ Endpoints:
   mis-seeded island.  Refused if stamps depend on the seed (they'd be
   orphaned or legal unswept space would become internal gaps);
   merged-interior seeds are always removable.
+- **`POST /island/edit {"seed": "0x...", "end": "0x..."|null, "new_seed": "0x..."}`**
+  — change an existing island's boundaries in place (identify it by its
+  current `seed`); declaration/work order is preserved.  This is the
+  golden path for *"raise the declared end to keep sweeping past it"* —
+  no hand-editing the yaml.  Fields beyond `seed` are optional:
+  - `end` — new soft end.  Pass a `"0x..."` to retarget, or `null` to
+    make the window open-ended.  **Omit the key** to leave it unchanged.
+    The end is soft, so this never fails on a structural check (a
+    function straddling it just stamps past it).
+  - `new_seed` — move the window's start.  Validated like a fresh seed
+    (even, in-binary, not inside a verified subseg, not colliding with
+    another seed) and, like `/island/remove`, **refused if the move
+    would orphan verified stamps or open internal gaps** — `/unstamp`
+    them first.  If the edited island was the active one, the sweep
+    follows it to the new seed and any stale `ai_override` is cleared.
 
 ### Analyze mode (multi-block exploration)
 
