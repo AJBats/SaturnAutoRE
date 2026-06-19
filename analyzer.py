@@ -4434,11 +4434,7 @@ class SweepState:
         # logged BOTH in fa.branches (added by the walker's single-target
         # resolution) AND in fa.indirect_resolutions (added by the
         # post-walk pass), and we don't want to double-count.
-        def _harvest(fn_start: int, fn_end: int):
-            try:
-                fa = self.model.analyze_function(fn_start, hint_end=fn_end)
-            except Exception:
-                return
+        def _harvest_fa(fn_start: int, fa):
             seen_srcs: set = set()
             for b in fa.branches:
                 if b.target is None or b.internal:
@@ -4469,10 +4465,30 @@ class SweepState:
                     result.setdefault(t, {}).setdefault(fn_start, 0)
                     result[t][fn_start] += 1
 
+        def _harvest(fn_start: int, fn_end: int):
+            try:
+                fa = self.model.analyze_function(fn_start, hint_end=fn_end)
+            except Exception:
+                return
+            _harvest_fa(fn_start, fa)
+
         for sub in self._verified_for_hints():
             _harvest(sub.start, sub.end)
-        for b in (self.analyze_mode.get("blocks") or []):
-            _harvest(int(b["start"]), int(b["end"]))
+        # Analyze-mode blocks: harvest from the SAME multi-block union the
+        # listing renders (analyze_multi_block seeds reachability from the
+        # switch targets / static callers / reference starts inside each
+        # block).  A bare per-block analyze_function walk misses branches
+        # only reachable via cross-block flow — e.g. a block-2 `bra` back
+        # into block 1 whose source is reached only after a block-1 branch
+        # lands deeper into block 2 — so those targets would never get a
+        # "Called from FUN_X (analyze block)" hint.
+        blocks = self.analyze_mode.get("blocks") or []
+        for i, b in enumerate(blocks):
+            try:
+                fa = self.model.analyze_multi_block(blocks, active_block=i)
+            except Exception:
+                continue
+            _harvest_fa(int(b["start"]), fa)
         # Pending partners — harvest each queued partner's branches as
         # if it were stamped, so "Called from FUN_X (partner)" hint
         # labels can preview before /verdict approve materializes the
