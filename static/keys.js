@@ -10,6 +10,11 @@ let LAST_ATTN_KEY = '';
 // same, so primChanged wouldn't trip — without this guard the listing
 // keeps rendering against stale row data until F5).
 let LAST_ENTRIES_KEY = '';
+// Identity of the active analyze-mode view (active block + block set).
+// Toggling analyze mode on/off flips caller-kind tags and the rendered
+// block without necessarily moving the candidate boundaries, so the
+// boundary-based change detection alone would serve a stale listing.
+let LAST_ANALYZE_KEY = '';
 // Identity of the scrubber's verified-subseg set + focus.  Skip the
 // (300+ cell) DOM rebuild when nothing changed.  Format:
 // "<count>|<start1>:<end1>:<verdict1>,...|<focus>" — end is included
@@ -986,6 +991,7 @@ async function fetchState() {
       LAST_NATURAL_START = null;
       LAST_NATURAL_END = null;
       LAST_ENTRIES_KEY = '';
+      LAST_ANALYZE_KEY = '';
       return;
     }
 
@@ -1062,7 +1068,19 @@ async function fetchState() {
     }
     const primRefEndSet = refEndSet(s.candidate);
     const natRefEndSet  = overrideActive ? refEndSet(s.natural_view.candidate) : primRefEndSet;
-    if (primChanged || natChanged || attnChanged || entriesChanged || pendingPartnersChanged) {
+    // Analyze-mode identity.  Entering/exiting analyze mode (or cycling
+    // the active block) changes caller-kind tags ("analyze block" <->
+    // "partner") and which block renders, but the active block and the
+    // post-exit sweep candidate can share start/end — so primChanged
+    // wouldn't trip and the stale labels would linger until a refresh.
+    const analyzeKey = s.analyze_mode
+      ? s.analyze_mode.active_block + '|' +
+        (s.analyze_mode.blocks_summary || [])
+          .map(b => b.start_hex + '-' + b.end_hex).join(',')
+      : '';
+    const analyzeChanged = (analyzeKey !== LAST_ANALYZE_KEY);
+    LAST_ANALYZE_KEY = analyzeKey;
+    if (primChanged || natChanged || attnChanged || entriesChanged || pendingPartnersChanged || analyzeChanged) {
       if (overrideActive) {
         // Diff-align so rows for the same VRAM anchor address sit at the
         // same Y position across panes.  When a side has a header /
