@@ -1005,16 +1005,23 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
     Two variants, same overall shape:
 
     A. Index pre-scaled then added to base:
-        mov.l @(disp,PC), rN     ; rN = address of the jump table
-        ...                       ; (shll2 / add r_idx, rN / etc.)
-        mov.l @rN, rN             ; rN = table[idx]   <-- src==dst==rN
+        mov.l @(disp,PC), rB     ; rB = address of the jump table
+        ...                       ; (shll2 / add r_idx, rB / etc.)
+        mov.l @rB, rN             ; rN = table[idx]   (rB may equal rN)
         jmp @rN
 
     B. Indexed load (Duff's-device-style, no scale needed because the
         index is already a byte offset):
-        mov.l @(disp,PC), rN     ; rN = table base
-        mov.l @(r0, rN), rN      ; rN = table[r0]    <-- @(r0,rN),rN
+        mov.l @(disp,PC), rB     ; rB = table base
+        mov.l @(r0, rB), rN      ; rN = table[r0]    (rB may equal rN)
         jmp @rN
+
+    The base register rB that holds the table pointer is NOT necessarily
+    the jmp register rN.  GCC emits both the self-referential form
+    (rB==rN, e.g. `mov.l @r3,r3; jmp @r3`) and the two-register form
+    (rB!=rN, e.g. `mov.l @r2,r1; jmp @r1`).  We capture rB from the
+    indirection load and chase the table-start pool load through *that*
+    register.
 
     Either pattern's pool word holds the table start.  The table is a
     run of 4-byte case body addresses; we walk forward stopping at the
@@ -1032,10 +1039,18 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
         return []
     reg = (jmp_op >> 8) & 0xF
 
-    # Scan back up to 8 instructions (16 bytes) for the pattern.
-    # We need both `mov.l @rN, rN` (indirection through rN) AND
-    # `mov.l @(disp,PC), rN` (the pool load that supplied the table start).
-    mov_l_via_rn_seen = False
+    # Scan back up to 8 instructions (16 bytes) for the pattern.  We need
+    # the indirection load that writes the jmp register rN (giving the
+    # base register rB that holds the table pointer) AND the
+    # `mov.l @(disp,PC), rB` pool load that supplied the table start.
+    #
+    # base_reg stays None until the indirection load is found, so the
+    # pool-load branch below only accepts a load that sits *further back*
+    # than the indirection — i.e. the nearest table-start load preceding
+    # it.  A same-register reuse between the indirection and the jmp
+    # (GCC reloads rB for unrelated work in the case-setup tail) is
+    # encountered first, while base_reg is still None, and skipped.
+    base_reg = None
     pool_addr = None
     for back in range(2, 18, 2):
         addr = jmp_pc - back
@@ -1045,33 +1060,32 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
         if op is None:
             continue
 
-        # mov.l @rM, rN: 0110 NNNN MMMM 0010 — looking for src==dst==reg
+        # mov.l @rM, rN: 0110 NNNN MMMM 0010 — dst is the jmp register;
+        # the source rM is the table pointer (base + index*4).
         # (variant A: index pre-scaled and added to base via shll2/add)
-        if (op & 0xF00F) == 0x6002:
-            src = (op >> 4) & 0xF
-            dst = (op >> 8) & 0xF
-            if src == reg and dst == reg:
-                mov_l_via_rn_seen = True
+        if base_reg is None and (op & 0xF00F) == 0x6002:
+            if ((op >> 8) & 0xF) == reg:
+                base_reg = (op >> 4) & 0xF
                 continue
 
-        # mov.l @(r0,Rm), Rn: 0000 NNNN MMMM 1110 — looking for
-        # m==n==reg (variant B: indexed load with r0 as the offset
-        # register, no separate add/shift step — Duff's-device-style
-        # dispatchers that branch off a pre-aligned byte count).
-        if (op & 0xF00F) == 0x000E:
-            base = (op >> 4) & 0xF
-            dst = (op >> 8) & 0xF
-            if base == reg and dst == reg:
-                mov_l_via_rn_seen = True
+        # mov.l @(r0,Rm), Rn: 0000 NNNN MMMM 1110 — indexed load with r0
+        # as the offset register, no separate add/shift step (variant B:
+        # Duff's-device-style dispatchers off a pre-aligned byte count).
+        # dst is the jmp register; rM is the table base.
+        if base_reg is None and (op & 0xF00F) == 0x000E:
+            if ((op >> 8) & 0xF) == reg:
+                base_reg = (op >> 4) & 0xF
                 continue
 
-        # mov.l @(disp,PC), rN: 1101 NNNN dddd dddd
-        if (op & 0xF000) == 0xD000 and ((op >> 8) & 0xF) == reg:
+        # mov.l @(disp,PC), rB: 1101 BBBB dddd dddd — the pool load that
+        # supplied the table start into the base register.
+        if (base_reg is not None and (op & 0xF000) == 0xD000
+                and ((op >> 8) & 0xF) == base_reg):
             disp = op & 0xFF
             pool_addr = ((addr + 4) & 0xFFFFFFFC) + disp * 4
             break
 
-    if not mov_l_via_rn_seen or pool_addr is None:
+    if base_reg is None or pool_addr is None:
         return []
     if not (vram <= pool_addr <= binary_end):
         return []
