@@ -999,7 +999,8 @@ def _walk_epilogue_backward(binary, vram, end, func_start=None, saved=None):
 # ----- braf-switch jump-table detection -------------------------------------
 
 def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
-                                      func_start=None, hard_limit=None):
+                                      func_start=None, hard_limit=None,
+                                      table_out=None):
     """Recognize the GCC SH-2 indirect switch-dispatch idiom around `jmp_pc`.
 
     Two variants, same overall shape:
@@ -1109,7 +1110,11 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
     # Walk the table forward.  Each entry is a 4-byte case body addr.
     # Stop at the first entry whose value is out of vram range or odd.
     # Collect every in-range target; filter by [lo, hi] on return.
+    # `count` tracks the FULL table extent (every entry walked, even ones
+    # filtered out of `targets` by [lo, hi]) so a caller can classify the
+    # whole table region as data.
     targets = []
+    count = 0
     t = table_start
     while t + 3 <= binary_end:
         toff = t - vram
@@ -1125,8 +1130,17 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
             break
         if lo <= value <= hi:
             targets.append(value)
+        count += 1
         t += 4
 
+    # Surface the table location/extent so the binary-wide scan can mark
+    # these bytes as 4-byte data — the table is loaded indirectly
+    # (base+index), so the pool scanner never sees it and it would
+    # otherwise render as mis-decoded unreachable code.
+    if table_out is not None and count:
+        table_out["start"] = table_start
+        table_out["entry_size"] = 4
+        table_out["count"] = count
     return targets
 
 
@@ -3414,9 +3428,14 @@ class BinaryModel:
         self.switch_clusters = {}
         self.switch_dispatcher_of = {}
         pool_priors = self.pool_priors_dict()
+        mov_l_tables = []   # (start, entry_size, count) of detected 4-byte tables
         for jmp_pc in range(vram, binary_end, 2):
             # mov.l + jmp @rN idiom (variants A/B)
-            tgts = self._detect_mov_l_jmp_switch_targets(jmp_pc)
+            table_out = {}
+            tgts = self._detect_mov_l_jmp_switch_targets(jmp_pc, table_out=table_out)
+            if tgts and table_out.get("start") is not None:
+                mov_l_tables.append(
+                    (table_out["start"], table_out["entry_size"], table_out["count"]))
             if not tgts:
                 # mova + braf rN idiom (alt form)
                 tgts = _detect_braf_switch_targets(
@@ -3436,17 +3455,54 @@ class BinaryModel:
             for idx, t in enumerate(tgts):
                 targets.add(t)
                 self.switch_dispatcher_of.setdefault(t, []).append((jmp_pc, idx))
+        # Classify each mov.l/jmp jump-table region as 4-byte data so it
+        # renders as the `.4byte <case-addr>` entry list instead of being
+        # mis-decoded as unreachable code.  Deferred until after the scan
+        # so marking can't perturb detection earlier in the same pass.
+        # (braf tables are already POOL2 via pool_priors; byte-indexed
+        # 1-byte tables would need a byte-data kind and aren't handled.)
+        self._mark_switch_table_regions(mov_l_tables)
         return targets
 
-    def _detect_mov_l_jmp_switch_targets(self, jmp_pc: int) -> list:
+    def _mark_switch_table_regions(self, tables) -> None:
+        """Mark detected 4-byte jump-table regions as POOL4 so the row
+        emitter renders them as `.4byte` data, not phantom code.  Skips
+        addresses already classified (don't clobber confirmed pool / code
+        that a later phase walks)."""
+        binary = self.binary
+        vram = self.vram
+        for start, entry_size, count in tables:
+            if entry_size != 4:
+                continue
+            for i in range(count):
+                a = start + i * 4
+                off = a - vram
+                if off + 3 >= len(binary):
+                    break
+                if a in self.byte_kind:
+                    continue
+                value = (
+                    (binary[off] << 24) | (binary[off + 1] << 16)
+                    | (binary[off + 2] << 8) | binary[off + 3]
+                )
+                self.byte_kind[a] = ByteKind.POOL4
+                self.pool_words[a] = PoolWord(
+                    addr=a, size=4, value=value, loaded_from=[],
+                )
+
+    def _detect_mov_l_jmp_switch_targets(self, jmp_pc: int, table_out=None) -> list:
         """Binary-wide variant: returns ALL in-vram-range case targets at
         jmp_pc (no func_start/hard_limit filter).  Used by the binary-wide
         switch-target pre-scan that feeds Pass E.  Per-function callers
         (the control-flow walker) use the module-level helper directly
         with func_start/hard_limit filtering.
+
+        `table_out`, when a dict, receives the jump-table {start,
+        entry_size, count} so the caller can classify the table bytes.
         """
         return _detect_mov_l_jmp_switch_targets(
             self.binary, self.vram, jmp_pc, binary_end=self.end_addr,
+            table_out=table_out,
         )
 
     def _classify_orphan_pool(self) -> None:
