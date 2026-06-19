@@ -5158,6 +5158,18 @@ class SweepState:
         there are no in-range partner targets so the caller can skip
         the union.
         """
+        # A seed is a branch/dispatch that crosses INTO the candidate from
+        # the partner.  Key on source/target ADDRESSES, not Branch.internal:
+        # a queued partner is usually the candidate's mega-function sibling,
+        # so a free walk from the partner follows its bras into the candidate
+        # and runs to the candidate's end — inflating the partner's analyzed
+        # range so its branches into the candidate get classified `internal`,
+        # which the old `not b.internal` filter then dropped (yielding zero
+        # seeds → the whole partner-reached body rendered `unreach`).
+        # Address-based crossing is immune to that and also excludes the
+        # candidate's own internal branches (source already inside it).
+        def _into_candidate(addr):
+            return candidate.start <= addr <= candidate.end
         extra_seeds: list = []
         for p in self.pending_partners:
             try:
@@ -5165,21 +5177,27 @@ class SweepState:
             except Exception:
                 continue
             for b in p_fa.branches:
-                if b.target is not None and not b.internal:
-                    if candidate.start <= b.target <= candidate.end:
-                        extra_seeds.append(b.target)
+                if (b.target is not None
+                        and _into_candidate(b.target)
+                        and not _into_candidate(b.src)):
+                    extra_seeds.append(b.target)
             # Walk switch_clusters by ADDRESS RANGE, not via
             # p_fa.indirect_calls — the latter only contains dispatchers
             # the local walker actually reached from p.start, which
             # excludes dispatchers reached only via alt entries (common
             # on unstamped partners where no alt entries are declared
             # yet).  Range-based catches every dispatcher inside the
-            # partner's body.
+            # partner's body.  Skip any dispatcher that sits inside the
+            # candidate (possible once the swallow above widened p_fa.end
+            # over it) — its case bodies are candidate-internal, not
+            # partner-side seeds.
             for dispatcher_pc, tgts in self.model.switch_clusters.items():
                 if not (p <= dispatcher_pc <= p_fa.end):
                     continue
+                if _into_candidate(dispatcher_pc):
+                    continue
                 for t in tgts:
-                    if candidate.start <= t <= candidate.end:
+                    if _into_candidate(t):
                         extra_seeds.append(t)
         if not extra_seeds:
             return set(), []
@@ -5191,6 +5209,17 @@ class SweepState:
             pool_priors=self.model.pool_priors_dict(),
             extra_starts=extra_seeds[1:] if len(extra_seeds) > 1 else None,
         )
+        # _control_flow_walk leaves Branch.internal unset (False).  Classify
+        # against the candidate's range — these branches live inside the
+        # candidate (reached via the partner's flow), so a target landing in
+        # [start, end] is an INTERNAL arrow, not an external exit.  Without
+        # this, partner-reached bt/bf rows render "external" and their
+        # targets get no .L_ label or arc.  Mirrors analyze_multi_block's
+        # post-merge reclassification.  The Branch objects are freshly
+        # built by the walk (not shared with the analyze_function cache),
+        # so in-place mutation is safe.
+        extra_branches = _classify_branch_internality(
+            extra_branches, candidate.start, candidate.end)
         return extra_reach, extra_branches
 
     def _emit_function_rows(self, rows, next_id, fa, section, attn_set, candidate, partner_ranges=None,
@@ -5208,8 +5237,12 @@ class SweepState:
         binary = self.model.binary
         vram = self.model.vram
 
-        # Per-function pool view: pool4/pool2/mova sets + internal branch targets.
-        pool4, pool2, mova, branch_targets = self._build_per_function_pool_view(fa)
+        # Per-function pool view: pool4/pool2/mova sets + internal branch
+        # targets.  Pass the caller's reachable_set (candidate ∪ partner-
+        # extended walk) so partner-only-reachable code is treated as code,
+        # overriding the construction-time orphan-pool guess.
+        pool4, pool2, mova, branch_targets = self._build_per_function_pool_view(
+            fa, reachable_set=reachable_set)
 
         prologue_lo, prologue_hi = fa.prologue_range
         epi_lo, epi_hi = fa.epilogue_range if fa.epilogue_range else (None, None)
@@ -5217,11 +5250,17 @@ class SweepState:
         # Merge in any extra branches the caller collected (e.g. from
         # a partner-extended walk): keys not already in branches_at
         # get added so partner-walked bras get their branch metadata
-        # and the client can draw partner-leap arcs on them.
+        # and the client can draw partner-leap arcs on them.  Their
+        # internal targets also join branch_targets, so a partner-reached
+        # bt/bf target gets its .L_<addr>: anchor and the operand reads
+        # `bt .L_<addr>` instead of a bare external address — answering
+        # "how does control reach this code below the bra?".
         if extra_branches:
             for b in extra_branches:
                 if b.src not in branches_at and b.target is not None:
                     branches_at[b.src] = b
+                if b.internal and b.target is not None:
+                    branch_targets[b.target] = True
 
         # Decoration sets: midpoints and ref-end derived from this
         # function's analysis (NOT the displayed candidate's), so prev-
@@ -5764,7 +5803,7 @@ class SweepState:
 
     # ----- Per-function pool view (with sibling pool refs) -------------
 
-    def _build_per_function_pool_view(self, fa: FunctionAnalysis):
+    def _build_per_function_pool_view(self, fa: FunctionAnalysis, reachable_set=None):
         """Build per-function pool4/pool2/mova sets + branch_targets.
 
         SINGLE RESPONSIBILITY: gather + filter pre-classified pool
@@ -5773,18 +5812,29 @@ class SweepState:
         FunctionAnalysis field when one exists.)
 
         Three sources:
-          1. PC-relative load targets WITHIN fa.reachable (function-internal).
+          1. PC-relative load targets WITHIN reach (function-internal).
           2. Sibling pool refs landing INSIDE fa's range (cross-function).
-          3. Reference priors inside fa's range NOT in fa.reachable.
+          3. Reference priors inside fa's range NOT in reach.
+
+        `reachable_set`, when supplied, is the caller's authoritative
+        code set for this view — the candidate's own reachable UNIONed
+        with any partner-extended walk.  It supersedes `fa.reachable`
+        for both the load scan (source 1) and the prior-skip (source 3),
+        so code that's only reachable via a partner's flow is recognized
+        as code instead of being left to the construction-time orphan-
+        pool guess (Pass E).  Genuine pool words stay pool: the walk
+        never decodes them as instructions, so they're absent from
+        `reach` and source 3 still classifies them.
 
         Mirrors eval_server._pools_and_branches.
         """
         binary = self.model.binary
         vram = self.model.vram
+        reach = reachable_set if reachable_set is not None else fa.reachable
         pool4, pool2, mova = set(), set(), set()
 
         # Source 1: pool refs FROM fa to any target.
-        for addr in fa.reachable:
+        for addr in reach:
             off = addr - vram
             if off + 1 >= len(binary):
                 continue
@@ -5806,12 +5856,12 @@ class SweepState:
         mova  |= spm
 
         # Source 3: reference priors falling in fa's range AND not in
-        # reachable.  Skip addrs analyzer's CFG walk reached as code:
+        # reach.  Skip addrs analyzer's CFG walk reached as code:
         # auto-disassemblers will sometimes wrap a real branch in a
         # `.4byte` literal, but oracle's in-binary decoding is the
         # ground truth — trust it over the prior.
         for addr, pw in self.model.pool_words.items():
-            if fa.start <= addr <= fa.end and addr not in fa.reachable:
+            if fa.start <= addr <= fa.end and addr not in reach:
                 if pw.size == 4:
                     pool4.add(addr)
                 elif pw.size == 2:
