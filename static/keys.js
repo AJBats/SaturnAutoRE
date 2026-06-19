@@ -832,14 +832,23 @@ function drawArcs() {
     if (!pz) return MIN_LEFT_MARGIN;
     return pz.getBoundingClientRect().left - listingRect.left;
   }
-  function targetInPartnerRange(addr) {
+  function inPartnerRange(addr) {
     for (const [s, e] of CURRENT_PENDING_PARTNER_RANGES) {
       if (s <= addr && addr <= e) return true;
     }
     return false;
   }
   CURRENT_BRANCHES.forEach(br => {
-    if (!targetInPartnerRange(br.target)) return;
+    // The leap marks a branch that CROSSES the candidate/partner
+    // boundary — the evidence that the two blocks belong together.
+    // Fire it when exactly one endpoint sits inside a partner range:
+    //   candidate -> partner  (src outside, target inside)
+    //   partner   -> candidate (src inside, target outside)
+    // Both-inside (the partner's own internal flow, shown as a review
+    // section) and both-outside (the candidate's own flow) render as
+    // normal local arcs instead — so we never stack a leap on top of
+    // an arc that's already there.
+    if (inPartnerRange(br.src) === inPartnerRange(br.target)) return;
     const srcEl = srcMap.get(br.src);
     if (!srcEl) return;
     const sX = tickXOf(srcEl) - TICK_INSET;
