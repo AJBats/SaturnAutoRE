@@ -1024,6 +1024,15 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
     indirection load and chase the table-start pool load through *that*
     register.
 
+    Variant B's effective address `r0 + Rm` is symmetric: compilers emit
+    both `base in Rm, scaled index in r0` AND the mirrored `base in r0,
+    scaled index in Rm` (e.g. `mov.l @(disp,PC),r0; shll2 r1;
+    mov.l @(r0,r1),r0; jmp @r0`).  So for variant B BOTH r0 and Rm are
+    base-register candidates; the pool-load scan accepts whichever it
+    finds first walking back.  A wrong pick is backstopped by table
+    validation — the pool word must be an even in-range address whose
+    entries walk as case-body addresses.
+
     Either pattern's pool word holds the table start.  The table is a
     run of 4-byte case body addresses; we walk forward stopping at the
     first entry whose value isn't in vram range or isn't 2-byte aligned.
@@ -1042,16 +1051,16 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
 
     # Scan back up to 8 instructions (16 bytes) for the pattern.  We need
     # the indirection load that writes the jmp register rN (giving the
-    # base register rB that holds the table pointer) AND the
+    # base-register candidates that may hold the table pointer) AND the
     # `mov.l @(disp,PC), rB` pool load that supplied the table start.
     #
-    # base_reg stays None until the indirection load is found, so the
+    # base_regs stays empty until the indirection load is found, so the
     # pool-load branch below only accepts a load that sits *further back*
     # than the indirection — i.e. the nearest table-start load preceding
     # it.  A same-register reuse between the indirection and the jmp
     # (GCC reloads rB for unrelated work in the case-setup tail) is
-    # encountered first, while base_reg is still None, and skipped.
-    base_reg = None
+    # encountered first, while base_regs is still empty, and skipped.
+    base_regs = ()
     pool_addr = None
     for back in range(2, 18, 2):
         addr = jmp_pc - back
@@ -1064,29 +1073,30 @@ def _detect_mov_l_jmp_switch_targets(binary, vram, jmp_pc, binary_end=None,
         # mov.l @rM, rN: 0110 NNNN MMMM 0010 — dst is the jmp register;
         # the source rM is the table pointer (base + index*4).
         # (variant A: index pre-scaled and added to base via shll2/add)
-        if base_reg is None and (op & 0xF00F) == 0x6002:
+        if not base_regs and (op & 0xF00F) == 0x6002:
             if ((op >> 8) & 0xF) == reg:
-                base_reg = (op >> 4) & 0xF
+                base_regs = ((op >> 4) & 0xF,)
                 continue
 
-        # mov.l @(r0,Rm), Rn: 0000 NNNN MMMM 1110 — indexed load with r0
-        # as the offset register, no separate add/shift step (variant B:
-        # Duff's-device-style dispatchers off a pre-aligned byte count).
-        # dst is the jmp register; rM is the table base.
-        if base_reg is None and (op & 0xF00F) == 0x000E:
+        # mov.l @(r0,Rm), Rn: 0000 NNNN MMMM 1110 — indexed load
+        # (variant B).  dst is the jmp register.  The effective address
+        # r0 + Rm is symmetric, so the table base may live in EITHER
+        # register (the other holds the scaled index) — both are
+        # candidates for the pool-load chase.
+        if not base_regs and (op & 0xF00F) == 0x000E:
             if ((op >> 8) & 0xF) == reg:
-                base_reg = (op >> 4) & 0xF
+                base_regs = ((op >> 4) & 0xF, 0)
                 continue
 
         # mov.l @(disp,PC), rB: 1101 BBBB dddd dddd — the pool load that
-        # supplied the table start into the base register.
-        if (base_reg is not None and (op & 0xF000) == 0xD000
-                and ((op >> 8) & 0xF) == base_reg):
+        # supplied the table start into a base-register candidate.
+        if (base_regs and (op & 0xF000) == 0xD000
+                and ((op >> 8) & 0xF) in base_regs):
             disp = op & 0xFF
             pool_addr = ((addr + 4) & 0xFFFFFFFC) + disp * 4
             break
 
-    if base_reg is None or pool_addr is None:
+    if not base_regs or pool_addr is None:
         return []
     if not (vram <= pool_addr <= binary_end):
         return []
@@ -1247,25 +1257,39 @@ def _detect_byte_indexed_jmp_switch_targets(binary, vram, jmp_pc,
     for rT in rT_candidates:
         if byte_load_dest != rT:
             continue
-        # The register that ACTUALLY held the byte_table_base at the
-        # mov.b — the same register or a different one depending on
-        # compiler choice.
+        # Resolve the byte_table_base pool.  Two shapes:
+        #   (a) loaded DIRECTLY into the mov.b's source register:
+        #         mov.l @(d,PC), rT ; add rIdx, rT ; mov.b @rT, ...
+        #   (b) loaded into ANOTHER register and ADDED into it:
+        #         mov.l @(d,PC), rB ; add rB, addr_reg ; mov.b @addr_reg, ...
+        # Shape (b) commonly REUSES addr_reg afterward for code_base, so
+        # mov_l_loads[addr_reg] resolves to the code-base pool — chase the
+        # add-source registers' pools too and pick the first distinct,
+        # valid one.
         addr_reg = byte_load_src
-        if addr_reg not in mov_l_loads:
-            continue
-        byte_table_pool = mov_l_loads[addr_reg]
-        if byte_table_pool == code_base_pool:
-            continue  # two distinct pool loads required
-        if not (vram <= byte_table_pool <= binary_end):
-            continue
-        bpoff = byte_table_pool - vram
-        if bpoff + 3 >= len(binary):
-            continue
-        byte_table_base = (
-            (binary[bpoff] << 24) | (binary[bpoff + 1] << 16)
-            | (binary[bpoff + 2] << 8) | binary[bpoff + 3]
-        )
-        if not (vram <= byte_table_base <= binary_end):
+        cand_pools = []
+        if addr_reg in mov_l_loads:
+            cand_pools.append(mov_l_loads[addr_reg])
+        for asrc, adst in adds:
+            if adst == addr_reg and asrc in mov_l_loads:
+                cand_pools.append(mov_l_loads[asrc])
+        byte_table_base = None
+        for cp in cand_pools:
+            if cp == code_base_pool:
+                continue  # table and code base must be distinct pools
+            if not (vram <= cp <= binary_end):
+                continue
+            cpoff = cp - vram
+            if cpoff + 3 >= len(binary):
+                continue
+            cand_base = (
+                (binary[cpoff] << 24) | (binary[cpoff + 1] << 16)
+                | (binary[cpoff + 2] << 8) | binary[cpoff + 3]
+            )
+            if vram <= cand_base <= binary_end:
+                byte_table_base = cand_base
+                break
+        if byte_table_base is None:
             continue
         # Require `add rIdx, addr_reg` somewhere — addr_reg has to be
         # advanced past the table base by an index for the indirect
